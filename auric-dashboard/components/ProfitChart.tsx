@@ -11,7 +11,7 @@ import {
   YAxis,
 } from "recharts";
 
-import type { TradeLogRow } from "@/lib/types/auric";
+import type { LogRow } from "@/lib/types/auric";
 
 export type ProfitChartPoint = {
   name: string;
@@ -21,7 +21,7 @@ export type ProfitChartPoint = {
 };
 
 /** % de lucro/prejuízo inferido por linha de log (Supabase ou heurística do bot). */
-export function profitPercentFromLog(log: TradeLogRow): number {
+export function profitPercentFromLog(log: LogRow): number {
   if (
     typeof log.resultado_trade === "number" &&
     !Number.isNaN(log.resultado_trade)
@@ -37,7 +37,7 @@ export function profitPercentFromLog(log: TradeLogRow): number {
   return 0;
 }
 
-function buildCumulativeData(data: TradeLogRow[]): ProfitChartPoint[] {
+function buildCumulativeData(data: LogRow[]): ProfitChartPoint[] {
   if (!data.length) return [];
 
   const chronological = [...data].sort((a, b) => {
@@ -99,7 +99,7 @@ function ChartTooltip({
   );
 }
 
-export function ProfitChart({ data }: { data: TradeLogRow[] }) {
+export function ProfitChart({ data }: { data: LogRow[] }) {
   const chartData = useMemo(() => buildCumulativeData(data), [data]);
 
   if (chartData.length === 0) {

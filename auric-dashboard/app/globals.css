@@ -84,10 +84,10 @@
 }
 
 .dark {
-  /* Deep charcoal + subtle cool tint (Auric) */
-  --background: oklch(0.09 0.01 260);
+  /* Midnight City — terminal Auric */
+  --background: #09090b;
   --foreground: oklch(0.96 0.005 260);
-  --card: oklch(0.14 0.012 260);
+  --card: #18181b;
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
@@ -101,7 +101,7 @@
   --accent-foreground: oklch(0.985 0 0);
   /* Carmesim para prejuízo */
   --destructive: oklch(0.58 0.22 25);
-  --border: oklch(1 0 0 / 10%);
+  --border: #27272a;
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
   --chart-1: oklch(0.87 0 0);
@@ -125,10 +125,11 @@
   }
   body {
     @apply min-h-screen bg-background text-foreground;
+    background-color: #09090b;
     background-image: radial-gradient(
-      ellipse 120% 80% at 50% -20%,
-      oklch(0.22 0.06 166 / 0.12),
-      transparent 55%
+      ellipse 100% 60% at 50% 0%,
+      oklch(0.22 0.08 166 / 0.08),
+      transparent 50%
     );
   }
   html {

@@ -9,11 +9,14 @@ No macOS, se o XGBoost não carregar (libxgboost / libomp), instale OpenMP: brew
 from __future__ import annotations
 
 import warnings
+from typing import Any
 
 import ccxt
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+
+from indicators import adicionar_adx_e_vwap
 from sklearn.metrics import accuracy_score, precision_score
 from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
@@ -106,6 +109,7 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     ema50_safe = out["ema_50"].replace(0, np.nan)
     out["dist_ema_50"] = (out["close"] - ema50_safe) / ema50_safe * 100.0
 
+    out = adicionar_adx_e_vwap(out)
     return out
 
 
@@ -127,6 +131,153 @@ def select_feature_columns(df: pd.DataFrame) -> list[str]:
     return sorted(
         c for c in df.columns if c not in exclude and df[c].dtype != object
     )
+
+
+def _bb_width_pct_series(df: pd.DataFrame) -> pd.Series | None:
+    """Delega para `indicators.largura_bollinger_pct` (única definição de largura BB)."""
+    from indicators import largura_bollinger_pct
+
+    return largura_bollinger_pct(df)
+
+
+def _regime_volatilidade_de_feat(feat: pd.DataFrame) -> dict[str, Any]:
+    """Núcleo de `obter_regime_volatilidade` a partir de OHLCV já com features."""
+    from indicators import bollinger_squeeze as bb_squeeze_flag
+
+    feat = feat.replace([np.inf, -np.inf], np.nan)
+
+    if feat.empty or "atr" not in feat.columns:
+        return {
+            "regime": "BAIXA",
+            "atr_pct": None,
+            "atr_pct_median": None,
+            "bb_width_pct": None,
+            "bb_width_median": None,
+            "bollinger_squeeze": False,
+            "detalhe": "sem ATR",
+        }
+
+    atr_pct = (feat["atr"] / feat["close"]).dropna()
+    if len(atr_pct) < 50:
+        return {
+            "regime": "BAIXA",
+            "atr_pct": float(atr_pct.iloc[-1]) if len(atr_pct) else None,
+            "atr_pct_median": None,
+            "bb_width_pct": None,
+            "bb_width_median": None,
+            "bollinger_squeeze": False,
+            "detalhe": "série ATR% curta",
+        }
+
+    cur_atr_pct = float(atr_pct.iloc[-1])
+    hist_atr = atr_pct.iloc[:-1].tail(160)
+    med_atr_pct = float(hist_atr.median())
+    v_atr = "BAIXA" if cur_atr_pct <= med_atr_pct else "ALTA"
+
+    votes: list[str] = [v_atr]
+    bbw = _bb_width_pct_series(feat)
+    cur_bw: float | None = None
+    med_bw: float | None = None
+    if bbw is not None:
+        bw_clean = bbw.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(bw_clean) >= 50:
+            cur_bw = float(bw_clean.iloc[-1])
+            hist_bw = bw_clean.iloc[:-1].tail(120)
+            med_bw = float(hist_bw.median())
+            votes.append("BAIXA" if cur_bw <= med_bw else "ALTA")
+
+    bollinger_squeeze = bool(bb_squeeze_flag(feat))
+
+    n_baixa = sum(1 for v in votes if v == "BAIXA")
+    if n_baixa > len(votes) / 2:
+        regime = "BAIXA"
+    elif n_baixa < len(votes) / 2:
+        regime = "ALTA"
+    else:
+        regime = v_atr  # empate ATR vs BB → prevalece ATR
+
+    return {
+        "regime": regime,
+        "atr_pct": cur_atr_pct,
+        "atr_pct_median": med_atr_pct,
+        "bb_width_pct": cur_bw,
+        "bb_width_median": med_bw,
+        "bollinger_squeeze": bollinger_squeeze,
+        "detalhe": f"ATR→{v_atr}" + (f", BB→{votes[-1]}" if len(votes) > 1 else ""),
+    }
+
+
+def obter_regime_volatilidade(
+    symbol: str = SYMBOL,
+    timeframe: str = TIMEFRAME,
+    n_candles: int = 320,
+) -> dict[str, Any]:
+    """
+    Regime de volatilidade para contexto quando P(ML) está na zona neutra (sem direção clara).
+
+    Usa ATR% (ATR/close) e, se existir, largura relativa das Bandas de Bollinger, cada uma
+    comparada à mediana de uma janela histórica (última barra excluída da mediana).
+    Votos: maioria define «BAIXA» vs «ALTA»; empate favorece ATR.
+    """
+    ohlcv = fetch_ohlcv_binance(symbol=symbol, timeframe=timeframe, total=n_candles)
+    feat = add_technical_features(ohlcv)
+    return _regime_volatilidade_de_feat(feat)
+
+
+def obter_snapshot_indicadores_eth(
+    symbol: str = SYMBOL,
+    timeframe: str = TIMEFRAME,
+    n_candles: int = 400,
+    *,
+    prob_ml: float | None = None,
+) -> dict[str, Any]:
+    """
+    Última vela: ADX, VWAP diário, viés preço/VWAP, squeeze BB, regime ATR/BB.
+    Um único download OHLCV por ciclo quando usado em vez de chamadas separadas.
+    """
+    from indicators import (
+        extrair_bollinger_pct_b_ultima,
+        mercado_lateral_por_adx,
+        regime_adx_semantico,
+        vies_vwap,
+    )
+
+    ohlcv = fetch_ohlcv_binance(symbol=symbol, timeframe=timeframe, total=n_candles)
+    feat = add_technical_features(ohlcv)
+    reg = _regime_volatilidade_de_feat(feat)
+    last = feat.iloc[-1]
+    bb_extra = extrair_bollinger_pct_b_ultima(feat)
+
+    def _to_f(x: Any) -> float | None:
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return None
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    adx = _to_f(last.get("ADX_14"))
+    vwap = _to_f(last.get("vwap_d"))
+    rsi = _to_f(last.get("rsi"))
+    close = _to_f(last.get("close")) or 0.0
+
+    lateral = mercado_lateral_por_adx(adx)
+    bias = vies_vwap(close, vwap)
+    adx_regime = regime_adx_semantico(adx)
+
+    out: dict[str, Any] = {
+        **reg,
+        **bb_extra,
+        "adx_14": adx,
+        "adx_regime": adx_regime,
+        "rsi_14": rsi,
+        "vwap_d": vwap,
+        "preco_close": close,
+        "vies_vwap": bias,
+        "mercado_lateral": lateral,
+        "prob_ml": prob_ml,
+    }
+    return out
 
 
 def obter_sinal_atual(

@@ -27,6 +27,25 @@ SHORT_SL = 0.008
 # Alavancagem usada só no log de liquidação aproximada (ajuste em configurar_alavancagem / main).
 ALAVANCAGEM_REF_LOG_PADRAO = 3
 
+# Position sizing: notional USDT = saldo_USDT × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
+PERCENTUAL_BANCA = 0.15
+
+# Abertura em LIMIT agressivo vs. último preço (proteção de slippage): long acima, short abaixo.
+PRECO_ABERTURA_LIMITE_OFFSET = 0.0005  # 0,05%
+
+# Trailing stop: após lucro ≥ este valor, SL vai a break-even e depois segue o preço a TRAILING_SL_DIST_FRAC.
+TRAILING_LUCRO_ATIVACAO_FRAC = 0.01  # 1%
+TRAILING_SL_DIST_FRAC = 0.008  # 0,8% atrás (LONG) / à frente (SHORT) do preço atual
+
+# Abertura LIMIT GTC + chase: após timeout sem fill, cancela e reabre no novo último
+# (+0,05% long / −0,05% short) até N rondas. LONG: defaults abaixo. SHORT: mercado em queda rápida —
+# usar timeouts mais curtos e mais rondas (caça o preço). Overrides via env.
+CHASE_ENTRADA_TIMEOUT_S = float(os.getenv("AURIC_CHASE_TIMEOUT_S", "15"))
+CHASE_ENTRADA_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_MAX_ROUNDS", "3"))
+# Chase agressivo só para abertura SHORT (ETH a «despencar» — ordem não fica pendurada acima do mercado).
+CHASE_SHORT_TIMEOUT_S = float(os.getenv("AURIC_CHASE_SHORT_TIMEOUT_S", "8"))
+CHASE_SHORT_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_SHORT_MAX_ROUNDS", "6"))
+
 
 def _carregar_chaves() -> tuple[str, str]:
     api_key = os.getenv("BINANCE_API_KEY", "").strip()
@@ -97,12 +116,24 @@ def configurar_alavancagem(
         raise
 
 
+def notional_usdt_futuros_position_sizing(
+    exchange: ccxt.binance,
+    alavancagem: float,
+) -> float:
+    """Notional alvo: saldo USDT (margem futuros) × PERCENTUAL_BANCA × alavancagem."""
+    saldo = obter_saldo_usdt_margem(exchange)
+    return float(saldo) * PERCENTUAL_BANCA * float(alavancagem)
+
+
 def _quantidade_base_a_partir_de_usd(
     exchange: ccxt.binance,
     simbolo: str,
     quantidade_usd: float,
 ) -> float:
-    """Converte notional em USDT para quantidade na base (contratos ETH), com precisão."""
+    """
+    Converte notional em USDT para quantidade na base (contratos ETH), com precisão.
+    Equivale a (notional_usd / preco_atual), com `amount_to_precision`.
+    """
     if quantidade_usd <= 0:
         raise ValueError("quantidade_usd deve ser positiva.")
     ticker = exchange.fetch_ticker(simbolo)
@@ -111,6 +142,156 @@ def _quantidade_base_a_partir_de_usd(
         raise RuntimeError("Preço inválido para calcular quantidade.")
     q = quantidade_usd / preco
     return float(exchange.amount_to_precision(simbolo, q))
+
+
+def _preco_referencia_ultimo(exchange: ccxt.binance, simbolo: str) -> float:
+    """Último preço do ticker (mesma referência usada no sizing)."""
+    ticker = exchange.fetch_ticker(simbolo)
+    preco = float(ticker.get("last") or ticker.get("close") or 0)
+    if preco <= 0:
+        raise RuntimeError(f"{_TAG} Preço inválido para ordem limit de abertura em {simbolo}.")
+    return preco
+
+
+def obter_ultimo_preco(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> float:
+    """Último preço (ticker) do perpétuo — alias explícito para chase / scripts externos."""
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    return _preco_referencia_ultimo(ex, sym)
+
+
+def executar_com_chase(
+    simbolo: str,
+    direcao: str,
+    qty: float,
+    exchange: ccxt.binance | None = None,
+    *,
+    tentativas: int = 3,
+) -> dict[str, Any] | None:
+    """
+    Chase: LIMIT GTC com offset 0,05% vs último; após `CHASE_ENTRADA_TIMEOUT_S` verifica fill;
+    se não, cancela e reabre até `tentativas` rondas.
+
+    - `direcao`: «LONG» (buy) ou «SHORT» (sell).
+    Devolve o dict da ordem da bolsa se preenchida; `None` se esgotar tentativas.
+    """
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        raise ValueError(f"{_TAG} direcao deve ser LONG ou SHORT, recebido: {d!r}")
+    if qty <= 0:
+        raise ValueError(f"{_TAG} qty deve ser positivo.")
+
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    side = "buy" if d == "LONG" else "sell"
+
+    try:
+        return _entrar_limite_com_chase_futuros(
+            ex,
+            sym,
+            side,
+            float(qty),
+            nome_lado=d,
+            max_rounds=max(1, int(tentativas)),
+        )
+    except RuntimeError as e:
+        print(f"{_TAG} executar_com_chase: {e}", file=sys.stderr)
+        return None
+
+
+def _entrar_limite_com_chase_futuros(
+    ex: ccxt.binance,
+    simbolo: str,
+    side: str,
+    amt: float,
+    *,
+    nome_lado: str,
+    max_rounds: int | None = None,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    """
+    Abertura LIMIT GTC com offset 0,05% vs último (`fetch_ticker`); aguarda
+    `timeout_s` (ou default global); se não houver fill suficiente, cancela e repete (caça o preço).
+    """
+    cap = max_rounds if max_rounds is not None else CHASE_ENTRADA_MAX_ROUNDS
+    wait = float(timeout_s) if timeout_s is not None else CHASE_ENTRADA_TIMEOUT_S
+    params_gtc: dict[str, Any] = {"timeInForce": "GTC"}
+
+    for rnd in range(1, cap + 1):
+        ticker = ex.fetch_ticker(simbolo)
+        ultimo = float(ticker.get("last") or ticker.get("close") or 0)
+        if ultimo <= 0:
+            raise RuntimeError(f"{_TAG} Preço último inválido (chase {rnd}).")
+
+        if side == "buy":
+            preco_limite = float(
+                ex.price_to_precision(
+                    simbolo, ultimo * (1.0 + PRECO_ABERTURA_LIMITE_OFFSET)
+                )
+            )
+        else:
+            preco_limite = float(
+                ex.price_to_precision(
+                    simbolo, ultimo * (1.0 - PRECO_ABERTURA_LIMITE_OFFSET)
+                )
+            )
+
+        try:
+            order = ex.create_order(
+                simbolo,
+                "limit",
+                side,
+                amt,
+                preco_limite,
+                params_gtc,
+            )
+        except ccxt.BaseError as e:
+            print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
+            continue
+
+        oid = order.get("id")
+        if oid is None:
+            raise RuntimeError(f"{_TAG} Ordem sem id após create_order.")
+
+        filled0 = float(order.get("filled") or 0)
+        st0 = (order.get("status") or "").lower()
+        if filled0 >= amt * 0.97 or st0 in ("closed", "filled"):
+            print(f"{_TAG} ✅ [SUCESSO] {nome_lado}: fill na resposta da bolsa.")
+            return dict(order)
+
+        print(
+            f"{_TAG} ⏳ [CHASE {rnd}/{cap}] Ordem LIMIT em {preco_limite}. "
+            f"Aguardando {wait:.0f}s..."
+        )
+        time.sleep(wait)
+
+        try:
+            check = ex.fetch_order(oid, simbolo)
+        except ccxt.BaseError as ef:
+            print(f"{_TAG} fetch_order: {ef}", file=sys.stderr)
+            check = order
+
+        filled = float(check.get("filled") or 0)
+        status = (check.get("status") or "").lower()
+        if filled >= amt * 0.97 or status in ("closed", "filled"):
+            print(f"{_TAG} ✅ [SUCESSO] Ordem preenchida (ronda {rnd}).")
+            return dict(check)
+
+        try:
+            ex.cancel_order(oid, simbolo)
+        except ccxt.BaseError as ec:
+            print(f"{_TAG} cancel chase (ok se já executou): {ec}", file=sys.stderr)
+
+        print(
+            f"{_TAG} ⚠️ [TIMEOUT] Preço fugiu — recalculando chase ({rnd}/{cap})..."
+        )
+
+    raise RuntimeError(
+        f"{_TAG} Entrada LIMIT: esgotadas {cap} tentativas de chase."
+    )
 
 
 def _log_liquidacao_estimada(
@@ -145,7 +326,7 @@ def _aguardar_qty_e_preco_entrada(
     *,
     timeout_s: float = 4.0,
 ) -> tuple[float, float]:
-    """Após ordem a mercado, obtém quantidade (contratos) e preço médio de entrada."""
+    """Após ordem de abertura (limit), obtém quantidade (contratos) e preço médio de entrada."""
     t0 = time.time()
     last_err: str | None = None
     while time.time() - t0 < timeout_s:
@@ -167,6 +348,42 @@ def _aguardar_qty_e_preco_entrada(
         f"{_TAG} Não foi possível ler qty/entry após abrir posição em {simbolo}. "
         f"Último erro: {last_err}"
     )
+
+
+def cancelar_ordens_entrada_short(
+    exchange: ccxt.binance,
+    simbolo: str,
+) -> int:
+    """
+    Cancela ordens LIMIT de abertura de SHORT (venda sem reduce-only).
+    Não cancela TP/SL (reduce-only).
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    n = 0
+    try:
+        abertas = exchange.fetch_open_orders(sym)
+    except ccxt.BaseError as e:
+        print(f"{_TAG} fetch_open_orders: {e}", file=sys.stderr)
+        return 0
+    for o in abertas:
+        if str(o.get("side") or "").lower() != "sell":
+            continue
+        if bool(o.get("reduceOnly")):
+            continue
+        info = o.get("info") or {}
+        if info.get("reduceOnly") in (True, "true", "True"):
+            continue
+        oid = o.get("id")
+        if oid is None:
+            continue
+        try:
+            exchange.cancel_order(oid, sym)
+            n += 1
+        except ccxt.BaseError as ec:
+            print(f"{_TAG} cancel ordem entrada SHORT {oid}: {ec}", file=sys.stderr)
+    if n:
+        print(f"{_TAG} Canceladas {n} ordem(ns) de entrada SHORT em {sym}.")
+    return n
 
 
 def cancelar_todas_ordens_abertas(
@@ -284,16 +501,34 @@ def _criar_bracket_short(
     return ord_tp, ord_sl
 
 
+def _usdt_de_balance_unificado(bal: dict[str, Any]) -> float:
+    """
+    Extrai USDT do dict devolvido por `fetch_balance`: preferência `free` (disponível),
+    senão `total` (saldo líquido na conta de futuros).
+    """
+    usdt = bal.get("USDT")
+    if usdt is None:
+        return 0.0
+    if isinstance(usdt, dict):
+        livre = usdt.get("free")
+        total = usdt.get("total")
+        if livre is not None:
+            return float(livre)
+        if total is not None:
+            return float(total)
+        return 0.0
+    try:
+        return float(usdt)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def obter_saldo_usdt_margem(exchange: ccxt.binance | None = None) -> float:
-    """Saldo USDT disponível na carteira de Futuros (USDT-M)."""
+    """Saldo USDT na carteira de Futuros USDT-M — `fetch_balance` explícito para `type: future`."""
     ex = exchange or criar_exchange_binance()
     try:
-        bal = ex.fetch_balance()
-        usdt = bal.get("USDT") or {}
-        livre = usdt.get("free")
-        if livre is None:
-            return 0.0
-        return float(livre)
+        bal = ex.fetch_balance(params={"type": "future"})
+        return _usdt_de_balance_unificado(bal)
     except ccxt.BaseError as e:
         print(f"{_TAG} Erro ao obter saldo USDT (futures): {e}", file=sys.stderr)
         raise
@@ -301,26 +536,43 @@ def obter_saldo_usdt_margem(exchange: ccxt.binance | None = None) -> float:
 
 def abrir_long_market(
     simbolo: str,
-    quantidade_usd: float,
     exchange: ccxt.binance | None = None,
     *,
     alavancagem: float | None = None,
+    notional_usdt_override: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **long** a mercado com notional aproximado `quantidade_usd` em USDT.
-    Em seguida coloca **reduce-only**: LIMIT (TP) e STOP_MARKET (SL).
+    Abre **long** com LIMIT **GTC** + **chase**: preço = último × (1 + offset 0,05%);
+    após ~CHASE_ENTRADA_TIMEOUT_S sem fill, cancela e reabre no novo último.
+    Notional = 15%×banca×alav; depois bracket TP/SL.
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
-    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
+    if notional_usdt_override is not None:
+        quantidade_usd = float(notional_usdt_override)
+    else:
+        quantidade_usd = notional_usdt_futuros_position_sizing(ex, lev)
+    if quantidade_usd <= 0:
+        raise ValueError(
+            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
+        )
+    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
 
     print(
-        f"{_TAG} Abrindo LONG MARKET em {sym} — notional ~{quantidade_usd:.2f} USDT "
-        f"(qty base ≈ {amt})..."
+        f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDT "
+        f"(15% banca × alav {lev:g}x; qty base ≈ {amt}); chase até {CHASE_ENTRADA_MAX_ROUNDS}×/"
+        f"{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
     )
     try:
-        ordem = ex.create_order(sym, "market", "buy", amt, None, {})
+        ordem = _entrar_limite_com_chase_futuros(
+            ex,
+            sym,
+            "buy",
+            amt,
+            nome_lado="LONG",
+            max_rounds=CHASE_ENTRADA_MAX_ROUNDS,
+        )
         print(f"{_TAG} Long aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "LONG", lev)
@@ -338,26 +590,44 @@ def abrir_long_market(
 
 def abrir_short_market(
     simbolo: str,
-    quantidade_usd: float,
     exchange: ccxt.binance | None = None,
     *,
     alavancagem: float | None = None,
+    notional_usdt_override: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **short** a mercado; depois **reduce-only** LIMIT (TP) e STOP_MARKET (SL)
-    com lógica de preço invertida em relação ao long.
+    Abre **short** com LIMIT GTC + chase (−0,05% vs. último); mesmo fluxo que o long.
+    Depois **reduce-only** LIMIT (TP) e STOP_MARKET (SL).
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
-    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
+    if notional_usdt_override is not None:
+        quantidade_usd = float(notional_usdt_override)
+    else:
+        quantidade_usd = notional_usdt_futuros_position_sizing(ex, lev)
+    if quantidade_usd <= 0:
+        raise ValueError(
+            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
+        )
+    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
 
     print(
-        f"{_TAG} Abrindo SHORT MARKET em {sym} — notional ~{quantidade_usd:.2f} USDT "
-        f"(qty base ≈ {amt})..."
+        f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDT "
+        f"(15% banca × alav {lev:g}x; qty base ≈ {amt}); "
+        f"chase SHORT {CHASE_SHORT_MAX_ROUNDS}×/{CHASE_SHORT_TIMEOUT_S:.0f}s "
+        f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
     )
     try:
-        ordem = ex.create_order(sym, "market", "sell", amt, None, {})
+        ordem = _entrar_limite_com_chase_futuros(
+            ex,
+            sym,
+            "sell",
+            amt,
+            nome_lado="SHORT",
+            max_rounds=CHASE_SHORT_MAX_ROUNDS,
+            timeout_s=CHASE_SHORT_TIMEOUT_S,
+        )
         print(f"{_TAG} Short aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "SHORT", lev)
@@ -461,6 +731,199 @@ def consultar_posicao_futures(
     }
 
 
+def _buscar_ordem_stop_loss_aberta(
+    exchange: ccxt.binance,
+    simbolo: str,
+    direcao: str,
+) -> dict[str, Any] | None:
+    """
+    Ordens reduce-only STOP_MARKET que fecham a posição: LONG → sell, SHORT → buy.
+    """
+    d = str(direcao).strip().upper()
+    for o in exchange.fetch_open_orders(simbolo):
+        if not o.get("reduceOnly"):
+            continue
+        typ = str(o.get("type") or "").upper()
+        if typ != "STOP_MARKET":
+            continue
+        side = str(o.get("side") or "").lower()
+        if d == "LONG" and side == "sell":
+            return o
+        if d == "SHORT" and side == "buy":
+            return o
+    return None
+
+
+def _stop_price_de_ordem(ordem: dict[str, Any]) -> float | None:
+    sp = ordem.get("stopPrice")
+    if sp is not None and sp != "":
+        try:
+            return float(sp)
+        except (TypeError, ValueError):
+            pass
+    info = ordem.get("info") or {}
+    raw = info.get("stopPrice") or info.get("activatePrice")
+    if raw is not None and raw != "":
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _quantidade_posicao_abs(
+    exchange: ccxt.binance,
+    simbolo: str,
+    direcao: str,
+) -> float:
+    """Contratos absolutos da posição alinhada a `direcao` (LONG/SHORT)."""
+    d = str(direcao).strip().upper()
+    for p in exchange.fetch_positions([simbolo]):
+        c = float(p.get("contracts") or 0)
+        if abs(c) <= 0:
+            continue
+        lado = str(p.get("side") or "").lower()
+        if d == "LONG" and (lado == "long" or (not lado and c > 0)):
+            return float(exchange.amount_to_precision(simbolo, abs(c)))
+        if d == "SHORT" and (lado == "short" or (not lado and c < 0)):
+            return float(exchange.amount_to_precision(simbolo, abs(c)))
+    raise ccxt.InvalidOrder(
+        f"{_TAG} Nenhuma posição {d} aberta em {simbolo} para atualizar stop."
+    )
+
+
+def atualizar_ordem_stop(
+    simbolo: str,
+    novo_stop: float,
+    direcao: str,
+    exchange: ccxt.binance | None = None,
+) -> dict[str, Any]:
+    """
+    Substitui a ordem STOP_MARKET reduce-only (SL) por uma nova com `stopPrice` = `novo_stop`.
+    Mantém o take-profit (LIMIT) inalterado.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        raise ValueError(f"{_TAG} direcao deve ser LONG ou SHORT, recebido: {d!r}")
+
+    sp = float(ex.price_to_precision(sym, float(novo_stop)))
+    if sp <= 0:
+        raise ValueError(f"{_TAG} novo_stop inválido: {novo_stop}")
+
+    ord_sl = _buscar_ordem_stop_loss_aberta(ex, sym, d)
+    p_ro = _params_reduce_futures()
+
+    if ord_sl is not None:
+        oid = ord_sl.get("id")
+        rem = ord_sl.get("remaining")
+        amt_raw = rem
+        if amt_raw is None or float(amt_raw) <= 0:
+            amt_raw = ord_sl.get("amount")
+        if amt_raw is None:
+            amt_raw = _quantidade_posicao_abs(ex, sym, d)
+        q = float(ex.amount_to_precision(sym, float(amt_raw)))
+        prev = _stop_price_de_ordem(ord_sl)
+        if prev is not None:
+            sp_cmp = float(ex.price_to_precision(sym, prev))
+            if sp_cmp == sp:
+                print(f"{_TAG} Stop já em {sp}; sem alteração.")
+                return {"ok": True, "skipped": True, "stopPrice": sp, "order": ord_sl}
+
+        if oid is not None:
+            try:
+                ex.cancel_order(oid, sym)
+            except ccxt.BaseError as e:
+                print(f"{_TAG} Erro ao cancelar SL anterior: {e}", file=sys.stderr)
+                raise
+    else:
+        q = _quantidade_posicao_abs(ex, sym, d)
+        print(
+            f"{_TAG} Aviso: SL STOP_MARKET em aberto não encontrado; "
+            f"a criar nova ordem reduce-only qty={q}.",
+            file=sys.stderr,
+        )
+
+    try:
+        if d == "LONG":
+            nova = ex.create_order(
+                sym,
+                "STOP_MARKET",
+                "sell",
+                q,
+                None,
+                {**p_ro, "stopPrice": sp},
+            )
+        else:
+            nova = ex.create_order(
+                sym,
+                "STOP_MARKET",
+                "buy",
+                q,
+                None,
+                {**p_ro, "stopPrice": sp},
+            )
+        print(f"{_TAG} SL atualizado: STOP_MARKET @ {sp} qty={q} id={nova.get('id')}")
+        return {"ok": True, "skipped": False, "stopPrice": sp, "order": nova}
+    except ccxt.BaseError as e:
+        print(f"{_TAG} Erro ao criar novo SL: {e}", file=sys.stderr)
+        raise
+
+
+def gerenciar_trailing_stop(
+    simbolo: str,
+    preco_atual: float,
+    preco_entrada: float,
+    direcao: str,
+    exchange: ccxt.binance | None = None,
+) -> dict[str, Any] | None:
+    """
+    Atualiza o stop loss dinamicamente para proteger lucros.
+
+    - Lucro < TRAILING_LUCRO_ATIVACAO_FRAC (1%): não altera.
+    - Caso contrário: SL = max/mín. entre entrada (break-even) e preço atual
+      afastado por TRAILING_SL_DIST_FRAC (0,8%), conforme o lado.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        raise ValueError(f"{_TAG} direcao deve ser LONG ou SHORT, recebido: {d!r}")
+
+    pa = float(preco_atual)
+    pe = float(preco_entrada)
+    if pe <= 0 or pa <= 0:
+        raise ValueError(f"{_TAG} preco_entrada e preco_atual devem ser positivos.")
+
+    if d == "LONG":
+        lucro_atual = (pa - pe) / pe
+    else:
+        lucro_atual = (pe - pa) / pe
+
+    if lucro_atual < TRAILING_LUCRO_ATIVACAO_FRAC:
+        return None
+
+    novo_sl = pe
+    if d == "LONG":
+        distancia_sl = pa * (1.0 - TRAILING_SL_DIST_FRAC)
+        novo_sl = max(pe, distancia_sl)
+    else:
+        distancia_sl = pa * (1.0 + TRAILING_SL_DIST_FRAC)
+        novo_sl = min(pe, distancia_sl)
+
+    novo_sl = float(ex.price_to_precision(sym, novo_sl))
+
+    print(
+        f"{_TAG} 🔄 [TRAILING STOP] Ajustando SL para {novo_sl:.4f} "
+        f"(lucro {lucro_atual:.2%}, ref entrada {pe:.4f}, último {pa:.4f})"
+    )
+    out = atualizar_ordem_stop(simbolo, novo_sl, d, ex)
+    out["lucro_atual"] = lucro_atual
+    out["novo_sl"] = novo_sl
+    return out
+
+
 # --- Compatibilidade com código legado (Spot) — redireciona para Futures ---
 
 def consultar_posicao_spot(
@@ -473,13 +936,18 @@ def consultar_posicao_spot(
 
 def executar_compra_spot_market(
     simbolo: str,
-    valor_usd: float,
     exchange: ccxt.binance | None = None,
     *,
     alavancagem: float | None = None,
+    notional_usdt_override: float | None = None,
 ) -> dict[str, Any]:
     """Alias: abre **long** a mercado em USDT-M (nome histórico 'Spot')."""
-    return abrir_long_market(simbolo, valor_usd, exchange, alavancagem=alavancagem)
+    return abrir_long_market(
+        simbolo,
+        exchange,
+        alavancagem=alavancagem,
+        notional_usdt_override=notional_usdt_override,
+    )
 
 
 def executar_venda_spot_total(

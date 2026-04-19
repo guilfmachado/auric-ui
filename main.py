@@ -10,8 +10,10 @@ load_dotenv(override=True)
 
 import argparse
 import json
+import os
 import time
 import traceback
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from typing import Any
@@ -21,12 +23,12 @@ import ccxt
 import brain
 import executor_futures
 import executor_spot
+import indicators
 import intelligence_hub
 import logger
 import ml_model
 
 SYMBOL_TRADE = "ETH/USDT"
-VALOR_COMPRA_USDT = 15.0
 ALAVANCAGEM_PADRAO = 3
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
@@ -49,7 +51,16 @@ _last_modo_detectado: str | None = None
 
 
 def obter_modo_operacao() -> str:
-    """Consulta no Supabase se o bot deve operar em SPOT ou FUTURES."""
+    """
+    Modo SPOT ou FUTURES: se `TRADING_MODE` estiver definido no .env, tem prioridade;
+    caso contrário usa `config.modo_operacao` no Supabase (id=1).
+    """
+    env_modo = (os.getenv("TRADING_MODE") or "").strip().upper()
+    if env_modo in ("SPOT", "FUTURES"):
+        return env_modo
+    op_fut = (os.getenv("OPERACAO_FUTURES") or "").strip().lower()
+    if op_fut in ("1", "true", "yes", "on"):
+        return "FUTURES"
     if logger.supabase is None:
         return "FUTURES"
     try:
@@ -73,7 +84,8 @@ def obter_modo_operacao() -> str:
 
 def verificar_permissao_operacao() -> bool:
     """
-    Pedágio: lê `bot_control.is_active` (id=1). Sem Supabase ou erro → False.
+    Pedágio ao arrancar o loop: `bot_control.is_active` onde `id = 1`
+    (mesma tabela/coluna que `logger.obter_bot_ativo`, mas sem Supabase → False).
     """
     if logger.supabase is None:
         print("⚠️ [ERRO] Falha ao ler permissão: Supabase não configurado (SUPABASE_URL / SUPABASE_KEY).")
@@ -93,6 +105,168 @@ def verificar_permissao_operacao() -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ [ERRO] Falha ao ler permissão: {e}")
         return False
+
+
+def atualizar_saldo_supabase() -> None:
+    """
+    Lê o saldo USDT na carteira **Futuros USDT-M** via CCXT, exatamente:
+    ``exchange.fetch_balance(params={'type': 'future'})['total']['USDT']``.
+
+    Depois persiste com ``logger.persistir_saldo_usdt`` (**upsert** em
+    ``wallet_status.usdt_balance``, id=1; opcionalmente **update** em
+    ``config.balance_usdt``).
+    """
+    if logger.supabase is None:
+        return
+    try:
+        ex = executor_futures.criar_exchange_binance()
+        bal = ex.fetch_balance(params={"type": "future"})
+        total = bal.get("total")
+        if not isinstance(total, dict):
+            print(
+                "⚠️ atualizar_saldo_supabase: resposta sem chave `total` dict — "
+                f"tipo={type(total).__name__}"
+            )
+            return
+        raw_usdt = total.get("USDT")
+        if raw_usdt is None:
+            print("⚠️ atualizar_saldo_supabase: total['USDT'] ausente no balance futures.")
+            return
+        saldo = float(raw_usdt)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ atualizar_saldo_supabase (Binance): {e}")
+        return
+    try:
+        logger.persistir_saldo_usdt(saldo)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ atualizar_saldo_supabase (Supabase): {e}")
+
+
+def _marcar_comando_manual_executado(row_id: int) -> None:
+    if logger.supabase is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    logger.supabase.table("manual_commands").update(
+        {"executed": True, "updated_at": now}
+    ).eq("id", row_id).execute()
+
+
+def verificar_comandos_manuais() -> None:
+    """
+    Processa fila `manual_commands` (executed = false): LONG → `abrir_long_market` (LIMIT +0,05%),
+    SHORT → `abrir_short_market` (LIMIT −0,05%), CLOSE → `fechar_posicao_market` (Futuros USDT-M).
+    Após sucesso, marca executed = true.
+    """
+    if logger.supabase is None:
+        return
+    if os.getenv("AURIC_DRY_RUN", "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        res = (
+            logger.supabase.table("manual_commands")
+            .select("id, command")
+            .eq("executed", False)
+            .order("id", desc=False)
+            .execute()
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ verificar_comandos_manuais (select): {e}")
+        return
+
+    rows = res.data or []
+    if not rows:
+        return
+
+    ex = executor_futures.criar_exchange_binance()
+    for row in rows:
+        rid = row.get("id")
+        cmd = str(row.get("command") or "").upper().strip()
+        if rid is None:
+            continue
+        try:
+            if cmd == "LONG":
+                print(f"🎮 [MANUAL] Executando comando LONG id={rid} → Binance Futuros...")
+                executor_futures.abrir_long_market(
+                    SYMBOL_TRADE,
+                    ex,
+                    alavancagem=float(ALAVANCAGEM_PADRAO),
+                )
+                _marcar_comando_manual_executado(int(rid))
+                print(f"🎮 [MANUAL] LONG id={rid} concluído; executed=true.")
+            elif cmd == "SHORT":
+                sym_man = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+                try:
+                    snap_man = ml_model.obter_snapshot_indicadores_eth(SYMBOL_TRADE)
+                    rsi_m = snap_man.get("rsi_14")
+                except Exception as e_rm:  # noqa: BLE001
+                    print(f"⚠️ [MANUAL] Snapshot RSI: {e_rm}")
+                    rsi_m = None
+                if indicators.rsi_proibe_entrada_short(rsi_m):
+                    print(
+                        f"🎮 [MANUAL] VETO: RSI sobrevendido (RSI(14)={rsi_m}) — SHORT não executado."
+                    )
+                    try:
+                        t = ex.fetch_ticker(sym_man)
+                        preco_man = float(t.get("last") or t.get("close") or 0.0)
+                    except Exception:  # noqa: BLE001
+                        preco_man = 0.0
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco_man,
+                        prob_ml=0.0,
+                        sentimento="MANUAL",
+                        acao="VETO_RSI_OVERSOLD",
+                        justificativa=(
+                            f"Comando manual SHORT id={rid} vetado; "
+                            f"RSI(14)={rsi_m} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT}"
+                        ),
+                        lado_ordem="SHORT",
+                    )
+                    _marcar_comando_manual_executado(int(rid))
+                    continue
+                if indicators.volume_compra_spike_1m(ex, sym_man):
+                    ncx = executor_futures.cancelar_ordens_entrada_short(ex, SYMBOL_TRADE)
+                    print(
+                        f"🎮 [MANUAL] VETO: spike volume 1m — SHORT não executado; "
+                        f"canceladas {ncx} ordem(ns) entrada."
+                    )
+                    try:
+                        t = ex.fetch_ticker(sym_man)
+                        preco_man = float(t.get("last") or t.get("close") or 0.0)
+                    except Exception:  # noqa: BLE001
+                        preco_man = 0.0
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco_man,
+                        prob_ml=0.0,
+                        sentimento="MANUAL",
+                        acao="VETO_VOLUME_SPIKE",
+                        justificativa=(
+                            f"Comando manual SHORT id={rid} vetado; spike 1m; n_cancel={ncx}"
+                        ),
+                        lado_ordem="SHORT",
+                    )
+                    _marcar_comando_manual_executado(int(rid))
+                    continue
+                print(f"🎮 [MANUAL] Executando comando SHORT id={rid} → Binance Futuros...")
+                executor_futures.abrir_short_market(
+                    SYMBOL_TRADE,
+                    ex,
+                    alavancagem=float(ALAVANCAGEM_PADRAO),
+                )
+                _marcar_comando_manual_executado(int(rid))
+                print(f"🎮 [MANUAL] SHORT id={rid} concluído; executed=true.")
+            elif cmd == "CLOSE":
+                print(f"🎮 [MANUAL] Emergency close id={rid} → Binance Futuros...")
+                executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+                _marcar_comando_manual_executado(int(rid))
+                print(f"🎮 [MANUAL] CLOSE id={rid} concluído; executed=true.")
+            else:
+                print(
+                    f"⚠️ [MANUAL] Comando ignorado id={rid} (command={cmd!r}; use LONG, SHORT ou CLOSE)."
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ [MANUAL] Falha ao executar id={rid} cmd={cmd!r}: {e}")
 
 
 def _simbolo_binance_rest(simbolo: str) -> str:
@@ -229,7 +403,7 @@ def _gerenciar_saida_modo_vigia(
                     f"id={ordem.get('id')}."
                 )
                 logger.registrar_log_trade(
-                    ativo=SYMBOL_TRADE,
+                    par_moeda=SYMBOL_TRADE,
                     preco=preco,
                     prob_ml=0.0,
                     sentimento="—",
@@ -244,7 +418,7 @@ def _gerenciar_saida_modo_vigia(
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída TP short: {e_v}")
                 logger.registrar_log_trade(
-                    ativo=SYMBOL_TRADE,
+                    par_moeda=SYMBOL_TRADE,
                     preco=preco,
                     prob_ml=0.0,
                     sentimento="—",
@@ -263,7 +437,7 @@ def _gerenciar_saida_modo_vigia(
                     f"id={ordem.get('id')}."
                 )
                 logger.registrar_log_trade(
-                    ativo=SYMBOL_TRADE,
+                    par_moeda=SYMBOL_TRADE,
                     preco=preco,
                     prob_ml=0.0,
                     sentimento="—",
@@ -278,7 +452,7 @@ def _gerenciar_saida_modo_vigia(
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída SL short: {e_v}")
                 logger.registrar_log_trade(
-                    ativo=SYMBOL_TRADE,
+                    par_moeda=SYMBOL_TRADE,
                     preco=preco,
                     prob_ml=0.0,
                     sentimento="—",
@@ -310,7 +484,7 @@ def _gerenciar_saida_modo_vigia(
                 f"ordem id={ordem.get('id')}."
             )
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=0.0,
                 sentimento="—",
@@ -324,7 +498,7 @@ def _gerenciar_saida_modo_vigia(
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída TP: {e_v}")
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=0.0,
                 sentimento="—",
@@ -342,7 +516,7 @@ def _gerenciar_saida_modo_vigia(
                 f"ordem id={ordem.get('id')}."
             )
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=0.0,
                 sentimento="—",
@@ -356,7 +530,7 @@ def _gerenciar_saida_modo_vigia(
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída SL: {e_v}")
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=0.0,
                 sentimento="—",
@@ -379,6 +553,9 @@ def rodar_ciclo(modo: str) -> None:
         print("Bot em modo Standby via Dashboard")
         return
 
+    atualizar_saldo_supabase()
+    verificar_comandos_manuais()
+
     ex_mod = executor_futures if modo == "FUTURES" else executor_spot
     modo_label = "FUTURES USDT-M" if modo == "FUTURES" else "SPOT"
 
@@ -397,6 +574,31 @@ def rodar_ciclo(modo: str) -> None:
     ex = ex_mod.criar_exchange_binance()
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
+
+    if modo == "FUTURES":
+        try:
+            sym_f = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+            if indicators.volume_compra_spike_1m(ex, sym_f):
+                ncx = executor_futures.cancelar_ordens_entrada_short(ex, SYMBOL_TRADE)
+                if ncx:
+                    print(
+                        f"    [Risco] Volume 1m +300% vs. minuto anterior — "
+                        f"{ncx} ordem(ns) de entrada SHORT cancelada(s)."
+                    )
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco,
+                        prob_ml=0.0,
+                        sentimento="—",
+                        acao="CANCEL_SHORT_ENTRADA_SPIKE_1M",
+                        justificativa=(
+                            f"Volume vela 1m fechada ≥ {1.0 + indicators.VOLUME_SPIKE_FRACAO_1M:.0f}× "
+                            f"a anterior; ordens entrada SHORT canceladas (n={ncx})."
+                        ),
+                        lado_ordem="SHORT",
+                    )
+        except Exception as e_vs:  # noqa: BLE001
+            print(f"    ⚠️ Verificação volume spike: {e_vs}")
 
     print("\n" + "=" * 64)
     print(f"[Ciclo] {SYMBOL_TRADE} | modo={modo_label} | preço ref. ≈ {preco:.4f} USDT")
@@ -418,24 +620,149 @@ def rodar_ciclo(modo: str) -> None:
 
     print("\n--- [AURIC CYCLE START] ---")
 
-    # 1. Sinal Técnico (XGBoost)
+    # 1. Sinal Técnico (XGBoost) + snapshot ADX / VWAP / BB (um download OHLCV)
     probabilidade = ml_model.obter_sinal_atual()
     print(f"📊 [ML] Probabilidade de Alta: {probabilidade:.2%}")
 
+    try:
+        snap = ml_model.obter_snapshot_indicadores_eth(
+            SYMBOL_TRADE, prob_ml=probabilidade
+        )
+    except Exception as e_snap:  # noqa: BLE001
+        print(f"    ⚠️ Snapshot indicadores indisponível: {e_snap}")
+        snap = {
+            "regime": "BAIXA",
+            "atr_pct": None,
+            "atr_pct_median": None,
+            "bb_width_pct": None,
+            "bb_width_median": None,
+            "bollinger_squeeze": False,
+            "detalhe": str(e_snap),
+            "adx_14": None,
+            "adx_regime": "INDEFINIDO",
+            "bb_pct_b": None,
+            "bb_upper": None,
+            "bb_lower": None,
+            "bb_middle": None,
+            "vwap_d": None,
+            "preco_close": preco,
+            "vies_vwap": "INDEFINIDO",
+            "mercado_lateral": True,
+            "rsi_14": None,
+        }
+
+    adx_v = snap.get("adx_14")
+    rsi_v = snap.get("rsi_14")
+    vies = snap.get("vies_vwap", "INDEFINIDO")
+    print(
+        f"    [Indicadores] ADX(14)={adx_v if adx_v is not None else 'N/A'} "
+        f"| RSI(14)={rsi_v if rsi_v is not None else 'N/A'} "
+        f"| viés VWAP: {vies} | squeeze BB: {snap.get('bollinger_squeeze')}"
+    )
+
     limiar_short = ML_PROB_SHORT_MAX
     if probabilidade > limiar_short and probabilidade < limiar:
-        print(
-            "\n    [Buscando Oportunidade] ML na zona neutra — sem Hub/Brain; "
-            "aguardando próximo ciclo."
+        reg_vol = snap
+        regime = str(reg_vol.get("regime") or "BAIXA").upper()
+        squeeze = bool(reg_vol.get("bollinger_squeeze"))
+
+        if squeeze:
+            linha_compressao = "Volatilidade em compressão (Bollinger Squeeze)."
+        else:
+            linha_compressao = (
+                "Bandas de Bollinger sem squeeze forte (faixa típica ou expansão)."
+            )
+        if regime == "BAIXA":
+            linha_regime = (
+                "Regime ATR/BB: volatilidade baixa vs. mediana recente (possível acumulação)."
+            )
+        else:
+            linha_regime = (
+                "Regime ATR/BB: volatilidade elevada (mercado errático / chicote)."
+            )
+        linha_decay = (
+            "Camada social (ex.: @VitalikButerin / feeds Alpha): notícias com mais de 2h "
+            "são ignoradas pelo filtro SENTIMENT DECAY (notícias velhas = ruído)."
         )
+        linha_adx_vwap = (
+            f"ADX(14)={adx_v if adx_v is not None else 'N/A'} "
+            f"({'lateral' if snap.get('mercado_lateral') else 'tendência'}) — "
+            f"preço vs VWAP diário: {vies}."
+        )
+        contexto_dashboard = f"{linha_compressao} {linha_regime} {linha_adx_vwap} {linha_decay}"
+
+        atr_p = reg_vol.get("atr_pct")
+        med_a = reg_vol.get("atr_pct_median")
+        bw = reg_vol.get("bb_width_pct")
+        med_b = reg_vol.get("bb_width_median")
+        partes_metricas: list[str] = []
+        if atr_p is not None and med_a is not None:
+            partes_metricas.append(f"ATR%={float(atr_p):.5f} (mediana ref. {float(med_a):.5f})")
+        if bw is not None and med_b is not None:
+            partes_metricas.append(
+                f"BB width={float(bw):.5f} (mediana ref. {float(med_b):.5f})"
+            )
+        metricas_txt = (
+            "; ".join(partes_metricas)
+            if partes_metricas
+            else str(reg_vol.get("detalhe") or "—")
+        )
+
+        adx_txt = (
+            f"{float(adx_v):.0f}"
+            if adx_v is not None
+            else "—"
+        )
+        rsi_txt = (
+            f"{float(rsi_v):.0f}"
+            if rsi_v is not None
+            else "—"
+        )
+        rot_adx = indicators.rotulo_regime_adx(
+            float(adx_v) if adx_v is not None else None
+        )
+        rot_rsi = indicators.rotulo_regime_rsi(
+            float(rsi_v) if rsi_v is not None else None
+        )
+        if squeeze:
+            linha_decisao = (
+                "Mercado sem tendência definida. Protegendo capital e aguardando expansão "
+                "de volume (Bollinger Squeeze detectado)."
+            )
+        else:
+            linha_decisao = (
+                "Mercado sem tendência definida. Protegendo capital e aguardando "
+                "clarificação de volatilidade ou sinal ML fora da zona neutra."
+            )
+
+        just_dashboard = (
+            f"STATUS: MONITORANDO\n"
+            f"ML: {probabilidade * 100:.1f}% (Neutro)\n"
+            f"ADX: {adx_txt} ({rot_adx})\n"
+            f"RSI: {rsi_txt} ({rot_rsi})\n"
+            f"DECISÃO: {linha_decisao}\n"
+            f"---\n"
+            f"CONTEXTO: {contexto_dashboard}\n"
+            f"{metricas_txt} | P(alta)={probabilidade:.4f} ∈ "
+            f"({limiar_short},{limiar}); Hub/Brain inativos."
+        )
+
+        print("\n    [Painel de mercado — zona neutra / heatmap]")
+        for ln in just_dashboard.split("\n"):
+            if ln.strip() and not ln.startswith("---"):
+                print(f"    {ln}")
+        print(f"    [Métricas técnicas] {metricas_txt}")
+
         logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
+            par_moeda=SYMBOL_TRADE,
             preco=preco,
             prob_ml=probabilidade,
             sentimento="—",
-            acao="HOLD",
-            justificativa=(
-                f"P(alta)={probabilidade:.4f} ∈ ({limiar_short},{limiar}); sem ativação Hub/Brain."
+            acao="MONITORANDO",
+            justificativa=just_dashboard,
+            contexto_raw=indicators.formatar_log_contexto_raw(
+                "(Intelligence Hub não consultado — ML na zona neutra.)",
+                {**snap, "prob_ml": probabilidade},
             ),
         )
         return
@@ -453,6 +780,29 @@ def rodar_ciclo(modo: str) -> None:
     contexto = hub.obter_contexto_agregado()
     print(contexto[:1200] + ("..." if len(contexto) > 1200 else ""))
 
+    sym_ohlcv = SYMBOL_TRADE
+    if modo == "FUTURES":
+        sym_ohlcv = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+
+    confluencia: dict[str, Any] | None = None
+    try:
+        confluencia = indicators.obter_indicadores_confluencia(ex, sym_ohlcv)
+        print(
+            "    [Confluência 1h] "
+            f"ADX={confluencia.get('adx')} VWAP={confluencia.get('vwap')} "
+            f"| vs VWAP: {confluencia.get('posicao_vwap')} "
+            f"| squeeze: {confluencia.get('squeeze')}"
+        )
+    except Exception as e_cf:  # noqa: BLE001
+        print(f"    ⚠️ Indicadores confluência indisponíveis: {e_cf}")
+
+    snap_log = {**snap, "prob_ml": probabilidade}
+    if confluencia is not None:
+        snap_log["confluencia"] = confluencia
+
+    contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
+    bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
+
     # 3. Ativa o Cérebro (Claude 3.5 Sonnet)
     print("🧠 [BRAIN] Consultando Claude 3.5 Sonnet (Final Boss Mode)...")
     veredito = brain.analisar_sentimento_mercado(
@@ -461,6 +811,7 @@ def rodar_ciclo(modo: str) -> None:
         limiar_ml=limiar,
         direcao_sugerida=direcao_sugerida,
         verbose=False,
+        bloco_tecnico_prioritario=bloco_ta,
     )
 
     sent = str(veredito.get("sentimento", "")).upper().strip()
@@ -468,6 +819,11 @@ def rodar_ciclo(modo: str) -> None:
         conf_num = int(float(veredito.get("confianca", 0)))
     except (TypeError, ValueError):
         conf_num = 0
+    conf_num = indicators.aplicar_boost_confianca_squeeze(
+        probabilidade,
+        bool(snap.get("bollinger_squeeze")),
+        conf_num,
+    )
     alerta = str(veredito.get("alerta_macro") or "").strip()
     just_ia = (
         veredito.get("justificativa_curta")
@@ -479,7 +835,10 @@ def rodar_ciclo(modo: str) -> None:
 
     print(
         f"⚖️ [DECISION] Veredito: {veredito.get('sentimento', '—')} | "
-        f"Confiança: {veredito.get('confianca')}%"
+        f"Confiança efetiva: {conf_num}% "
+        f"(Brain {veredito.get('confianca')}% + regras; "
+        f"se P≥{indicators.ML_PROB_LIMIAR_BOOST_SQUEEZE:.0%} e squeeze BB → "
+        f"mín. {indicators.CONFIANCA_BOOST_SQUEEZE}%)"
     )
     print(
         f"📝 [REASON] "
@@ -496,12 +855,30 @@ def rodar_ciclo(modo: str) -> None:
     )
 
     # 4. Filtro de execução (entrada)
+    if sent not in ("BULLISH", "BEARISH"):
+        print(
+            "    [Buscando Oportunidade] Só executa com sentimento BULLISH ou BEARISH; "
+            f"recebido={sent}."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento=sent,
+            acao="VETO_SENTIMENTO",
+            justificativa=f"{just_ia} | sentimento={sent} (exige BULLISH/BEARISH)",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
+        )
+        return
+
     if pos_rec == "VETO" or pos_rec != direcao_sugerida:
         print(
             "    [Buscando Oportunidade] Brain não confirma a direção técnica (VETO ou divergência)."
         )
         logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
+            par_moeda=SYMBOL_TRADE,
             preco=preco,
             prob_ml=probabilidade,
             sentimento=sent,
@@ -509,6 +886,9 @@ def rodar_ciclo(modo: str) -> None:
             justificativa=(
                 f"{just_ia} | posicao_recomendada={pos_rec} vs direcao_sugerida={direcao_sugerida}"
             ),
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
         )
         return
 
@@ -518,50 +898,129 @@ def rodar_ciclo(modo: str) -> None:
             f"{CONFIANCA_BRAIN_MIN_ENTRADA}% — sem entrada."
         )
         logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
+            par_moeda=SYMBOL_TRADE,
             preco=preco,
             prob_ml=probabilidade,
             sentimento=sent,
             acao="VETO_CONFIANCA_BRAIN",
             justificativa=f"{just_ia} (conf {conf_num}% < {CONFIANCA_BRAIN_MIN_ENTRADA}%)",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
         )
         return
 
-    if direcao_sugerida == "SHORT" and modo != "FUTURES":
+    if snap.get("mercado_lateral") and not snap.get("bollinger_squeeze"):
+        if pos_rec == direcao_sugerida and sent in ("BULLISH", "BEARISH"):
+            adx_s = snap.get("adx_14")
+            print(
+                "    [Buscando Oportunidade] ADX indica mercado lateral (ADX "
+                f"< {indicators.ADX_LIMIAR_TENDENCIA} sem squeeze BB): não operar "
+                "rompimento na direção do ML — preferir reversão/mean-reversion."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_ADX_LATERAL",
+                justificativa=(
+                    f"{just_ia} | ADX(14)={adx_s} < {indicators.ADX_LIMIAR_TENDENCIA} "
+                    "sem Bollinger Squeeze — sinal de continuação/tendência desvalorizado."
+                ),
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
+
+    dry_run = os.getenv("AURIC_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+    if dry_run:
         print(
-            "    [Buscando Oportunidade] SHORT requer FUTURES — modo SPOT não abre venda a descoberto."
+            "🔸 [DRY RUN] AURIC_DRY_RUN ativo — nenhuma ordem real será enviada à Binance."
         )
         logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento=sent,
+            acao="DRY_RUN",
+            justificativa=f"{just_ia} | simulação apenas (defina AURIC_DRY_RUN=0 para mainnet)",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
+        )
+        return
+
+    if sent == "BEARISH" and modo != "FUTURES":
+        print(
+            "    [Buscando Oportunidade] BEARISH/SHORT requer FUTURES — modo SPOT não abre short."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
             preco=preco,
             prob_ml=probabilidade,
             sentimento=sent,
             acao="VETO_SHORT_SPOT",
             justificativa=f"{just_ia} | ative FUTURES na config para operar SHORT.",
             lado_ordem="SHORT",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
         )
         return
 
-    if direcao_sugerida == "LONG":
-        entrada_txt = (
-            f"COMPRA (Long) MARKET ~{VALOR_COMPRA_USDT:.2f} USDT ({modo_label}, mainnet)."
-        )
+    if sent == "BEARISH" and indicators.rsi_proibe_entrada_short(snap.get("rsi_14")):
+        rsi_c = snap.get("rsi_14")
         print(
-            f"    [Buscando Oportunidade] Confluência LONG + posicao_recomendada=LONG + "
+            f"    [Risco] RSI sobrevendido (RSI(14)={rsi_c}) — SHORT proibido («vender o fundo»)."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento=sent,
+            acao="VETO_RSI_OVERSOLD",
+            justificativa=(
+                f"{just_ia} | RSI(14)={rsi_c} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT} "
+                "(abrir SHORT vetado)"
+            ),
+            lado_ordem="SHORT",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
+        )
+        return
+
+    if sent == "BULLISH":
+        if modo == "FUTURES":
+            notional_alvo = executor_futures.notional_usdt_futuros_position_sizing(
+                ex, float(ALAVANCAGEM_PADRAO)
+            )
+            entrada_txt = (
+                f"COMPRA (Long) LIMIT (+0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
+                f"(15% banca × {ALAVANCAGEM_PADRAO}x, {modo_label}, mainnet)."
+            )
+        else:
+            notional_alvo = executor_spot.obter_saldo_usdt(ex) * executor_spot.PERCENTUAL_BANCA
+            entrada_txt = (
+                f"COMPRA (Long) LIMIT (+0,05%) — custo ≈ {notional_alvo:.2f} USDT "
+                f"(15% saldo spot, {modo_label}, mainnet)."
+            )
+        print(
+            f"    [Buscando Oportunidade] BULLISH + ML/Brain alinhados + "
             f"conf≥{CONFIANCA_BRAIN_MIN_ENTRADA}% — {entrada_txt}"
         )
         try:
+            print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             if modo == "FUTURES":
-                ordem = ex_mod.executar_compra_spot_market(
+                ordem = executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
-                    VALOR_COMPRA_USDT,
                     ex,
                     alavancagem=float(ALAVANCAGEM_PADRAO),
                 )
             else:
-                ordem = ex_mod.executar_compra_spot_market(
-                    SYMBOL_TRADE, VALOR_COMPRA_USDT, ex
-                )
+                ordem = ex_mod.executar_compra_spot_market(SYMBOL_TRADE, exchange=ex)
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")
             preco_compra = float(ordem.get("auric_entry_price") or preco)
@@ -573,17 +1032,21 @@ def rodar_ciclo(modo: str) -> None:
                 else ""
             )
             just_final = (
-                f"{just_ia} | Ordem id={oid} status={st}; custo {VALOR_COMPRA_USDT} USDT.{bracket_note} "
+                f"{just_ia} | Ordem id={oid} status={st}; "
+                f"notional/custo alvo ≈ {notional_alvo:.2f} USDT.{bracket_note} "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (LONG)."
             )
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=probabilidade,
                 sentimento=sent,
-                acao="COMPRA_LONG_MARKET",
+                acao="COMPRA_LONG_LIMIT",
                 justificativa=just_final,
                 lado_ordem="LONG",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
             )
             print(
                 f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
@@ -600,66 +1063,109 @@ def rodar_ciclo(modo: str) -> None:
             err_txt = f"Falha na ordem: {e_ord!s}"
             print(f"    [ERRO] {err_txt}")
             logger.registrar_log_trade(
-                ativo=SYMBOL_TRADE,
+                par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=probabilidade,
                 sentimento=sent,
                 acao="ERRO_EXECUCAO",
                 justificativa=f"{just_ia} | {err_txt}",
                 lado_ordem="LONG",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
             )
         return
 
-    # SHORT (futures)
-    entrada_txt = (
-        f"VENDA (Short) MARKET ~{VALOR_COMPRA_USDT:.2f} USDT notional ({modo_label})."
-    )
-    print(
-        f"    [Buscando Oportunidade] Confluência SHORT + posicao_recomendada=SHORT + "
-        f"conf≥{CONFIANCA_BRAIN_MIN_ENTRADA}% — {entrada_txt}"
-    )
-    try:
-        ordem = executor_futures.abrir_short_market(
-            SYMBOL_TRADE, VALOR_COMPRA_USDT, ex, alavancagem=float(ALAVANCAGEM_PADRAO)
+    elif sent == "BEARISH":
+        notional_alvo = executor_futures.notional_usdt_futuros_position_sizing(
+            ex, float(ALAVANCAGEM_PADRAO)
         )
-        oid = ordem.get("id", "?")
-        st = ordem.get("status", "?")
-        preco_compra = float(ordem.get("auric_entry_price") or preco)
-        posicao_aberta = True
-        direcao_posicao = "SHORT"
-        just_final = (
-            f"{just_ia} | Short id={oid} status={st}; notional ~{VALOR_COMPRA_USDT} USDT. "
-            " TP/SL reduce-only na Binance. "
-            f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (SHORT)."
-        )
-        logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento=sent,
-            acao="ABRE_SHORT_MARKET",
-            justificativa=just_final,
-            lado_ordem="SHORT",
+        entrada_txt = (
+            f"VENDA (Short) LIMIT (−0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
+            f"(15% banca × {ALAVANCAGEM_PADRAO}x, {modo_label})."
         )
         print(
-            f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
+            f"    [Buscando Oportunidade] BEARISH + ML/Brain alinhados + "
+            f"conf≥{CONFIANCA_BRAIN_MIN_ENTRADA}% — {entrada_txt}"
         )
-        print(
-            "    Próximos ciclos: >>> MODO VIGIA <<< "
-            "(FUTURES: TP/SL na bolsa; maestro como rede de segurança)"
-        )
-    except Exception as e_ord:  # noqa: BLE001
-        err_txt = f"Falha na ordem short: {e_ord!s}"
-        print(f"    [ERRO] {err_txt}")
-        logger.registrar_log_trade(
-            ativo=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento=sent,
-            acao="ERRO_EXECUCAO",
-            justificativa=f"{just_ia} | {err_txt}",
-            lado_ordem="SHORT",
-        )
+        try:
+            sym_f = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+            if indicators.volume_compra_spike_1m(ex, sym_f):
+                executor_futures.cancelar_ordens_entrada_short(ex, SYMBOL_TRADE)
+                print(
+                    "    [Risco] Volume 1m +300% vs. minuto anterior — "
+                    "SHORT abortado (spike de volume)."
+                )
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento=sent,
+                    acao="VETO_VOLUME_SPIKE",
+                    justificativa=(
+                        f"{just_ia} | volume 1m fechado ≥ "
+                        f"{1.0 + indicators.VOLUME_SPIKE_FRACAO_1M:.0f}× o minuto anterior — "
+                        "sem abrir SHORT"
+                    ),
+                    lado_ordem="SHORT",
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia,
+                    noticias_agregadas=contexto,
+                )
+                return
+        except Exception as e_sp:  # noqa: BLE001
+            print(f"    ⚠️ Verificação volume spike (antes do SHORT): {e_sp}")
+        try:
+            print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
+            ordem = executor_futures.abrir_short_market(
+                SYMBOL_TRADE,
+                ex,
+                alavancagem=float(ALAVANCAGEM_PADRAO),
+            )
+            oid = ordem.get("id", "?")
+            st = ordem.get("status", "?")
+            preco_compra = float(ordem.get("auric_entry_price") or preco)
+            posicao_aberta = True
+            direcao_posicao = "SHORT"
+            just_final = (
+                f"{just_ia} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDT. "
+                " TP/SL reduce-only na Binance. "
+                f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (SHORT)."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="ABRE_SHORT_LIMIT",
+                justificativa=just_final,
+                lado_ordem="SHORT",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            print(
+                f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
+            )
+            print(
+                "    Próximos ciclos: >>> MODO VIGIA <<< "
+                "(FUTURES: TP/SL na bolsa; maestro como rede de segurança)"
+            )
+        except Exception as e_ord:  # noqa: BLE001
+            err_txt = f"Falha na ordem short: {e_ord!s}"
+            print(f"    [ERRO] {err_txt}")
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="ERRO_EXECUCAO",
+                justificativa=f"{just_ia} | {err_txt}",
+                lado_ordem="SHORT",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
 
 
 def main() -> None:
@@ -718,7 +1224,7 @@ def main() -> None:
             try:
                 preco = obter_preco_referencia(SYMBOL_TRADE, modo)
                 logger.registrar_log_trade(
-                    ativo=SYMBOL_TRADE,
+                    par_moeda=SYMBOL_TRADE,
                     preco=preco,
                     prob_ml=-1.0,
                     sentimento="—",

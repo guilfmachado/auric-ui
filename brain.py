@@ -1,9 +1,9 @@
 """
-Análise de sentimento (ETH) via Replicate — Claude 3.5 Sonnet.
+Análise de sentimento (ETH) via Replicate — por omissão Claude 4.5 Sonnet (anthropic/claude-4.5-sonnet).
 
 Motor «Auric Final Boss»: macro-correlacional + vetores geopolítico, infra e baleias;
 contexto agregado do IntelligenceHub; cruza com P(alta) do XGBoost e direção sugerida (LONG/SHORT).
-Saída JSON: sentimento, confianca, justificativa_curta, alerta_macro, posicao_recomendada.
+Saída: JSON com esses campos ou texto veredito (BULLISH/BEARISH/VETO) convertido para o mesmo formato.
 """
 
 from __future__ import annotations
@@ -14,13 +14,26 @@ import re
 import sys
 from typing import Any
 
+import numpy as np
 import replicate
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Modelo padrão no Replicate — versão estável oficial (sobrescreva com REPLICATE_MODEL no .env).
-MODEL_SLUG = os.getenv("REPLICATE_MODEL", "anthropic/claude-3.5-sonnet").strip()
+# Por omissão: Claude 4.5 Sonnet no Replicate. Override: REPLICATE_BRAIN_MODEL ou REPLICATE_MODEL_VERSION (slug/digest).
+_DEFAULT_BRAIN_MODEL = "anthropic/claude-4.5-sonnet"
+REPLICATE_MODEL = (
+    os.getenv("REPLICATE_BRAIN_MODEL") or os.getenv("REPLICATE_MODEL_VERSION") or _DEFAULT_BRAIN_MODEL
+).strip()
+
+# Claude 4.5 no Replicate: manter max_tokens ≥ 1024; temperatura baixa = analista de risco, não «poeta».
+_BRAIN_MAX_TOKENS = 1024
+_BRAIN_TEMPERATURE = 0.3
+
+
+def _pct_br_ml(prob: float) -> str:
+    """P(alta) em percentagem legível (pt), ex.: 25,10%."""
+    return f"{float(prob) * 100:.2f}".replace(".", ",") + "%"
 
 
 def _token_configurado() -> bool:
@@ -81,6 +94,68 @@ def _parse_json_resposta(texto: str) -> dict[str, Any]:
     raise json.JSONDecodeError("Nenhum objeto JSON válido encontrado", texto, 0)
 
 
+def _dict_from_veredito_texto_brain(
+    raw: str,
+    *,
+    direcao_sugerida: str,
+) -> dict[str, Any]:
+    """
+    Resposta em texto (BULLISH / BEARISH / VETO + justificativa) → dict compatível com main.py.
+    """
+    texto = (raw or "").strip()
+    if not texto or texto.upper() == "ERROR":
+        return {
+            "sentimento": "ERROR",
+            "confianca": 0,
+            "justificativa_curta": texto or "resposta vazia",
+            "alerta_macro": "",
+            "posicao_recomendada": "VETO",
+        }
+
+    up = texto.upper()
+    sentimento = "NEUTRAL"
+    for tok in ("BULLISH", "BEARISH", "VETO"):
+        if re.search(rf"\b{tok}\b", up):
+            sentimento = tok
+            break
+
+    if sentimento == "NEUTRAL":
+        if "BULLISH" in up:
+            sentimento = "BULLISH"
+        elif "BEARISH" in up:
+            sentimento = "BEARISH"
+        elif "VETO" in up:
+            sentimento = "VETO"
+
+    if sentimento == "NEUTRAL":
+        sentimento = "CAUTIOUS"
+
+    if sentimento == "BULLISH":
+        pos_rec = "LONG"
+    elif sentimento == "BEARISH":
+        pos_rec = "SHORT"
+    else:
+        pos_rec = "VETO"
+
+    just = texto
+    for tok in ("BULLISH", "BEARISH", "VETO", "CAUTIOUS"):
+        m = re.search(rf"\b{tok}\b", texto, flags=re.IGNORECASE)
+        if m:
+            just = texto[m.end() :].strip(" \n:-—")
+            break
+
+    if not just:
+        just = texto[:500]
+
+    return {
+        "sentimento": sentimento,
+        "confianca": 72,
+        "justificativa_curta": just[:2000] if just else texto[:2000],
+        "alerta_macro": "",
+        "posicao_recomendada": pos_rec,
+    }
+
+
 def _prompt_sistema_claude(direcao_sugerida: str) -> str:
     d = (direcao_sugerida or "LONG").strip().upper()
     if d not in ("LONG", "SHORT"):
@@ -126,9 +201,16 @@ def _montar_prompt_completo_claude(
     *,
     ref_xgboost: str | None = None,
     direcao_sugerida: str = "LONG",
+    bloco_tecnico_prioritario: str | None = None,
 ) -> str:
+    base = _prompt_sistema_claude(direcao_sugerida)
+    if bloco_tecnico_prioritario and str(bloco_tecnico_prioritario).strip():
+        base += (
+            "\n\n=== ANÁLISE TÉCNICA (leitura obrigatória antes das notícias) ===\n\n"
+            + str(bloco_tecnico_prioritario).strip()
+        )
     bloco = (
-        _prompt_sistema_claude(direcao_sugerida)
+        base
         + "\n\n=== CONTEXTO AGREGADO (NÃO INVENTES FACTOS FORA DESTE BLOCO) ===\n\n"
         + bloco_dados
     )
@@ -141,12 +223,43 @@ def _montar_prompt_completo_claude(
     return bloco
 
 
-def _input_replicate_claude(prompt_completo: str) -> dict[str, Any]:
-    return {
-        "prompt": prompt_completo,
-        "max_tokens": 1024,
-        "temperature": 0.15,
-    }
+def montar_bloco_tecnico_final_boss(snapshot: dict[str, Any]) -> str:
+    """
+    Missão «Final Boss» + detalhe de indicadores (regras em indicators).
+    """
+    import indicators
+
+    adx_raw = snapshot.get("adx_14")
+    adx_str = "N/A"
+    if adx_raw is not None:
+        try:
+            x = float(adx_raw)
+            if not (isinstance(x, float) and np.isnan(x)):
+                adx_str = f"{x:.2f}"
+        except (TypeError, ValueError):
+            pass
+
+    vies = snapshot.get("vies_vwap", "INDEFINIDO")
+    acima_ou_abaixo = indicators.texto_preco_vs_vwap(str(vies))
+    status_bollinger = indicators.descrever_status_bollinger_para_prompt(snapshot)
+    confluencia = snapshot.get("confluencia")
+    if isinstance(confluencia, dict) and confluencia:
+        bloco_conf = "\n\n" + indicators.formatar_confluencia_para_llm(confluencia)
+    else:
+        bloco_conf = ""
+
+    missao = f"""Você é o estrategista chefe. Além das notícias e do ML, considere estes dados técnicos:
+
+ADX: {adx_str} (Indica força da tendência)
+
+Preço vs VWAP: {acima_ou_abaixo} (Viés institucional)
+
+Bollinger: {status_bollinger} (Indica se o preço está esticado ou comprimido)
+
+Sua Missão: Se o ML der 83% de alta, mas o ADX estiver em 12 (lateral) e o preço abaixo da VWAP, você deve dar VETO. Só confirme o trade se houver CONFLUÊNCIA entre técnico e notícias."""
+
+    detalhe = indicators.formatar_bloco_indicadores_para_llm(snapshot)
+    return f"{missao}\n\n{detalhe}{bloco_conf}"
 
 
 def analisar_sentimento_mercado(
@@ -156,9 +269,12 @@ def analisar_sentimento_mercado(
     limiar_ml: float | None = None,
     direcao_sugerida: str = "LONG",
     verbose: bool = True,
+    bloco_indicadores: str | None = None,
+    bloco_tecnico_prioritario: str | None = None,
 ) -> dict[str, Any]:
     """
-    Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Claude via Replicate.
+    Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Replicate (Claude 4.5 por omissão).
+    `replicate.run` é síncrono; a saída pode ser string ou iterável de strings — normalizamos com `_saida_replicate_para_string`.
     """
     if not _token_configurado():
         _avisar_token_ausente()
@@ -177,47 +293,91 @@ def analisar_sentimento_mercado(
     ref_xg: str | None = None
     if prob_ml is not None:
         lim_txt = f"{limiar_ml:.4f}" if limiar_ml is not None else "N/A"
+        p = float(prob_ml)
+        pct_br = _pct_br_ml(p)
         ref_xg = (
             "=== SINAL TÉCNICO (XGBoost — referência do orquestrador neste ciclo) ===\n"
-            f"P(alta próximo horizonte) = {prob_ml:.4f}. "
+            f"P(alta próximo horizonte): {pct_br} (valor em [0,1]: {p:.6f}; também {p:.4f}).\n"
             f"Limiar long do maestro (ativa Hub): {lim_txt}; zona short: P(alta) ≤ 0,40. "
-            f"Direção sugerida neste ciclo: {d}. "
-            "Cruza com macro/geopolítica/infra/baleias; divergência crítica → posicao_recomendada VETO."
+            f"Direção sugerida neste ciclo: {d}.\n"
+            "Obrigatório: cruza esta percentagem com as manchetes e texto da secção "
+            "«=== CONTEXTO AGREGADO» (notícias / Reddit / Twitter) acima; divergência crítica "
+            "→ posicao_recomendada VETO."
         )
+
+    ta_block = bloco_tecnico_prioritario
+    if not (ta_block and str(ta_block).strip()) and bloco_indicadores and str(
+        bloco_indicadores
+    ).strip():
+        ta_block = str(bloco_indicadores).strip()
 
     prompt_completo = _montar_prompt_completo_claude(
         contexto_agregado,
         ref_xgboost=ref_xg,
         direcao_sugerida=d,
+        bloco_tecnico_prioritario=ta_block,
     )
 
+    model_slug = REPLICATE_MODEL
     if verbose:
-        print("[Brain] Enviando contexto para Replicate (Claude 3.5 Sonnet)...")
-        print(f"   Modelo: {MODEL_SLUG}")
+        print("🧠 [BRAIN] Consultando Claude 4.5 Sonnet (Elite Mode)...")
+
+    if prob_ml is not None:
+        instrucao_duplo = (
+            "Atua como analista de risco institucional: factual, conservador, sem optimismo nem criatividade literária.\n"
+            "O contexto que se segue inclui obrigatoriamente (1) a secção «=== CONTEXTO AGREGADO» com o texto "
+            "das notícias e feeds (institucional, Reddit, Twitter) e (2) o bloco final «=== SINAL TÉCNICO (XGBoost)» "
+            "com P(alta) em percentagem explícita e em [0,1]. Cruza (1) com (2); se divergirem de forma material, "
+            "VETO.\n"
+            f"Resumo do sinal numérico deste ciclo (repetido no XGBoost no final): P(alta) = {_pct_br_ml(float(prob_ml))}.\n"
+        )
+    else:
+        instrucao_duplo = (
+            "Atua como analista de risco institucional: factual, conservador, sem optimismo nem criatividade literária.\n"
+            "O contexto inclui a secção «=== CONTEXTO AGREGADO» com o texto das notícias e feeds; "
+            "baseia a leitura de factos apenas nesse texto (e indicadores técnicos se presentes).\n"
+        )
+    prompt = (
+        f"{instrucao_duplo}\n"
+        "Responde em conformidade com o preâmbulo do sistema: apenas o objeto JSON pedido (cinco chaves), "
+        "sem markdown nem texto extra.\n\n"
+        f"--- Contexto ---\n{prompt_completo}"
+    )
 
     try:
-        inp = _input_replicate_claude(prompt_completo)
-        output = replicate.run(MODEL_SLUG, input=inp)
+        output = replicate.run(
+            model_slug,
+            input={
+                "prompt": prompt,
+                "max_tokens": _BRAIN_MAX_TOKENS,
+                "temperature": _BRAIN_TEMPERATURE,
+            },
+        )
         resposta_bruta = _saida_replicate_para_string(output).strip()
+        if verbose:
+            print("✅ [BRAIN] Resposta do 4.5 recebida!")
 
-        try:
-            dados = _parse_json_resposta(resposta_bruta)
-            return dados
-        except json.JSONDecodeError as e:
-            if verbose:
-                print(f"[Brain] Falha no parse JSON: {e}")
-                print(f"[Brain] Trecho (800 chars):\n{resposta_bruta[:800]}")
+        if resposta_bruta.upper() == "ERROR" or not resposta_bruta:
             return {
                 "sentimento": "ERROR",
                 "confianca": 0,
-                "justificativa_curta": f"JSON inválido: {e!s}",
+                "justificativa_curta": resposta_bruta or "resposta vazia",
                 "alerta_macro": "",
                 "posicao_recomendada": "VETO",
             }
 
+        try:
+            return _parse_json_resposta(resposta_bruta)
+        except json.JSONDecodeError:
+            if verbose:
+                print("[Brain] Resposta não-JSON — interpretando veredito BULLISH/BEARISH/VETO.")
+            return _dict_from_veredito_texto_brain(
+                resposta_bruta,
+                direcao_sugerida=d,
+            )
+
     except Exception as e:  # noqa: BLE001
-        if verbose:
-            print(f"[Brain] Erro na chamada ao Replicate: {e}")
+        print(f"❌ [BRAIN ERROR] Falha no Claude 4.5: {e}")
         return {
             "sentimento": "ERROR",
             "confianca": 0,
@@ -261,7 +421,7 @@ def analyze_decision(market_context: dict[str, Any]) -> dict[str, Any]:
         "confidence": confidence,
         "raw_response": raw_response,
         "replicate_prediction_id": None,
-        "model": MODEL_SLUG,
+        "model": REPLICATE_MODEL,
     }
 
 

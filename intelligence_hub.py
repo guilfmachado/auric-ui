@@ -12,6 +12,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import feedparser
@@ -43,6 +44,57 @@ TWITTER_ALPHA_ACCOUNTS: tuple[tuple[str, str], ...] = (
 _RE_HTML_TAGS = re.compile(r"<[^>]+>", re.DOTALL)
 _RE_URLS = re.compile(r"https?://[^\s\]\)<>\"']+")
 _RE_ESPACOS = re.compile(r"\s+")
+
+# Notícias com mais idade que isto são descartadas (ruído em cripto).
+NOTICIAS_MAX_IDADE_HORAS = 2
+
+
+def _timestamp_da_entrada_feed(ent: Any) -> datetime | None:
+    """Data UTC da entrada RSS/Atom (feedparser), ou None se não for parseável."""
+    get = getattr(ent, "get", None)
+    if not callable(get):
+        return None
+    pp = get("published_parsed") or get("updated_parsed")
+    if not pp:
+        return None
+    try:
+        return datetime(
+            pp.tm_year,
+            pp.tm_mon,
+            pp.tm_mday,
+            pp.tm_hour,
+            pp.tm_min,
+            pp.tm_sec,
+            tzinfo=timezone.utc,
+        )
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def filtrar_noticias_recentes(
+    noticias: list[dict[str, Any]],
+    *,
+    horas: int = NOTICIAS_MAX_IDADE_HORAS,
+) -> list[dict[str, Any]]:
+    """
+    Remove itens com mais de `horas` de idade (UTC). Exige `timestamp` timezone-aware.
+    Itens sem `timestamp` são descartados (idade desconhecida = não confiável para «freshness»).
+    """
+    agora = datetime.now(timezone.utc)
+    limite = agora - timedelta(hours=horas)
+    noticias_filtradas = [
+        n
+        for n in noticias
+        if n.get("timestamp") is not None and n["timestamp"] > limite
+    ]
+    if noticias:
+        descartadas = len(noticias) - len(noticias_filtradas)
+        if descartadas:
+            print(
+                f"[INTELLIGENCE_HUB] 🧹 [SENTIMENT DECAY] {descartadas} notícias antigas "
+                f"descartadas (janela {horas}h UTC)."
+            )
+    return noticias_filtradas
 
 
 def limpar_texto_feed_bruto(texto: str, max_chars: int = 380) -> str:
@@ -129,13 +181,15 @@ def buscar_tweets_nitter(
             texto_limpo = limpar_texto_feed_bruto(bruto.strip())
             if not texto_limpo:
                 continue
-            saida.append(
-                {
-                    "text": texto_limpo,
-                    "link": limpar_texto_feed_bruto((ent.get("link") or "")[:200]),
-                    "published": (ent.get("published") or ent.get("updated") or "").strip(),
-                }
-            )
+            ts = _timestamp_da_entrada_feed(ent)
+            item: dict[str, Any] = {
+                "text": texto_limpo,
+                "link": limpar_texto_feed_bruto((ent.get("link") or "")[:200]),
+                "published": (ent.get("published") or ent.get("updated") or "").strip(),
+            }
+            if ts is not None:
+                item["timestamp"] = ts
+            saida.append(item)
 
         if saida:
             print(
@@ -210,13 +264,15 @@ class IntelligenceHub:
                 title = (ent.get("title") or "").strip()
                 if not title:
                     continue
-                saida.append(
-                    {
-                        "title": limpar_texto_feed_bruto(title, max_chars=500),
-                        "link": (ent.get("link") or "").strip(),
-                        "published": (ent.get("published") or ent.get("updated") or "").strip(),
-                    }
-                )
+                ts = _timestamp_da_entrada_feed(ent)
+                row: dict[str, Any] = {
+                    "title": limpar_texto_feed_bruto(title, max_chars=500),
+                    "link": (ent.get("link") or "").strip(),
+                    "published": (ent.get("published") or ent.get("updated") or "").strip(),
+                }
+                if ts is not None:
+                    row["timestamp"] = ts
+                saida.append(row)
             return saida
         except Exception as e:  # noqa: BLE001
             print(
@@ -238,6 +294,13 @@ class IntelligenceHub:
                 blocos.append(
                     f"[{label_exibicao} — Twitter / X]\n"
                     "(sem entradas neste ciclo — ver logs [NITTER_ROUTER] / [INTELLIGENCE_HUB].)"
+                )
+                continue
+            itens = filtrar_noticias_recentes(itens)
+            if not itens:
+                blocos.append(
+                    f"[{label_exibicao} — Twitter / X]\n"
+                    "(apenas entradas >2h ou sem data — descartadas por [SENTIMENT DECAY].)"
                 )
                 continue
             linhas = [f"- {x['text']}" for x in itens]
@@ -281,10 +344,11 @@ class IntelligenceHub:
 
     def _formatar_bloco_institucional(self) -> str:
         itens = self.buscar_noticias_rss(self.sources["coindesk"], self.limite_rss)
+        itens = filtrar_noticias_recentes(itens)
         if not itens:
             return (
                 "[CoinDesk — institucional]\n"
-                "(Sem manchetes neste ciclo — feed indisponível ou vazio.)"
+                "(Sem manchetes neste ciclo — feed indisponível, vazio ou só notícias >2h / sem data.)"
             )
         linhas = [f"- {x['title']}" for x in itens]
         return "[CoinDesk — institucional / notícias]\n" + "\n".join(linhas)
@@ -297,6 +361,7 @@ class IntelligenceHub:
         ]
         for feed_url, label in feeds:
             itens = self.buscar_noticias_rss(feed_url, self.limite_reddit)
+            itens = filtrar_noticias_recentes(itens)
             if not itens:
                 print(
                     f"[INTELLIGENCE_HUB] Reddit {label}: sem entradas (rate limit, bloqueio "

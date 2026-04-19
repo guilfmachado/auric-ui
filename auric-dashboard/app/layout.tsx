@@ -14,8 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Auric · Quant Desk",
-  description: "Dashboard de monitoramento do bot de trading quantitativo Auric.",
+  title: "Auric · Final Boss Terminal",
+  description:
+    "Terminal de trading quantitativo — desk midnight, gauges e intelligence log.",
 };
 
 export default function RootLayout({
@@ -26,7 +27,7 @@ export default function RootLayout({
   return (
     <html lang="pt-BR" className="dark">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}
+        className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased bg-[#09090b]`}
       >
         {children}
       </body>

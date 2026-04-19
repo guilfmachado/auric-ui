@@ -20,7 +20,13 @@ exchange = ccxt.binance({
 })
 
 try:
-    balance = exchange.fetch_balance()
-    print("✅ SUCESSO! A chave funciona e o saldo foi lido.")
+    balance = exchange.fetch_balance(params={"type": "future"})
+    usdt = balance.get("USDT") or {}
+    livre = usdt.get("free")
+    tot = usdt.get("total")
+    print(
+        "✅ SUCESSO! A chave funciona e o saldo futuros USDT foi lido "
+        f"(USDT: free={livre!s} | total={tot!s})."
+    )
 except Exception as e:
     print(f"❌ ERRO CONTINUA: {e}")
