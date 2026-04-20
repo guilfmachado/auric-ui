@@ -46,6 +46,12 @@ CLAUDE_RATE_LIMIT_WINDOW_S = 300.0
 METRICS_FLUSH_EVERY_TRIGGERS = 50
 METRICS_FLUSH_EVERY_S = 3600.0
 OUTCOME_AUDIT_INTERVAL_S = 300.0
+# Resiliência HFT: reconexão WS e backoff após falha de ordem (HTTP / margem / notional).
+WS_RECONNECT_DELAY_S = 5.0
+ORDER_FAILURE_BACKOFF_S = 5.0
+# Loop asyncio principal (para asyncio.sleep desde threads do ciclo ML sem bloquear outras tasks).
+_main_event_loop: asyncio.AbstractEventLoop | None = None
+
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
 FATOR_STOP_LOSS = 0.99  # preço <= entrada × 0.99
@@ -108,6 +114,42 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _registar_loop_principal_async() -> None:
+    """
+    Grava o loop em execução para permitir `asyncio.sleep` desde `rodar_ciclo`
+    (thread worker) sem bloquear o event loop (graceful degradation / anti-spam).
+    """
+    global _main_event_loop
+    _main_event_loop = asyncio.get_running_loop()
+
+
+def _cooldown_apos_falha_ordem_desde_thread_ciclo() -> None:
+    """
+    Chamado desde `rodar_ciclo` (asyncio.to_thread): após falha de ordem ML,
+    impõe pausa antes de novos HTTP — usa o loop principal para não parar
+    o WebSocket, métricas ou listener manual durante o backoff.
+    """
+    loop = _main_event_loop
+    sec = float(ORDER_FAILURE_BACKOFF_S)
+    print(
+        f"⏳ [RATE LIMIT] Backoff {sec:.0f}s após falha de execução de ordem (anti-spam HTTP).",
+        flush=True,
+    )
+    if loop is not None and loop.is_running():
+        try:
+            fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(sec), loop)
+            fut.result(timeout=sec + 15.0)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"⚠️ [RATE LIMIT] asyncio.sleep no loop principal falhou ({e}); "
+                f"time.sleep({sec:.0f}s) neste worker.",
+                flush=True,
+            )
+            time.sleep(sec)
+    else:
+        time.sleep(sec)
 
 
 def _permitir_consulta_claude() -> tuple[bool, int, float]:
@@ -321,8 +363,8 @@ def _marcar_comando_manual_executado(row_id: int) -> None:
 
 def verificar_comandos_manuais() -> None:
     """
-    Processa fila `manual_commands` (executed = false): LONG → `abrir_long_market` (LIMIT +0,05%),
-    SHORT → `abrir_short_market` (LIMIT −0,05%), CLOSE → `fechar_posicao_market` (Futuros USDT-M).
+    Processa fila `manual_commands` (executed = false): LONG → `abrir_long_market` (LIMIT bid×1,0005 GTC+chase),
+    SHORT → `abrir_short_market` (LIMIT ask×0,9995), CLOSE → `fechar_posicao_market` (LIMIT reduce-only+chase).
     Após sucesso, marca executed = true.
     """
     if logger.supabase is None:
@@ -569,6 +611,11 @@ async def _escutar_comandos_manuais() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
             await asyncio.to_thread(_mark_manual_command_status_sync, rid, "FAILED")
+            print(
+                f"⏳ [MANUAL LISTENER] Cooldown {ORDER_FAILURE_BACKOFF_S:.0f}s após falha "
+                "(anti-spam / rate limit exchange)."
+            )
+            await asyncio.sleep(ORDER_FAILURE_BACKOFF_S)
 
 
 def _simbolo_binance_rest(simbolo: str) -> str:
@@ -1505,6 +1552,7 @@ def rodar_ciclo(modo: str) -> None:
                 justificativa_ia=just_ia,
                 noticias_agregadas=contexto,
             )
+            _cooldown_apos_falha_ordem_desde_thread_ciclo()
         return
 
     elif sent == "BEARISH":
@@ -1612,6 +1660,7 @@ def rodar_ciclo(modo: str) -> None:
                 justificativa_ia=just_ia,
                 noticias_agregadas=contexto,
             )
+            _cooldown_apos_falha_ordem_desde_thread_ciclo()
 
 
 async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
@@ -1860,6 +1909,8 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     - escuta WebSocket 1m Futures (ETHUSDT)
     - dispara ciclo em fechamento da vela OU pico de volume intra-vela
     - mantém o socket vivo sem bloquear durante ML/Hub/Brain (to_thread)
+    - `while True` + backoff: quedas de WS não derrubam o processo; durante o sleep
+      outras coroutines (manual, métricas, auditoria) continuam a correr.
     """
     del args  # mantido por compat CLI; loop é orientado por eventos WS.
     ultima_vela_fechada_ts: int | None = None
@@ -1963,8 +2014,14 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                             estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
                             print(f"✅ [WS] Ciclo concluído. Estado atual: {estado}")
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️ [WS] Conexão caiu/erro no loop ({e}). Reconectando em 3s...")
-            await asyncio.sleep(3)
+            # Auto-reconnect: não propaga — outras tasks (manual, métricas, auditoria) continuam.
+            print(
+                f"⚠️ [WS] Stream Binance Futures caiu ou erro ({type(e).__name__}: {e}). "
+                f"Auto-reconnect após {WS_RECONNECT_DELAY_S:.0f}s...",
+                flush=True,
+            )
+            traceback.print_exc()
+            await asyncio.sleep(WS_RECONNECT_DELAY_S)
 
 
 async def main() -> None:
@@ -1985,6 +2042,7 @@ async def main() -> None:
         help="Segundos entre ciclos (padrão: 300 = 5 min).",
     )
     args = parser.parse_args()
+    _registar_loop_principal_async()
 
     print(
         "\n[Maestro] Bot quantitativo | MAINNET | modo SPOT/FUTURES via Supabase (config) | "

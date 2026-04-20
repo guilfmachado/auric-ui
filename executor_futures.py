@@ -32,7 +32,8 @@ ALAVANCAGEM_REF_LOG_PADRAO = 3
 # Position sizing: notional USDT = saldo_USDT × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
 PERCENTUAL_BANCA = 0.15
 
-# Abertura em LIMIT agressivo vs. último preço (proteção de slippage): long acima, short abaixo.
+# LIMIT + offset vs. livro (maker-friendly): compra ref. bid (+0,05%); venda ref. ask (−0,05%).
+# TimeInForce: GTC — ordem repousa no livro até fill/cancel (IOC seria péssimo para caça maker).
 PRECO_ABERTURA_LIMITE_OFFSET = 0.0005  # 0,05%
 
 # Trailing stop: após lucro ≥ este valor, SL vai a break-even e depois segue o preço a TRAILING_SL_DIST_FRAC.
@@ -160,6 +161,41 @@ def _preco_referencia_ultimo(exchange: ccxt.binance, simbolo: str) -> float:
     return preco
 
 
+def _preco_limite_limit_offset_book(
+    exchange: ccxt.binance,
+    simbolo: str,
+    side: str,
+    *,
+    offset_frac: float | None = None,
+) -> tuple[float, float, float, float]:
+    """
+    Preço LIMIT com offset 0,05% a partir do livro:
+    - buy (LONG / fechar SHORT): base = bid → limite = bid × (1 + offset)
+    - sell (SHORT / fechar LONG): base = ask → limite = ask × (1 − offset)
+    Devolve (limite_arredondado, base, bid, ask) para logs.
+    """
+    off = float(offset_frac) if offset_frac is not None else float(PRECO_ABERTURA_LIMITE_OFFSET)
+    ticker = exchange.fetch_ticker(simbolo)
+    bid = float(ticker.get("bid") or 0.0)
+    ask = float(ticker.get("ask") or 0.0)
+    last = float(ticker.get("last") or ticker.get("close") or 0.0)
+    s = str(side).strip().lower()
+    if s == "buy":
+        base = bid if bid > 0 else last
+        raw = base * (1.0 + off)
+    elif s == "sell":
+        base = ask if ask > 0 else last
+        raw = base * (1.0 - off)
+    else:
+        raise ValueError(f"{_TAG} side inválido para LIMIT+offset: {side!r}")
+    if base <= 0 or raw <= 0:
+        raise RuntimeError(
+            f"{_TAG} bid/ask/last inválidos para {simbolo} (bid={bid}, ask={ask}, last={last})."
+        )
+    limite = float(exchange.price_to_precision(simbolo, raw))
+    return limite, base, bid, ask
+
+
 def obter_ultimo_preco(
     simbolo: str,
     exchange: ccxt.binance | None = None,
@@ -179,7 +215,7 @@ def executar_com_chase(
     tentativas: int = 3,
 ) -> dict[str, Any] | None:
     """
-    Chase: LIMIT GTC com offset 0,05% vs último; após `CHASE_ENTRADA_TIMEOUT_S` verifica fill;
+    Chase: LIMIT GTC com offset 0,05% vs bid (compra) / ask (venda); após timeout verifica fill;
     se não, cancela e reabre até `tentativas` rondas.
 
     - `direcao`: «LONG» (buy) ou «SHORT» (sell).
@@ -218,33 +254,29 @@ def _entrar_limite_com_chase_futuros(
     nome_lado: str,
     max_rounds: int | None = None,
     timeout_s: float | None = None,
+    reduce_only: bool = False,
 ) -> dict[str, Any]:
     """
-    Abertura LIMIT GTC com offset 0,05% vs último (`fetch_ticker`); aguarda
-    `timeout_s` (ou default global); se não houver fill suficiente, cancela e repete (caça o preço).
+    LIMIT + offset (bid/ask ±0,05%), timeInForce=GTC; aguarda `timeout_s`;
+    se não houver fill suficiente, cancela e repete (chase). `reduceOnly` para fechos.
     """
     cap = max_rounds if max_rounds is not None else CHASE_ENTRADA_MAX_ROUNDS
     wait = float(timeout_s) if timeout_s is not None else CHASE_ENTRADA_TIMEOUT_S
     params_gtc: dict[str, Any] = {"timeInForce": "GTC"}
+    if reduce_only:
+        params_gtc["reduceOnly"] = True
+        params_gtc["workingType"] = "MARK_PRICE"
 
     for rnd in range(1, cap + 1):
-        ticker = ex.fetch_ticker(simbolo)
-        ultimo = float(ticker.get("last") or ticker.get("close") or 0)
-        if ultimo <= 0:
-            raise RuntimeError(f"{_TAG} Preço último inválido (chase {rnd}).")
-
-        if side == "buy":
-            preco_limite = float(
-                ex.price_to_precision(
-                    simbolo, ultimo * (1.0 + PRECO_ABERTURA_LIMITE_OFFSET)
-                )
-            )
-        else:
-            preco_limite = float(
-                ex.price_to_precision(
-                    simbolo, ultimo * (1.0 - PRECO_ABERTURA_LIMITE_OFFSET)
-                )
-            )
+        preco_limite, base, bid, ask = _preco_limite_limit_offset_book(
+            ex, simbolo, side, offset_frac=PRECO_ABERTURA_LIMITE_OFFSET
+        )
+        ref = "bid" if str(side).lower() == "buy" else "ask"
+        ro_txt = ", reduceOnly" if reduce_only else ""
+        print(
+            f"{_TAG} [LIMIT+offset {rnd}/{cap}] {nome_lado} {side.upper()} @ {preco_limite} "
+            f"(ref {ref}={base:.4f}, bid={bid:.4f}, ask={ask:.4f}, GTC{ro_txt})"
+        )
 
         try:
             order = ex.create_order(
@@ -606,8 +638,8 @@ def abrir_long_market(
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **long** com LIMIT **GTC** + **chase**: preço = último × (1 + offset 0,05%);
-    após ~CHASE_ENTRADA_TIMEOUT_S sem fill, cancela e reabre no novo último.
+    Abre **long** com LIMIT **GTC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
+    após ~CHASE_ENTRADA_TIMEOUT_S sem fill, cancela e reabre no novo livro.
     Notional = 15%×banca×alav; depois bracket (SL fixo + trailing stop).
     """
     ex = exchange or criar_exchange_binance()
@@ -673,8 +705,8 @@ def abrir_short_market(
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **short** com LIMIT GTC + chase (−0,05% vs. último); mesmo fluxo que o long.
-    Depois **reduce-only** STOP_MARKET (SL) e TRAILING_STOP_MARKET.
+    Abre **short** com LIMIT GTC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
+    mesmo fluxo que o long. Depois **reduce-only** STOP_MARKET (SL) e TRAILING_STOP_MARKET.
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
@@ -735,7 +767,8 @@ def fechar_posicao_market(
     exchange: ccxt.binance | None = None,
 ) -> dict[str, Any]:
     """
-    Cancela ordens abertas no símbolo (TP/SL órfãs) e fecha a posição a mercado.
+    Cancela ordens abertas no símbolo (TP/SL órfãs) e fecha a posição com LIMIT GTC
+    (bid/ask + offset 0,05%) + chase, reduce-only — sem ordens MARKET.
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
@@ -765,13 +798,35 @@ def fechar_posicao_market(
     if qty <= 0:
         raise ccxt.InvalidOrder(f"{_TAG} Quantidade de fechamento inválida: {contratos}")
 
-    # Long: vender; Short: comprar de volta.
+    # Long: vender (ref. ask × 0,9995); Short: comprar (ref. bid × 1,0005).
     if lado == "short" or contratos < 0:
-        print(f"{_TAG} Fechando SHORT em {sym} — compra MARKET qty={qty}...")
-        ordem = ex.create_order(sym, "market", "buy", qty, None, {})
+        print(
+            f"{_TAG} Fechando SHORT em {sym} — compra LIMIT+offset (chase) qty={qty}..."
+        )
+        ordem = _entrar_limite_com_chase_futuros(
+            ex,
+            sym,
+            "buy",
+            qty,
+            nome_lado="FECHO_SHORT",
+            max_rounds=CHASE_SHORT_MAX_ROUNDS,
+            timeout_s=CHASE_SHORT_TIMEOUT_S,
+            reduce_only=True,
+        )
     else:
-        print(f"{_TAG} Fechando LONG em {sym} — venda MARKET qty={qty}...")
-        ordem = ex.create_order(sym, "market", "sell", qty, None, {})
+        print(
+            f"{_TAG} Fechando LONG em {sym} — venda LIMIT+offset (chase) qty={qty}..."
+        )
+        ordem = _entrar_limite_com_chase_futuros(
+            ex,
+            sym,
+            "sell",
+            qty,
+            nome_lado="FECHO_LONG",
+            max_rounds=CHASE_ENTRADA_MAX_ROUNDS,
+            timeout_s=CHASE_ENTRADA_TIMEOUT_S,
+            reduce_only=True,
+        )
 
     print(f"{_TAG} Posição encerrada. id={ordem.get('id')} status={ordem.get('status')}")
     try:
