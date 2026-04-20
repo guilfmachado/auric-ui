@@ -32,17 +32,17 @@ ALAVANCAGEM_REF_LOG_PADRAO = 3
 # Position sizing: notional USDT = saldo_USDT × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
 PERCENTUAL_BANCA = 0.15
 
-# LIMIT + offset vs. livro (maker-friendly): compra ref. bid (+0,05%); venda ref. ask (−0,05%).
-# TimeInForce: GTC — ordem repousa no livro até fill/cancel (IOC seria péssimo para caça maker).
+# LIMIT + offset vs. livro: compra ref. bid (+0,05%); venda ref. ask (−0,05%).
+# Entradas: timeInForce IOC (sem GTC pendurado — liberta margem). Fechos reduce-only: GTC + chase.
 PRECO_ABERTURA_LIMITE_OFFSET = 0.0005  # 0,05%
 
 # Trailing stop: após lucro ≥ este valor, SL vai a break-even e depois segue o preço a TRAILING_SL_DIST_FRAC.
 TRAILING_LUCRO_ATIVACAO_FRAC = 0.01  # 1%
 TRAILING_SL_DIST_FRAC = 0.008  # 0,8% atrás (LONG) / à frente (SHORT) do preço atual
 
-# Abertura LIMIT GTC + chase: após timeout sem fill, cancela e reabre no novo último
-# (+0,05% long / −0,05% short) até N rondas. LONG: defaults abaixo. SHORT: mercado em queda rápida —
-# usar timeouts mais curtos e mais rondas (caça o preço). Overrides via env.
+# Abertura LIMIT IOC + chase: após timeout sem fill suficiente, cancela (se ainda aberta) e reabre
+# no novo bid/ask até N rondas. LONG: defaults abaixo. SHORT: mercado em queda rápida —
+# timeouts mais curtos / mais rondas. Overrides via env.
 CHASE_ENTRADA_TIMEOUT_S = float(os.getenv("AURIC_CHASE_TIMEOUT_S", "15"))
 CHASE_ENTRADA_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_MAX_ROUNDS", "3"))
 # Chase agressivo só para abertura SHORT (ETH a «despencar» — ordem não fica pendurada acima do mercado).
@@ -215,8 +215,8 @@ def executar_com_chase(
     tentativas: int = 3,
 ) -> dict[str, Any] | None:
     """
-    Chase: LIMIT GTC com offset 0,05% vs bid (compra) / ask (venda); após timeout verifica fill;
-    se não, cancela e reabre até `tentativas` rondas.
+    Chase: LIMIT IOC (entrada) com offset 0,05% vs bid/ask; após timeout verifica fill;
+    se não, cancela (se aplicável) e reabre até `tentativas` rondas.
 
     - `direcao`: «LONG» (buy) ou «SHORT» (sell).
     Devolve o dict da ordem da bolsa se preenchida; `None` se esgotar tentativas.
@@ -257,15 +257,24 @@ def _entrar_limite_com_chase_futuros(
     reduce_only: bool = False,
 ) -> dict[str, Any]:
     """
-    LIMIT + offset (bid/ask ±0,05%), timeInForce=GTC; aguarda `timeout_s`;
-    se não houver fill suficiente, cancela e repete (chase). `reduceOnly` para fechos.
+    LIMIT + offset (bid/ask ±0,05%):
+    - Entrada (reduce_only=False): timeInForce **IOC** — evita ordens GTC presas no livro (margin lock).
+    - Fecho reduce-only: **GTC** + chase (comportamento anterior).
+    Ajusta `qty_left` após fills parciais (IOC).
     """
     cap = max_rounds if max_rounds is not None else CHASE_ENTRADA_MAX_ROUNDS
     wait = float(timeout_s) if timeout_s is not None else CHASE_ENTRADA_TIMEOUT_S
-    params_gtc: dict[str, Any] = {"timeInForce": "GTC"}
+    tif = "GTC" if reduce_only else "IOC"
+    params_order: dict[str, Any] = {"timeInForce": tif}
     if reduce_only:
-        params_gtc["reduceOnly"] = True
-        params_gtc["workingType"] = "MARK_PRICE"
+        params_order["reduceOnly"] = True
+        params_order["workingType"] = "MARK_PRICE"
+
+    qty_left = float(ex.amount_to_precision(simbolo, float(amt)))
+    if qty_left <= 0:
+        raise ValueError(f"{_TAG} qty inválida após precisão: {amt!r}")
+
+    last_order: dict[str, Any] | None = None
 
     for rnd in range(1, cap + 1):
         preco_limite, base, bid, ask = _preco_limite_limit_offset_book(
@@ -275,7 +284,7 @@ def _entrar_limite_com_chase_futuros(
         ro_txt = ", reduceOnly" if reduce_only else ""
         print(
             f"{_TAG} [LIMIT+offset {rnd}/{cap}] {nome_lado} {side.upper()} @ {preco_limite} "
-            f"(ref {ref}={base:.4f}, bid={bid:.4f}, ask={ask:.4f}, GTC{ro_txt})"
+            f"qty={qty_left} (ref {ref}={base:.4f}, bid={bid:.4f}, ask={ask:.4f}, {tif}{ro_txt})"
         )
 
         try:
@@ -283,9 +292,9 @@ def _entrar_limite_com_chase_futuros(
                 simbolo,
                 "limit",
                 side,
-                amt,
+                qty_left,
                 preco_limite,
-                params_gtc,
+                params_order,
             )
         except ccxt.BaseError as e:
             print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
@@ -295,14 +304,16 @@ def _entrar_limite_com_chase_futuros(
         if oid is None:
             raise RuntimeError(f"{_TAG} Ordem sem id após create_order.")
 
+        last_order = dict(order)
+
         filled0 = float(order.get("filled") or 0)
         st0 = (order.get("status") or "").lower()
-        if filled0 >= amt * 0.97 or st0 in ("closed", "filled"):
+        if filled0 >= qty_left * 0.97 or st0 in ("closed", "filled"):
             print(f"{_TAG} ✅ [SUCESSO] {nome_lado}: fill na resposta da bolsa.")
-            return dict(order)
+            return last_order
 
         print(
-            f"{_TAG} ⏳ [CHASE {rnd}/{cap}] Ordem LIMIT em {preco_limite}. "
+            f"{_TAG} ⏳ [CHASE {rnd}/{cap}] Ordem LIMIT {tif} em {preco_limite}. "
             f"Aguardando {wait:.0f}s..."
         )
         time.sleep(wait)
@@ -313,19 +324,30 @@ def _entrar_limite_com_chase_futuros(
             print(f"{_TAG} fetch_order: {ef}", file=sys.stderr)
             check = order
 
+        last_order = dict(check)
+
         filled = float(check.get("filled") or 0)
         status = (check.get("status") or "").lower()
-        if filled >= amt * 0.97 or status in ("closed", "filled"):
+        if filled >= qty_left * 0.97 or status in ("closed", "filled"):
             print(f"{_TAG} ✅ [SUCESSO] Ordem preenchida (ronda {rnd}).")
-            return dict(check)
+            return last_order
+
+        if filled > 0:
+            qty_left = float(
+                ex.amount_to_precision(simbolo, max(0.0, qty_left - filled))
+            )
+        if qty_left <= 0:
+            print(f"{_TAG} ✅ [SUCESSO] qty alvo preenchida por fills acumulados.")
+            return last_order
 
         try:
             ex.cancel_order(oid, simbolo)
         except ccxt.BaseError as ec:
-            print(f"{_TAG} cancel chase (ok se já executou): {ec}", file=sys.stderr)
+            print(f"{_TAG} cancel chase (ok se já executou/IOC): {ec}", file=sys.stderr)
 
         print(
-            f"{_TAG} ⚠️ [TIMEOUT] Preço fugiu — recalculando chase ({rnd}/{cap})..."
+            f"{_TAG} ⚠️ [TIMEOUT] Preço fugiu — recalculando chase ({rnd}/{cap}) "
+            f"(qty_left={qty_left})..."
         )
 
     raise RuntimeError(
@@ -638,8 +660,8 @@ def abrir_long_market(
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **long** com LIMIT **GTC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
-    após ~CHASE_ENTRADA_TIMEOUT_S sem fill, cancela e reabre no novo livro.
+    Abre **long** com LIMIT **IOC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
+    após ~CHASE_ENTRADA_TIMEOUT_S sem fill suficiente, reabre no novo livro (sem GTC pendurado).
     Notional = 15%×banca×alav; depois bracket (SL fixo + trailing stop).
     """
     ex = exchange or criar_exchange_binance()
@@ -705,7 +727,7 @@ def abrir_short_market(
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
-    Abre **short** com LIMIT GTC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
+    Abre **short** com LIMIT IOC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
     mesmo fluxo que o long. Depois **reduce-only** STOP_MARKET (SL) e TRAILING_STOP_MARKET.
     """
     ex = exchange or criar_exchange_binance()
@@ -767,7 +789,7 @@ def fechar_posicao_market(
     exchange: ccxt.binance | None = None,
 ) -> dict[str, Any]:
     """
-    Cancela ordens abertas no símbolo (TP/SL órfãs) e fecha a posição com LIMIT GTC
+    Cancela ordens abertas no símbolo (TP/SL órfãs) e fecha a posição com LIMIT **GTC**
     (bid/ask + offset 0,05%) + chase, reduce-only — sem ordens MARKET.
     """
     ex = exchange or criar_exchange_binance()

@@ -924,6 +924,13 @@ def rodar_ciclo(modo: str) -> None:
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
 
+    # Sem posição: livro limpo na Binance (evita GTC/IOC órfãos a prender margem antes de novo sinal).
+    if modo == "FUTURES" and not posicao_aberta:
+        try:
+            executor_futures.cancelar_todas_ordens_abertas(SYMBOL_TRADE, ex)
+        except Exception as e_co:  # noqa: BLE001
+            print(f"⚠️ [Ciclo] Limpeza cancel_all (sem posição): {e_co}")
+
     if modo == "FUTURES":
         try:
             sym_f = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
