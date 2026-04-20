@@ -72,8 +72,12 @@ def obter_preco_entrada_ultima_posicao(
         "COMPRA_MARKET",
         "COMPRA_LONG_MARKET",
         "COMPRA_LONG_LIMIT",
+        "COMPRA_LONG",
         "ABRE_SHORT_MARKET",
         "ABRE_SHORT_LIMIT",
+        "ABRE_SHORT",
+        "RECON_EMERGENCY_LONG",
+        "RECON_EMERGENCY_SHORT",
     )
     try:
         res = (
@@ -89,7 +93,17 @@ def obter_preco_entrada_ultima_posicao(
             return None, "LONG"
         row = res.data[0]
         ac = (row.get("acao_tomada") or "").strip()
-        lado = "SHORT" if ac in ("ABRE_SHORT_MARKET", "ABRE_SHORT_LIMIT") else "LONG"
+        lado = (
+            "SHORT"
+            if ac
+            in (
+                "ABRE_SHORT_MARKET",
+                "ABRE_SHORT_LIMIT",
+                "ABRE_SHORT",
+                "RECON_EMERGENCY_SHORT",
+            )
+            else "LONG"
+        )
         return float(row["preco_atual"]), lado
     except Exception as e:
         print(f"⚠️ Erro ao ler entrada no Supabase: {e}")

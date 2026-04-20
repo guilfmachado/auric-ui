@@ -527,26 +527,116 @@ def _mark_manual_command_status_sync(row_id: int, status: str) -> None:
         print(f"⚠️ [MANUAL LISTENER] update status={status} id={row_id} falhou: {e}")
 
 
-def _executar_comando_manual_imediato_sync(cmd: str) -> None:
-    """
-    Executor GOD MODE: sem filtros de veto (RSI/ADX/VWAP).
-    """
-    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+def _preco_entrada_fallback_de_ordem(ordem: dict[str, Any]) -> float:
+    for k in ("auric_entry_price", "average", "price"):
+        v = ordem.get(k)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                continue
+    return 0.0
 
-    ex = executor_futures.criar_exchange_binance()
+
+def _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(
+    cmd: str,
+    ordem: dict[str, Any],
+    manual_row_id: int | None,
+) -> None:
+    """
+    Após LONG/SHORT manual na Binance (já com bracket): alinha RAM e grava log de abertura
+    no Supabase para o próximo ciclo WS tratar como Modo Vigia sem reconciliação tardia.
+    """
+    global posicao_aberta, preco_compra, direcao_posicao
+
     c = str(cmd or "").upper().strip()
     if c == "LONG":
-        executor_futures.abrir_long_market(
-            SYMBOL_TRADE,
-            ex,
-            alavancagem=float(_alavancagem_cfg),
-            risk_fraction=float(_risk_fraction_cfg),
-            trailing_callback_rate=float(_trailing_callback_cfg),
-            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+        direcao = "LONG"
+        acao = "COMPRA_LONG"
+    elif c == "SHORT":
+        direcao = "SHORT"
+        acao = "ABRE_SHORT"
+    else:
+        return
+
+    pe = float(ordem.get("auric_entry_price") or 0.0)
+    if pe <= 0:
+        pe = _preco_entrada_fallback_de_ordem(ordem)
+    if pe <= 0:
+        try:
+            ex_snap = executor_futures.criar_exchange_binance()
+            snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex_snap)
+            ep = snap.get("entry_price")
+            if ep is not None and float(ep) > 0:
+                pe = float(ep)
+        except Exception as e_snap:  # noqa: BLE001
+            print(f"⚠️ [GOD MODE] Fallback entryPrice carteira: {e_snap}")
+
+    if pe <= 0:
+        print(
+            "⚠️ [GOD MODE] preço de entrada indeterminado — RAM não atualizada; "
+            "reconciliação no próximo ciclo pode corrigir."
         )
         return
-    if c == "SHORT":
-        executor_futures.abrir_short_market(
+
+    ref_manual = (
+        f"manual_commands id={int(manual_row_id)}"
+        if manual_row_id is not None
+        else "manual_commands (id desconhecido)"
+    )
+    oid = ordem.get("id")
+    just = (
+        f"GOD MODE {direcao} via dashboard/Supabase; {ref_manual}. "
+        f"Bracket Binance (SL STOP_MARKET + TRAILING_STOP_MARKET) já ativo. "
+        f"ordem_ref id={oid} | entry ref.={pe:.6f} USDT."
+    )
+
+    logger.registrar_log_trade(
+        par_moeda=SYMBOL_TRADE,
+        preco=float(pe),
+        prob_ml=-1.0,
+        sentimento="MANUAL",
+        acao=acao,
+        justificativa=just,
+        lado_ordem=direcao,
+        contexto_raw=None,
+        justificativa_ia="GOD_MODE_HANDOFF_VIGIA",
+    )
+
+    posicao_aberta = True
+    preco_compra = float(pe)
+    direcao_posicao = direcao
+    print(
+        f"👑 [GOD MODE] Handoff Modo Vigia: posicao_aberta=True | {direcao_posicao} @ "
+        f"{preco_compra:.4f} USDT | log Supabase gravado ({acao})."
+    )
+
+
+def _normalizar_comando_manual_god_mode(cmd: str) -> str:
+    """Aceita LONG/SHORT do dashboard ou variantes MANUAL LONG / MANUAL SHORT."""
+    c = str(cmd or "").upper().strip()
+    if c.startswith("MANUAL "):
+        c = c.removeprefix("MANUAL ").strip()
+    return c
+
+
+def _executar_comando_manual_imediato_sync(
+    cmd: str,
+    manual_row_id: int | None = None,
+) -> None:
+    """
+    Executor GOD MODE: sem filtros de veto (RSI/ADX/VWAP).
+    LONG/SHORT: após fill na Binance, atualiza RAM + Supabase para o WS já gerir trailing.
+    """
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+    global posicao_aberta, preco_compra, direcao_posicao
+
+    ex = executor_futures.criar_exchange_binance()
+    c = _normalizar_comando_manual_god_mode(cmd)
+    if c == "LONG":
+        ordem = executor_futures.abrir_long_market(
             SYMBOL_TRADE,
             ex,
             alavancagem=float(_alavancagem_cfg),
@@ -554,9 +644,25 @@ def _executar_comando_manual_imediato_sync(cmd: str) -> None:
             trailing_callback_rate=float(_trailing_callback_cfg),
             trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
         )
+        _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
+        return
+    if c == "SHORT":
+        ordem = executor_futures.abrir_short_market(
+            SYMBOL_TRADE,
+            ex,
+            alavancagem=float(_alavancagem_cfg),
+            risk_fraction=float(_risk_fraction_cfg),
+            trailing_callback_rate=float(_trailing_callback_cfg),
+            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+        )
+        _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
         return
     if c in ("CLOSE", "CLOSE_ALL"):
         executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+        posicao_aberta = False
+        preco_compra = 0.0
+        direcao_posicao = "LONG"
+        print("👑 [GOD MODE] CLOSE: RAM resetada (sem posição).")
         return
     raise ValueError(f"Comando manual inválido: {c!r}")
 
@@ -606,7 +712,7 @@ async def _escutar_comandos_manuais() -> None:
         await asyncio.to_thread(_mark_manual_command_status_sync, rid, "EXECUTED")
 
         try:
-            await asyncio.to_thread(_executar_comando_manual_imediato_sync, cmd)
+            await asyncio.to_thread(_executar_comando_manual_imediato_sync, cmd, rid)
             print(f"✅ [MANUAL LISTENER] Comando {cmd} (id={rid}) executado com sucesso.")
         except Exception as e:  # noqa: BLE001
             print(f"❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
@@ -719,6 +825,99 @@ def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
         posicao_aberta = False
         preco_compra = 0.0
         direcao_posicao = "LONG"
+
+
+def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
+    """
+    Reconciliação Binance ↔ Supabase ↔ RAM (FUTURES):
+    - Se há posição na carteira mas não há log de abertura → log de emergência + RAM + brackets.
+    - Se há posição e log mas RAM diz flat → resincroniza RAM a partir do log + brackets.
+    """
+    global posicao_aberta, preco_compra, direcao_posicao
+    global _trailing_callback_cfg, _trailing_activation_mult_cfg
+
+    if modo != "FUTURES":
+        return
+
+    snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+    if not snap.get("posicao_aberta"):
+        return
+
+    entrada_log, lado_log = logger.obter_preco_entrada_ultima_posicao(SYMBOL_TRADE)
+    tem_log = entrada_log is not None and float(entrada_log) > 0
+
+    if tem_log and posicao_aberta:
+        return
+
+    ep_raw = snap.get("entry_price")
+    if ep_raw is not None and float(ep_raw) > 0:
+        ep = float(ep_raw)
+    else:
+        ep = float(obter_preco_referencia(SYMBOL_TRADE, modo))
+
+    qty = abs(float(snap.get("contratos") or 0.0))
+    lado_bn = str(snap.get("direcao_posicao") or "LONG").upper()
+    if lado_bn not in ("LONG", "SHORT"):
+        lado_bn = "LONG"
+
+    if tem_log and not posicao_aberta:
+        posicao_aberta = True
+        preco_compra = float(entrada_log)
+        direcao_posicao = lado_log if lado_log in ("LONG", "SHORT") else "LONG"
+        print(
+            f"🔄 [RECON] Binance com posição + log Supabase: RAM atualizada "
+            f"({direcao_posicao} @ {preco_compra:.4f}). A assegurar brackets na bolsa..."
+        )
+        try:
+            executor_futures.assegurar_brackets_apos_reconciliacao(
+                SYMBOL_TRADE,
+                ex,
+                direcao_posicao,
+                qty,
+                preco_compra,
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+            )
+        except Exception as e_br:  # noqa: BLE001
+            print(f"⚠️ [RECON] Falha ao (re)criar brackets após resync RAM: {e_br}")
+        return
+
+    if not tem_log:
+        acao = "RECON_EMERGENCY_LONG" if lado_bn == "LONG" else "RECON_EMERGENCY_SHORT"
+        just = (
+            "Reconciliação: posição aberta na Binance USDT-M sem log de abertura ativo no "
+            f"Supabase. entryPrice={ep:.6f}, contracts={qty}, side={lado_bn} (API carteira)."
+        )
+        print(
+            f"🚨 [RECON] Log de emergência + RAM ({lado_bn} @ {ep:.4f}, qty={qty}) — "
+            "sem COMPRA_LONG/ABRE_SHORT_* no histórico."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=ep,
+            prob_ml=-1.0,
+            sentimento="—",
+            acao=acao,
+            justificativa=just,
+            lado_ordem=lado_bn,
+            contexto_raw=None,
+            justificativa_ia="RECONCILIACAO_BINANCE_SEM_LOG",
+        )
+        posicao_aberta = True
+        preco_compra = ep
+        direcao_posicao = lado_bn
+        try:
+            executor_futures.assegurar_brackets_apos_reconciliacao(
+                SYMBOL_TRADE,
+                ex,
+                direcao_posicao,
+                qty,
+                preco_compra,
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+            )
+        except Exception as e_br:  # noqa: BLE001
+            print(f"⚠️ [RECON] Falha ao criar brackets após log de emergência: {e_br}")
 
 
 def _gerenciar_saida_modo_vigia(
@@ -924,14 +1123,8 @@ def rodar_ciclo(modo: str) -> None:
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
 
-    # Sem posição: livro limpo na Binance (evita GTC/IOC órfãos a prender margem antes de novo sinal).
-    if modo == "FUTURES" and not posicao_aberta:
-        try:
-            executor_futures.cancelar_todas_ordens_abertas(SYMBOL_TRADE, ex)
-        except Exception as e_co:  # noqa: BLE001
-            print(f"⚠️ [Ciclo] Limpeza cancel_all (sem posição): {e_co}")
-
     if modo == "FUTURES":
+        _reconciliar_posicao_futures_binance_supabase(ex, modo)
         try:
             sym_f = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
             if indicators.volume_compra_spike_1m(ex, sym_f):
@@ -968,6 +1161,13 @@ def rodar_ciclo(modo: str) -> None:
         )
         _gerenciar_saida_modo_vigia(preco, ex, ex_mod, modo_label)
         return
+
+    # Busca de oportunidade (sem posição em RAM após sync+recon): limpar livro na Binance (margem livre).
+    if modo == "FUTURES":
+        try:
+            executor_futures.cancelar_todas_ordens_abertas(SYMBOL_TRADE, ex)
+        except Exception as e_co:  # noqa: BLE001
+            print(f"⚠️ [Ciclo] Limpeza cancel_all (busca / sem posição): {e_co}")
 
     print("\n>>> BUSCANDO OPORTUNIDADE <<<")
     print(

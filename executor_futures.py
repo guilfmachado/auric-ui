@@ -480,6 +480,86 @@ def cancelar_todas_ordens_abertas(
         return n
 
 
+def cancelar_ordens_reduce_only_abertas(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> int:
+    """
+    Cancela apenas ordens reduce-only (TP/SL/trailing) no par — usado na reconciliação
+    antes de recriar brackets sem apagar ordens de entrada não-reduce.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    n = 0
+    try:
+        abertas = ex.fetch_open_orders(sym)
+    except ccxt.BaseError as e:
+        print(f"{_TAG} fetch_open_orders (reduce-only cleanup): {e}", file=sys.stderr)
+        return 0
+    for o in abertas:
+        ro = bool(o.get("reduceOnly"))
+        if not ro:
+            info = o.get("info") or {}
+            v = str(info.get("reduceOnly", "")).lower()
+            ro = v in ("true", "1", "yes")
+        if not ro:
+            continue
+        oid = o.get("id")
+        if oid is None:
+            continue
+        try:
+            ex.cancel_order(oid, sym)
+            n += 1
+        except ccxt.BaseError as ec:
+            print(f"{_TAG} cancel reduce-only {oid}: {ec}", file=sys.stderr)
+    if n:
+        print(f"{_TAG} Canceladas {n} ordem(ns) reduce-only em {sym} (reconciliação).")
+    return n
+
+
+def assegurar_brackets_apos_reconciliacao(
+    simbolo: str,
+    exchange: ccxt.binance,
+    direcao: str,
+    qty_contratos: float,
+    preco_entrada: float,
+    *,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
+) -> None:
+    """
+    Após detetar posição na Binance sem estado completo no maestro: remove TP/SL reduce-only
+    antigos e recria SL fixo + TRAILING_STOP (modo vigia na bolsa).
+    """
+    d = str(direcao).strip().upper()
+    cancelar_ordens_reduce_only_abertas(simbolo, exchange)
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    q = abs(float(qty_contratos))
+    if q <= 0:
+        print(f"{_TAG} assegurar_brackets: qty inválida ({qty_contratos!r})", file=sys.stderr)
+        return
+    if d == "LONG":
+        _criar_bracket_long(
+            exchange,
+            sym,
+            q,
+            float(preco_entrada),
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+        )
+    elif d == "SHORT":
+        _criar_bracket_short(
+            exchange,
+            sym,
+            q,
+            float(preco_entrada),
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+        )
+    else:
+        raise ValueError(f"{_TAG} direcao inválida: {d!r}")
+
+
 def _params_reduce_futures() -> dict[str, Any]:
     """Parâmetros comuns em ordens de fecho na Binance USDT-M."""
     return {
@@ -876,19 +956,38 @@ def consultar_posicao_futures(
     posicoes = ex.fetch_positions([sym])
     contratos = 0.0
     lado = ""
+    entry_price: float | None = None
     for p in posicoes:
         c = float(p.get("contracts") or 0)
         if abs(c) > 0:
             contratos = c
             lado = str(p.get("side") or "")
+            ep_raw = p.get("entryPrice")
+            if ep_raw is None or (isinstance(ep_raw, (int, float)) and float(ep_raw) == 0.0):
+                inf = p.get("info") or {}
+                ep_raw = inf.get("entryPrice") or inf.get("avgPrice")
+            if ep_raw is not None:
+                try:
+                    efv = float(ep_raw)
+                    if efv > 0:
+                        entry_price = efv
+                except (TypeError, ValueError):
+                    entry_price = None
             break
 
     aberta = abs(contratos) > 0 and abs(contratos) >= (min_amt * 0.5 if min_amt else 1e-12)
+    direcao_pos = (
+        "SHORT"
+        if (str(lado).lower() == "short" or contratos < 0)
+        else "LONG"
+    )
 
     return {
         "base": base,
         "contratos": contratos,
         "lado": lado,
+        "direcao_posicao": direcao_pos,
+        "entry_price": entry_price,
         "saldo_base_livre": abs(contratos),
         "min_quantidade_base": min_amt,
         "posicao_aberta": aberta,
