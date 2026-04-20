@@ -1,6 +1,6 @@
-"use client";
+'use client';
 
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 
 import { Skeleton } from "@/components/ui/skeleton";
@@ -33,6 +33,9 @@ function formatPct(n: number | null | undefined) {
   return `${sign}${n.toFixed(2)}%`;
 }
 
+const BINANCE_FAPI_ETH_PRICE =
+  "https://fapi.binance.com/fapi/v1/ticker/price?symbol=ETHUSDT";
+
 const LIVE_LOGS_N = 5;
 
 /** Gauge ML: arco em [0,1]; rótulo = `probabilidade_ml * 100` (formato %) quando p ≤ 1. */
@@ -56,6 +59,7 @@ function mlFromProbabilidade(raw: unknown): {
 export function AuricDashboard() {
   const {
     ready,
+    connectionError,
     supabaseReady,
     motorHydrated,
     config,
@@ -74,16 +78,59 @@ export function AuricDashboard() {
     insertManualCommand,
   } = useAuricDashboard();
 
-  const {
-    price: ethPrice,
-    changePct: ethCh,
-    loading: ethLoading,
-    refetch: refetchEth,
-  } = useEthTicker();
+  const { changePct: ethCh } = useEthTicker();
+
+  const [livePrice, setLivePrice] = useState<number | null>(null);
+  const [priceFlash, setPriceFlash] = useState<"up" | "down" | null>(null);
+  const prevPriceRef = useRef<number | null>(null);
+  const flashClearTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
 
   useEffect(() => {
-    if (latestLog?.id != null) refetchEth();
-  }, [latestLog?.id, refetchEth]);
+    let cancelled = false;
+
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(BINANCE_FAPI_ETH_PRICE);
+        if (!res.ok || cancelled) return;
+        const j = (await res.json()) as { price?: string };
+        const p = parseFloat(j.price ?? "");
+        if (!Number.isFinite(p) || cancelled) return;
+
+        const prev = prevPriceRef.current;
+        prevPriceRef.current = p;
+        setLivePrice(p);
+
+        if (prev !== null && p !== prev) {
+          if (flashClearTimeoutRef.current) {
+            clearTimeout(flashClearTimeoutRef.current);
+          }
+          setPriceFlash(p > prev ? "up" : "down");
+          flashClearTimeoutRef.current = setTimeout(() => {
+            setPriceFlash(null);
+            flashClearTimeoutRef.current = null;
+          }, 1000);
+        }
+      } catch {
+        /* rede / CORS: mantém último livePrice */
+      }
+    };
+
+    void tick();
+    const id = window.setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      if (flashClearTimeoutRef.current) {
+        clearTimeout(flashClearTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const ethTickerFootnote =
+    "Binance USDT-M Futures · preço ~2s · % 24h (Spot ref.)";
 
   const { prob01: mlFromLatestLog, pctLabel: mlPctLabel } =
     mlFromProbabilidade(latestLog?.probabilidade_ml);
@@ -145,6 +192,18 @@ export function AuricDashboard() {
     })();
 
   const logsForTable = logs.slice(0, LIVE_LOGS_N);
+  const emptyTelemetry = parseTelemetryFromLog(null);
+  const isMotorLoading = ready && supabaseReady && !motorHydrated;
+
+  if (connectionError != null) {
+    return (
+      <div className="fixed inset-0 flex min-h-screen items-center justify-center bg-black">
+        <div className="max-w-[95vw] break-words px-4 text-center text-5xl font-bold leading-tight text-red-600 sm:text-7xl md:text-8xl">
+          ERRO DE CONEXÃO: {connectionError.message}
+        </div>
+      </div>
+    );
+  }
 
   if (!ready) {
     return (
@@ -180,7 +239,8 @@ export function AuricDashboard() {
             }}
           >
             Configure NEXT_PUBLIC_SUPABASE_URL e NEXT_PUBLIC_SUPABASE_ANON_KEY
-            (ou PUBLISHABLE_KEY) em .env.local para ligar o motor Auric.
+            em .env.local (Project Settings → API → anon public) para ligar o
+            motor Auric.
           </div>
         )}
 
@@ -197,20 +257,62 @@ export function AuricDashboard() {
           manualPending={manualPending}
           onManualLong={() => void insertManualCommand("LONG")}
           onManualShort={() => void insertManualCommand("SHORT")}
+          onManualCloseAll={() => void insertManualCommand("CLOSE_ALL")}
         />
 
-        {supabaseReady && !motorHydrated && (
-          <div
-            className="rounded-lg border border-zinc-700/60 bg-zinc-900/50 px-4 py-8 text-center text-sm text-zinc-500"
-            style={{
-              fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
-            }}
-          >
-            <span className="inline-flex items-center gap-2">
-              <span className="size-2 animate-pulse rounded-full bg-emerald-500/80" />
-              Sincronizando dados do Supabase (último log + carteira)…
-            </span>
-          </div>
+        {isMotorLoading && (
+          <>
+            <PulseHero
+              isLoading
+              balanceUsdt="—"
+              balanceLoading={false}
+              pnlDayPct={formatPct(pnl ?? null)}
+              pnlPositive={pnlPositive}
+              ethPrice={livePrice}
+              ethChangePct={ethCh}
+              ethLoading={livePrice == null}
+              ethFootnote={ethTickerFootnote}
+              ethPriceFlash={priceFlash}
+            />
+
+            <div className="flex min-h-0 w-full min-w-0 flex-col gap-6 xl:gap-8">
+              <div className="grid min-h-0 w-full min-w-0 grid-cols-1 items-start gap-6 xl:grid-cols-12">
+                <div className="flex min-h-0 min-w-0 flex-col gap-6 xl:col-span-8">
+                  <TerminalCard className="min-h-[280px] space-y-5">
+                    <Skeleton className="h-3 w-36 rounded-md" />
+                    <div className="flex justify-center pt-4">
+                      <Skeleton className="h-24 w-[min(100%,14rem)] rounded-2xl" />
+                    </div>
+                    <Skeleton className="h-24 w-full rounded-lg" />
+                    <Skeleton className="h-20 w-full rounded-lg" />
+                  </TerminalCard>
+                  <TerminalCard>
+                    <Skeleton className="mb-3 h-3 w-40 rounded-md" />
+                    <Skeleton className="h-4 w-full max-w-md rounded-md" />
+                    <Skeleton className="mt-4 h-48 w-full rounded-xl" />
+                  </TerminalCard>
+                </div>
+
+                <aside className="flex w-full min-w-0 flex-col gap-6 xl:col-span-4">
+                  <GaugeMatrix
+                    isLoading
+                    mlProb01={null}
+                    mlPercentLabel={null}
+                    rsi={null}
+                  />
+                  <IndicatorHub isLoading telemetry={emptyTelemetry} />
+                </aside>
+              </div>
+
+              <section className="w-full min-w-0 shrink-0">
+                <LogsTable
+                  isLoading
+                  rows={[]}
+                  maxRows={LIVE_LOGS_N}
+                />
+              </section>
+            </div>
+          </>
         )}
 
         {showMotor && (
@@ -220,9 +322,11 @@ export function AuricDashboard() {
               balanceLoading={false}
               pnlDayPct={formatPct(pnl ?? null)}
               pnlPositive={pnlPositive}
-              ethPrice={ethPrice}
+              ethPrice={livePrice}
               ethChangePct={ethCh}
-              ethLoading={ethLoading}
+              ethLoading={livePrice == null}
+              ethFootnote={ethTickerFootnote}
+              ethPriceFlash={priceFlash}
             />
 
             <div className="flex min-h-0 w-full min-w-0 flex-col gap-6 xl:gap-8">

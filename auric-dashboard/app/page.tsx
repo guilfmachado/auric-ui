@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import { AuricDashboard } from "@/components/auric/auric-dashboard";
 

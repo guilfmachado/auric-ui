@@ -42,6 +42,8 @@ ML_PROB_SHORT_MAX = 0.40
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
+TRAILING_CALLBACK_RATE_PADRAO = 0.5
+TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
 
 # --- Estado do bot (memória do processo; reinício do script perde o estado) ---
 posicao_aberta: bool = False
@@ -105,6 +107,48 @@ def verificar_permissao_operacao() -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ [ERRO] Falha ao ler permissão: {e}")
         return False
+
+
+def obter_parametros_trailing_supabase() -> tuple[float, float]:
+    """
+    Lê parâmetros dinâmicos do trailing no Supabase (`config`, id=1):
+    - `trailing_callback_rate` (percentual; ex.: 0.5)
+    - `trailing_activation_multiplier` (multiplicador do antigo TP; ex.: 1.0)
+
+    Fallback seguro:
+    - callback_rate = 0.5
+    - activation_multiplier = 1.0 (mantém lógica atual de ativação)
+    """
+    callback = TRAILING_CALLBACK_RATE_PADRAO
+    activation_mult = TRAILING_ACTIVATION_MULTIPLIER_PADRAO
+
+    if logger.supabase is None:
+        return callback, activation_mult
+
+    try:
+        res = (
+            logger.supabase.table("config")
+            .select("trailing_callback_rate, trailing_activation_multiplier")
+            .eq("id", 1)
+            .single()
+            .execute()
+        )
+        row = res.data if isinstance(res.data, dict) else {}
+        cb_raw = row.get("trailing_callback_rate")
+        am_raw = row.get("trailing_activation_multiplier")
+
+        if cb_raw is not None:
+            cb = float(cb_raw)
+            if cb > 0:
+                callback = cb
+        if am_raw is not None:
+            am = float(am_raw)
+            if am > 0:
+                activation_mult = am
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ obter_parametros_trailing_supabase: {e}")
+
+    return callback, activation_mult
 
 
 def atualizar_saldo_supabase() -> None:
@@ -185,82 +229,75 @@ def verificar_comandos_manuais() -> None:
             continue
         try:
             if cmd == "LONG":
-                print(f"🎮 [MANUAL] Executando comando LONG id={rid} → Binance Futuros...")
+                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
+                print(
+                    f"👑 [GOD MODE] Manual Override ativo (id={rid}, LONG): "
+                    "ignorando filtros RSI/ADX/VWAP e enviando ordem."
+                )
                 executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
                     ex,
                     alavancagem=float(ALAVANCAGEM_PADRAO),
+                    trailing_callback_rate=trailing_cb,
+                    trailing_activation_multiplier=trailing_mult,
+                )
+                try:
+                    t = ex.fetch_ticker(executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE))
+                    preco_man = float(t.get("last") or t.get("close") or 0.0)
+                except Exception:  # noqa: BLE001
+                    preco_man = 0.0
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco_man,
+                    prob_ml=0.0,
+                    sentimento="MANUAL",
+                    acao="COMPRA_LONG",
+                    justificativa=(
+                        f"Manual Override (GOD MODE) id={rid}: execução direta LONG "
+                        "(RSI/ADX/VWAP ignorados)."
+                    ),
+                    lado_ordem="LONG",
                 )
                 _marcar_comando_manual_executado(int(rid))
                 print(f"🎮 [MANUAL] LONG id={rid} concluído; executed=true.")
             elif cmd == "SHORT":
-                sym_man = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
-                try:
-                    snap_man = ml_model.obter_snapshot_indicadores_eth(SYMBOL_TRADE)
-                    rsi_m = snap_man.get("rsi_14")
-                except Exception as e_rm:  # noqa: BLE001
-                    print(f"⚠️ [MANUAL] Snapshot RSI: {e_rm}")
-                    rsi_m = None
-                if indicators.rsi_proibe_entrada_short(rsi_m):
-                    print(
-                        f"🎮 [MANUAL] VETO: RSI sobrevendido (RSI(14)={rsi_m}) — SHORT não executado."
-                    )
-                    try:
-                        t = ex.fetch_ticker(sym_man)
-                        preco_man = float(t.get("last") or t.get("close") or 0.0)
-                    except Exception:  # noqa: BLE001
-                        preco_man = 0.0
-                    logger.registrar_log_trade(
-                        par_moeda=SYMBOL_TRADE,
-                        preco=preco_man,
-                        prob_ml=0.0,
-                        sentimento="MANUAL",
-                        acao="VETO_RSI_OVERSOLD",
-                        justificativa=(
-                            f"Comando manual SHORT id={rid} vetado; "
-                            f"RSI(14)={rsi_m} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT}"
-                        ),
-                        lado_ordem="SHORT",
-                    )
-                    _marcar_comando_manual_executado(int(rid))
-                    continue
-                if indicators.volume_compra_spike_1m(ex, sym_man):
-                    ncx = executor_futures.cancelar_ordens_entrada_short(ex, SYMBOL_TRADE)
-                    print(
-                        f"🎮 [MANUAL] VETO: spike volume 1m — SHORT não executado; "
-                        f"canceladas {ncx} ordem(ns) entrada."
-                    )
-                    try:
-                        t = ex.fetch_ticker(sym_man)
-                        preco_man = float(t.get("last") or t.get("close") or 0.0)
-                    except Exception:  # noqa: BLE001
-                        preco_man = 0.0
-                    logger.registrar_log_trade(
-                        par_moeda=SYMBOL_TRADE,
-                        preco=preco_man,
-                        prob_ml=0.0,
-                        sentimento="MANUAL",
-                        acao="VETO_VOLUME_SPIKE",
-                        justificativa=(
-                            f"Comando manual SHORT id={rid} vetado; spike 1m; n_cancel={ncx}"
-                        ),
-                        lado_ordem="SHORT",
-                    )
-                    _marcar_comando_manual_executado(int(rid))
-                    continue
-                print(f"🎮 [MANUAL] Executando comando SHORT id={rid} → Binance Futuros...")
+                print(
+                    f"👑 [GOD MODE] Manual Override ativo (id={rid}, SHORT): "
+                    "ignorando filtros RSI/ADX/VWAP e enviando ordem."
+                )
+                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
                 executor_futures.abrir_short_market(
                     SYMBOL_TRADE,
                     ex,
                     alavancagem=float(ALAVANCAGEM_PADRAO),
+                    trailing_callback_rate=trailing_cb,
+                    trailing_activation_multiplier=trailing_mult,
+                )
+                try:
+                    sym_man = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+                    t = ex.fetch_ticker(sym_man)
+                    preco_man = float(t.get("last") or t.get("close") or 0.0)
+                except Exception:  # noqa: BLE001
+                    preco_man = 0.0
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco_man,
+                    prob_ml=0.0,
+                    sentimento="MANUAL",
+                    acao="ABRE_SHORT",
+                    justificativa=(
+                        f"Manual Override (GOD MODE) id={rid}: execução direta SHORT "
+                        "(RSI/ADX/VWAP ignorados)."
+                    ),
+                    lado_ordem="SHORT",
                 )
                 _marcar_comando_manual_executado(int(rid))
                 print(f"🎮 [MANUAL] SHORT id={rid} concluído; executed=true.")
-            elif cmd == "CLOSE":
-                print(f"🎮 [MANUAL] Emergency close id={rid} → Binance Futuros...")
+            elif cmd in ("CLOSE", "CLOSE_ALL"):
+                print(f"🎮 [MANUAL] Emergency close id={rid} ({cmd}) → Binance Futuros...")
                 executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
                 _marcar_comando_manual_executado(int(rid))
-                print(f"🎮 [MANUAL] CLOSE id={rid} concluído; executed=true.")
+                print(f"🎮 [MANUAL] {cmd} id={rid} concluído; executed=true.")
             else:
                 print(
                     f"⚠️ [MANUAL] Comando ignorado id={rid} (command={cmd!r}; use LONG, SHORT ou CLOSE)."
@@ -854,8 +891,19 @@ def rodar_ciclo(modo: str) -> None:
         f"      posicao_recomendada={pos_rec} | direcao_sugerida={direcao_sugerida}"
     )
 
+    manual_override_veredito = sent == "MANUAL"
+    if manual_override_veredito:
+        alvo = pos_rec if pos_rec in ("LONG", "SHORT") else direcao_sugerida
+        sent = "BULLISH" if alvo == "LONG" else "BEARISH"
+        pos_rec = alvo
+        conf_num = max(conf_num, 100)
+        print(
+            f"👑 [GOD MODE] Veredito MANUAL detetado — filtros RSI/ADX/VWAP ignorados; "
+            f"execução forçada para {alvo}."
+        )
+
     # 4. Filtro de execução (entrada)
-    if sent not in ("BULLISH", "BEARISH"):
+    if not manual_override_veredito and sent not in ("BULLISH", "BEARISH"):
         print(
             "    [Buscando Oportunidade] Só executa com sentimento BULLISH ou BEARISH; "
             f"recebido={sent}."
@@ -873,7 +921,7 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    if pos_rec == "VETO" or pos_rec != direcao_sugerida:
+    if not manual_override_veredito and (pos_rec == "VETO" or pos_rec != direcao_sugerida):
         print(
             "    [Buscando Oportunidade] Brain não confirma a direção técnica (VETO ou divergência)."
         )
@@ -892,7 +940,7 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    if conf_num < CONFIANCA_BRAIN_MIN_ENTRADA:
+    if not manual_override_veredito and conf_num < CONFIANCA_BRAIN_MIN_ENTRADA:
         print(
             f"    [Buscando Oportunidade] Sinal alinhado mas confiança {conf_num}% < "
             f"{CONFIANCA_BRAIN_MIN_ENTRADA}% — sem entrada."
@@ -910,7 +958,11 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    if snap.get("mercado_lateral") and not snap.get("bollinger_squeeze"):
+    if (
+        not manual_override_veredito
+        and snap.get("mercado_lateral")
+        and not snap.get("bollinger_squeeze")
+    ):
         if pos_rec == direcao_sugerida and sent in ("BULLISH", "BEARISH"):
             adx_s = snap.get("adx_14")
             print(
@@ -970,27 +1022,85 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    if sent == "BEARISH" and indicators.rsi_proibe_entrada_short(snap.get("rsi_14")):
-        rsi_c = snap.get("rsi_14")
-        print(
-            f"    [Risco] RSI sobrevendido (RSI(14)={rsi_c}) — SHORT proibido («vender o fundo»)."
-        )
-        logger.registrar_log_trade(
-            par_moeda=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento=sent,
-            acao="VETO_RSI_OVERSOLD",
-            justificativa=(
-                f"{just_ia} | RSI(14)={rsi_c} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT} "
-                "(abrir SHORT vetado)"
-            ),
-            lado_ordem="SHORT",
-            contexto_raw=contexto_raw_supabase,
-            justificativa_ia=just_ia,
-            noticias_agregadas=contexto,
-        )
-        return
+    adx_raw = snap.get("adx_14")
+    rsi_raw = snap.get("rsi_14")
+    try:
+        adx_num = float(adx_raw) if adx_raw is not None else None
+    except (TypeError, ValueError):
+        adx_num = None
+    try:
+        rsi_num = float(rsi_raw) if rsi_raw is not None else None
+    except (TypeError, ValueError):
+        rsi_num = None
+
+    short_adx_bypass = False
+    if (
+        not manual_override_veredito
+        and sent == "BEARISH"
+        and indicators.rsi_proibe_entrada_short(rsi_num)
+    ):
+        if adx_num is not None and adx_num > 30.0:
+            short_adx_bypass = True
+            print(
+                "    [ADX BYPASS] RSI sobrevendido para SHORT, mas ADX(14)>30 "
+                f"(ADX={adx_num:.2f}) — tendência forte confirmada; veto ignorado."
+            )
+        else:
+            print(
+                f"    [Risco] RSI sobrevendido (RSI(14)={rsi_num}) — SHORT proibido "
+                "(sem ADX BYPASS, exigido ADX>30)."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_RSI_OVERSOLD",
+                justificativa=(
+                    f"{just_ia} | RSI(14)={rsi_num} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT} "
+                    f"e ADX(14)={adx_num} <= 30 (abrir SHORT vetado)"
+                ),
+                lado_ordem="SHORT",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
+
+    long_adx_bypass = False
+    if (
+        not manual_override_veredito
+        and sent == "BULLISH"
+        and rsi_num is not None
+        and rsi_num > 70.0
+    ):
+        if adx_num is not None and adx_num > 30.0:
+            long_adx_bypass = True
+            print(
+                "    [ADX BYPASS] RSI sobrecomprado para LONG, mas ADX(14)>30 "
+                f"(ADX={adx_num:.2f}) — tendência forte confirmada; veto ignorado."
+            )
+        else:
+            print(
+                f"    [Risco] RSI sobrecomprado (RSI(14)={rsi_num:.2f}) — LONG proibido "
+                "(sem ADX BYPASS, exigido ADX>30)."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_RSI_OVERBOUGHT",
+                justificativa=(
+                    f"{just_ia} | RSI(14)={rsi_num:.2f} > 70 e ADX(14)={adx_num} <= 30 "
+                    "(abrir LONG vetado)"
+                ),
+                lado_ordem="LONG",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
 
     if sent == "BULLISH":
         if modo == "FUTURES":
@@ -1011,13 +1121,20 @@ def rodar_ciclo(modo: str) -> None:
             f"    [Buscando Oportunidade] BULLISH + ML/Brain alinhados + "
             f"conf≥{CONFIANCA_BRAIN_MIN_ENTRADA}% — {entrada_txt}"
         )
+        if manual_override_veredito:
+            print("    👑 [GOD MODE] Execução LONG forçada por veredito MANUAL.")
+        elif long_adx_bypass:
+            print("    🚀 [ADX BYPASS] LONG autorizado apesar de RSI extremo (ADX > 30).")
         try:
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             if modo == "FUTURES":
+                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
                 ordem = executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
                     ex,
                     alavancagem=float(ALAVANCAGEM_PADRAO),
+                    trailing_callback_rate=trailing_cb,
+                    trailing_activation_multiplier=trailing_mult,
                 )
             else:
                 ordem = ex_mod.executar_compra_spot_market(SYMBOL_TRADE, exchange=ex)
@@ -1027,7 +1144,8 @@ def rodar_ciclo(modo: str) -> None:
             posicao_aberta = True
             direcao_posicao = "LONG"
             bracket_note = (
-                " TP/SL reduce-only na Binance (LIMIT+STOP_MARKET)."
+                " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
+                f"activation no antigo TP×{trailing_mult:.3f}, callback {trailing_cb:.3f}%)."
                 if modo == "FUTURES"
                 else ""
             )
@@ -1036,12 +1154,16 @@ def rodar_ciclo(modo: str) -> None:
                 f"notional/custo alvo ≈ {notional_alvo:.2f} USDT.{bracket_note} "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (LONG)."
             )
+            if manual_override_veredito:
+                acao_long = "COMPRA_LONG"
+            else:
+                acao_long = "LONG_ADX_BYPASS" if long_adx_bypass else "COMPRA_LONG_LIMIT"
             logger.registrar_log_trade(
                 par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=probabilidade,
                 sentimento=sent,
-                acao="COMPRA_LONG_LIMIT",
+                acao=acao_long,
                 justificativa=just_final,
                 lado_ordem="LONG",
                 contexto_raw=contexto_raw_supabase,
@@ -1054,7 +1176,8 @@ def rodar_ciclo(modo: str) -> None:
             print(
                 "    Próximos ciclos: >>> MODO VIGIA <<< "
                 + (
-                    "(FUTURES: TP/SL já na bolsa; o maestro ainda monitora como rede de segurança)"
+                    "(FUTURES: SL fixo + trailing stop já na bolsa; "
+                    "o maestro ainda monitora como rede de segurança)"
                     if modo == "FUTURES"
                     else "(TP +2% / SL -1%)."
                 )
@@ -1088,6 +1211,10 @@ def rodar_ciclo(modo: str) -> None:
             f"    [Buscando Oportunidade] BEARISH + ML/Brain alinhados + "
             f"conf≥{CONFIANCA_BRAIN_MIN_ENTRADA}% — {entrada_txt}"
         )
+        if manual_override_veredito:
+            print("    👑 [GOD MODE] Execução SHORT forçada por veredito MANUAL.")
+        elif short_adx_bypass:
+            print("    🚀 [ADX BYPASS] SHORT autorizado apesar de RSI extremo (ADX > 30).")
         try:
             sym_f = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
             if indicators.volume_compra_spike_1m(ex, sym_f):
@@ -1117,10 +1244,13 @@ def rodar_ciclo(modo: str) -> None:
             print(f"    ⚠️ Verificação volume spike (antes do SHORT): {e_sp}")
         try:
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
+            trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
             ordem = executor_futures.abrir_short_market(
                 SYMBOL_TRADE,
                 ex,
                 alavancagem=float(ALAVANCAGEM_PADRAO),
+                trailing_callback_rate=trailing_cb,
+                trailing_activation_multiplier=trailing_mult,
             )
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")
@@ -1129,15 +1259,20 @@ def rodar_ciclo(modo: str) -> None:
             direcao_posicao = "SHORT"
             just_final = (
                 f"{just_ia} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDT. "
-                " TP/SL reduce-only na Binance. "
+                " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
+                f"activation no antigo TP×{trailing_mult:.3f}, callback {trailing_cb:.3f}%). "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (SHORT)."
             )
+            if manual_override_veredito:
+                acao_short = "ABRE_SHORT"
+            else:
+                acao_short = "SHORT_ADX_BYPASS" if short_adx_bypass else "ABRE_SHORT_LIMIT"
             logger.registrar_log_trade(
                 par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=probabilidade,
                 sentimento=sent,
-                acao="ABRE_SHORT_LIMIT",
+                acao=acao_short,
                 justificativa=just_final,
                 lado_ordem="SHORT",
                 contexto_raw=contexto_raw_supabase,
@@ -1149,7 +1284,7 @@ def rodar_ciclo(modo: str) -> None:
             )
             print(
                 "    Próximos ciclos: >>> MODO VIGIA <<< "
-                "(FUTURES: TP/SL na bolsa; maestro como rede de segurança)"
+                "(FUTURES: SL fixo + trailing stop na bolsa; maestro como rede de segurança)"
             )
         except Exception as e_ord:  # noqa: BLE001
             err_txt = f"Falha na ordem short: {e_ord!s}"

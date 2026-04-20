@@ -3,6 +3,7 @@
 import { Layers } from "lucide-react";
 import { motion } from "framer-motion";
 
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 import type { ParsedTelemetry } from "@/lib/auric/parse-telemetry";
@@ -14,6 +15,7 @@ const RSI_WARN = 35;
 
 type Props = {
   telemetry: ParsedTelemetry;
+  isLoading?: boolean;
 };
 
 type PillTone =
@@ -70,7 +72,7 @@ function Pill({
   );
 }
 
-export function IndicatorHub({ telemetry }: Props) {
+export function IndicatorHub({ telemetry, isLoading }: Props) {
   const adxVal = telemetry.adx;
   const adxStr =
     adxVal != null && !Number.isNaN(adxVal) ? adxVal.toFixed(2) : "—";
@@ -104,12 +106,26 @@ export function IndicatorHub({ telemetry }: Props) {
           Indicator hub
         </span>
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-2">
-        <Pill label="ADX (14)" value={adxStr} tone={adxTone} />
-        <Pill label="RSI (14)" value={rsiDisplay} tone={rsiTone} />
-        <Pill label="VWAP" value={vwap} tone="violet" />
-        <Pill label="Bollinger" value={bb} tone="amber" />
-      </div>
+      {isLoading ? (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div
+              key={i}
+              className="flex min-h-[3.25rem] flex-col gap-2 rounded-lg border border-zinc-700/50 bg-zinc-900/40 p-3"
+            >
+              <Skeleton className="h-2.5 w-14 rounded-md" />
+              <Skeleton className="h-4 w-full max-w-[5.5rem] rounded-md" />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-2">
+          <Pill label="ADX (14)" value={adxStr} tone={adxTone} />
+          <Pill label="RSI (14)" value={rsiDisplay} tone={rsiTone} />
+          <Pill label="VWAP" value={vwap} tone="violet" />
+          <Pill label="Bollinger" value={bb} tone="amber" />
+        </div>
+      )}
     </TerminalCard>
   );
 }

@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { ScrollText } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Table,
   TableBody,
@@ -23,6 +24,8 @@ type Props = {
   rows: LogRow[];
   /** Número de linhas esperadas (rótulo no header). */
   maxRows?: number;
+  /** Primeira carga Supabase: linhas placeholder. */
+  isLoading?: boolean;
 };
 
 const logRowVariants = {
@@ -51,7 +54,7 @@ function formatTime(iso: string | undefined) {
   }
 }
 
-export function LogsTable({ rows, maxRows = 5 }: Props) {
+export function LogsTable({ rows, maxRows = 5, isLoading }: Props) {
   return (
     <motion.section
       initial={{ opacity: 0, y: 20 }}
@@ -93,7 +96,33 @@ export function LogsTable({ rows, maxRows = 5 }: Props) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.length === 0 ? (
+              {isLoading ? (
+                Array.from({ length: maxRows }).map((_, i) => (
+                  <TableRow
+                    key={`log-skeleton-${i}`}
+                    className="border-b border-[#27272a]/80"
+                  >
+                    <TableCell className="py-3">
+                      <Skeleton className="h-3 w-28 rounded-md" />
+                    </TableCell>
+                    <TableCell className="py-3">
+                      <Skeleton className="h-3 w-16 rounded-md" />
+                    </TableCell>
+                    <TableCell className="py-3">
+                      <Skeleton className="h-5 w-12 rounded-md" />
+                    </TableCell>
+                    <TableCell className="py-3 text-right">
+                      <Skeleton className="ml-auto h-3 w-10 rounded-md" />
+                    </TableCell>
+                    <TableCell className="py-3 text-right">
+                      <Skeleton className="ml-auto h-3 w-14 rounded-md" />
+                    </TableCell>
+                    <TableCell className="py-3">
+                      <Skeleton className="h-3 w-20 rounded-md" />
+                    </TableCell>
+                  </TableRow>
+                ))
+              ) : rows.length === 0 ? (
                 <tr>
                   <TableCell
                     colSpan={6}

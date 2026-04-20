@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
@@ -7,6 +7,26 @@ import { createClient } from "@/lib/supabase/client";
 import type { ConfigRow, LogRow, TradingMode } from "@/lib/types/auric";
 
 const CONFIG_ID = 1;
+
+/**
+ * PostgREST pode devolver array, uma linha única (.maybeSingle/.single) ou objeto
+ * agregado (ex.: { latestByIdDesc: [...] } em depurações).
+ */
+function pickLatestLogRow(data: unknown): LogRow | null {
+  if (data == null) return null;
+  if (Array.isArray(data)) {
+    const row = data[0];
+    return row !== undefined && row !== null ? (row as LogRow) : null;
+  }
+  if (typeof data === "object" && data !== null && "latestByIdDesc" in data) {
+    const arr = (data as { latestByIdDesc: unknown }).latestByIdDesc;
+    if (Array.isArray(arr) && arr[0] != null) return arr[0] as LogRow;
+  }
+  if (typeof data === "object" && data !== null && "id" in data) {
+    return data as LogRow;
+  }
+  return null;
+}
 
 function defaultConfig(): ConfigRow {
   return {
@@ -48,67 +68,67 @@ export function useAuricDashboard() {
   /** Primeiro fetch paralelo `logs` (1) + `wallet_status` concluído. */
   const [motorHydrated, setMotorHydrated] = useState(false);
   /** Comando manual em voo (loading por botão). */
-  const [manualPending, setManualPending] = useState<"LONG" | "SHORT" | null>(
-    null
-  );
+  const [manualPending, setManualPending] = useState<
+    "LONG" | "SHORT" | "CLOSE_ALL" | null
+  >(null);
+  /** Falha crítica no fetch inicial ao Supabase (UI de ecrã cheio). */
+  const [connectionError, setConnectionError] = useState<Error | null>(null);
 
-  /**
-   * Hidrata carteira + último log (fonte única para gauge / Intelligence / indicadores).
-   * Equivalente a um useEffect com:
-   * `.from('logs').select('*').order('id', { ascending: false }).limit(1)` +
-   * `wallet_status` id=1.
-   */
-  const hydrateMotor = useCallback(async () => {
+  /** `wallet_status.usdt_balance` (id = 1). */
+  const fetchWalletBalance = useCallback(async () => {
     if (!supabase) {
-      setMotorHydrated(true);
       setWalletHydrated(true);
       return;
     }
     setWalletFetchFailed(false);
     try {
-      const [logsRes, walletRes] = await Promise.all([
-        supabase
-          .from("logs")
-          .select("*")
-          .order("id", { ascending: false })
-          .limit(1),
-        supabase
-          .from("wallet_status")
-          .select("usdt_balance")
-          .eq("id", 1)
-          .maybeSingle(),
-      ]);
+      const { data, error } = await supabase
+        .from("wallet_status")
+        .select("usdt_balance")
+        .eq("id", 1)
+        .single();
 
-      if (logsRes.error) {
+      if (error) {
         console.error(
-          "[auric] fetch último log (logs):",
-          logsRes.error.message,
-          logsRes.error
-        );
-        setLastLog(null);
-      } else {
-        const row = (logsRes.data?.[0] as LogRow | undefined) ?? null;
-        setLastLog(row);
-      }
-
-      if (walletRes.error) {
-        console.error(
-          "[auric] fetch wallet_status:",
-          walletRes.error.message,
-          walletRes.error
+          "[auric] wallet_status select:",
+          error.message,
+          error
         );
         setWalletFetchFailed(true);
         setWalletUsdt(null);
       } else {
-        const w = walletRes.data as { usdt_balance?: unknown } | null;
-        setWalletUsdt(w ? coerceUsdtBalance(w.usdt_balance) : null);
+        const row = data as { usdt_balance?: unknown } | null;
+        setWalletUsdt(row ? coerceUsdtBalance(row.usdt_balance) : null);
       }
     } catch (err) {
-      console.error("[auric] hydrateMotor exceção:", err);
+      console.error("[auric] fetchWalletBalance:", err);
       setWalletFetchFailed(true);
+      setWalletUsdt(null);
     } finally {
       setWalletHydrated(true);
-      setMotorHydrated(true);
+    }
+  }, [supabase]);
+
+  /** Última linha de `logs` por `id` desc (fonte do gauge ML, veredito, preço ref., indicadores). */
+  const fetchLatestLogRow = useCallback(async () => {
+    if (!supabase) return;
+    try {
+      const { data, error } = await supabase
+        .from("logs")
+        .select("*")
+        .order("id", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        console.error("[auric] logs select (último):", error.message, error);
+        setLastLog(null);
+        return;
+      }
+      setLastLog(pickLatestLogRow(data));
+    } catch (err) {
+      console.error("[auric] fetchLatestLogRow:", err);
+      setLastLog(null);
     }
   }, [supabase]);
 
@@ -170,7 +190,7 @@ export function useAuricDashboard() {
         .from("wallet_status")
         .select("usdt_balance")
         .eq("id", 1)
-        .maybeSingle();
+        .single();
       if (e) {
         console.error("[auric] refreshWallet:", e.message, e);
         setWalletFetchFailed(true);
@@ -228,11 +248,32 @@ export function useAuricDashboard() {
   }, [supabase]);
 
   /**
-   * Bootstrap + leitura canónica do motor: último `logs` (order id desc, limit 1)
-   * e `wallet_status` (Supabase JS).
+   * Fetch inicial: `config`, depois em paralelo saldo (`wallet_status`) + último `logs`,
+   * depois lista de logs / bot / métricas. Erros reportados ao estado + `ERRO SUPABASE:` no terminal (Node).
    */
   useEffect(() => {
+    const reportFailure = (error: unknown) => {
+      const err =
+        error instanceof Error
+          ? error
+          : new Error(
+              error &&
+                typeof error === "object" &&
+                "message" in error &&
+                typeof (error as { message: unknown }).message === "string"
+                ? (error as { message: string }).message
+                : String(error)
+            );
+      setConnectionError(err);
+      console.error("ERRO SUPABASE:", error);
+    };
+
     if (!supabase) {
+      const err = new Error(
+        "Cliente Supabase não criado — confirma NEXT_PUBLIC_SUPABASE_URL e NEXT_PUBLIC_SUPABASE_ANON_KEY em .env.local (reinicia o dev server após alterar)."
+      );
+      setConnectionError(err);
+      console.error("ERRO SUPABASE:", err);
       setMotorHydrated(true);
       setWalletHydrated(true);
       setReady(true);
@@ -241,35 +282,139 @@ export function useAuricDashboard() {
 
     let cancelled = false;
     (async () => {
+      setConnectionError(null);
       try {
-        await refreshConfig();
-        await hydrateMotor();
-        await Promise.all([
-          refreshLogs(),
-          refreshBotControl(),
-          countTrades24h(),
-          measurePing(),
-        ]);
-      } catch (err) {
-        if (!cancelled) {
-          console.error("[auric] bootstrap:", err);
+        const { data: cdata, error: ce } = await supabase
+          .from("config")
+          .select("*")
+          .eq("id", CONFIG_ID)
+          .maybeSingle();
+        if (ce) {
+          reportFailure(ce);
+          return;
         }
+        if (cdata) {
+          setConfig(cdata as ConfigRow);
+        } else {
+          const ins = await supabase
+            .from("config")
+            .insert({
+              id: CONFIG_ID,
+              trading_mode: "FUTURES",
+              modo_operacao: "FUTURES",
+            })
+            .select()
+            .single();
+          if (ins.error) {
+            reportFailure(ins.error);
+            return;
+          }
+          setConfig(ins.data as ConfigRow);
+        }
+
+        const [wRes, lRes] = await Promise.all([
+          supabase
+            .from("wallet_status")
+            .select("usdt_balance")
+            .eq("id", 1)
+            .single(),
+          supabase
+            .from("logs")
+            .select("*")
+            .order("id", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
+        if (wRes.error) {
+          reportFailure(wRes.error);
+          return;
+        }
+        setWalletFetchFailed(false);
+        const wrow = wRes.data as { usdt_balance?: unknown } | null;
+        setWalletUsdt(
+          wrow != null ? coerceUsdtBalance(wrow.usdt_balance) : null
+        );
+        setWalletHydrated(true);
+
+        if (lRes.error) {
+          reportFailure(lRes.error);
+          return;
+        }
+        setLastLog(pickLatestLogRow(lRes.data));
+
+        if (cancelled) return;
+        setMotorHydrated(true);
+
+        const since = new Date(
+          Date.now() - 24 * 60 * 60 * 1000
+        ).toISOString();
+        const [logsList, botRes, countRes] = await Promise.all([
+          supabase
+            .from("logs")
+            .select("*")
+            .order("created_at", { ascending: false, nullsFirst: false })
+            .order("id", { ascending: false })
+            .limit(50),
+          supabase
+            .from("bot_control")
+            .select("is_active")
+            .eq("id", 1)
+            .maybeSingle(),
+          supabase
+            .from("logs")
+            .select("id", { count: "exact", head: true })
+            .gte("created_at", since),
+        ]);
+
+        if (logsList.error) {
+          reportFailure(logsList.error);
+          return;
+        }
+        setLogs((logsList.data ?? []) as LogRow[]);
+
+        if (botRes.error) {
+          reportFailure(botRes.error);
+          return;
+        }
+        if (
+          botRes.data &&
+          typeof (botRes.data as { is_active?: boolean }).is_active ===
+            "boolean"
+        ) {
+          setBotActiveState((botRes.data as { is_active: boolean }).is_active);
+        }
+
+        if (countRes.error) {
+          reportFailure(countRes.error);
+          return;
+        }
+        if (countRes.count !== null) {
+          setTrades24hComputed(countRes.count);
+        } else {
+          setTrades24hComputed(null);
+        }
+
+        const t0 = performance.now();
+        const pingRes = await supabase.from("logs").select("id").limit(1);
+        const t1 = performance.now();
+        if (pingRes.error) {
+          reportFailure(pingRes.error);
+          return;
+        }
+        setPingMs(Math.round(t1 - t0));
+      } catch (error) {
+        reportFailure(error);
       } finally {
-        if (!cancelled) setReady(true);
+        if (!cancelled) {
+          setMotorHydrated(true);
+          setReady(true);
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [
-    supabase,
-    hydrateMotor,
-    refreshConfig,
-    refreshLogs,
-    refreshBotControl,
-    countTrades24h,
-    measurePing,
-  ]);
+  }, [supabase]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -290,16 +435,20 @@ export function useAuricDashboard() {
           void refreshConfig();
         }
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        if (err) console.error("[auric] Realtime config:", err);
+        else if (status === "SUBSCRIBED")
+          console.info("[auric] Realtime: config inscrito");
+      });
 
-    /** Motor Auric: logs + carteira + bot em um único canal Realtime. */
+    /** Motor: `logs` + `wallet_status` + `bot_control`. */
     const chMotor = supabase
       .channel("auric-motor-realtime")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "logs" },
         () => {
-          void hydrateMotor();
+          void fetchLatestLogRow();
           void refreshLogs();
           void countTrades24h();
         }
@@ -318,7 +467,7 @@ export function useAuricDashboard() {
               return;
             }
           }
-          void refreshWallet();
+          void fetchWalletBalance();
         }
       )
       .on(
@@ -328,7 +477,11 @@ export function useAuricDashboard() {
           void refreshBotControl();
         }
       )
-      .subscribe();
+      .subscribe((status, err) => {
+        if (err) console.error("[auric] Realtime motor:", err);
+        else if (status === "SUBSCRIBED")
+          console.info("[auric] Realtime: logs + wallet_status + bot_control inscrito");
+      });
 
     return () => {
       void supabase.removeChannel(chConfig);
@@ -338,8 +491,8 @@ export function useAuricDashboard() {
     supabase,
     refreshConfig,
     refreshLogs,
-    refreshWallet,
-    hydrateMotor,
+    fetchWalletBalance,
+    fetchLatestLogRow,
     refreshBotControl,
     countTrades24h,
   ]);
@@ -393,7 +546,7 @@ export function useAuricDashboard() {
   );
 
   const insertManualCommand = useCallback(
-    async (command: "LONG" | "SHORT") => {
+    async (command: "LONG" | "SHORT" | "CLOSE_ALL") => {
       if (!supabase) return;
       setManualPending(command);
       const { error: e } = await supabase
@@ -413,6 +566,7 @@ export function useAuricDashboard() {
 
   return {
     ready,
+    connectionError,
     supabaseReady: !!supabase,
     motorHydrated,
     config,

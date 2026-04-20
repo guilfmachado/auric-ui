@@ -3,6 +3,7 @@
 import { Orbit } from "lucide-react";
 
 import { CardTitle } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 
 import { MlRadialGauge } from "./ml-radial-gauge";
@@ -15,6 +16,8 @@ type Props = {
   /** Rótulo do centro (ex.: `(p*100).toFixed(1)+'%'`). */
   mlPercentLabel?: string | null;
   rsi: number | null;
+  /** Carregamento inicial Supabase: placeholders no lugar dos gauges. */
+  isLoading?: boolean;
 };
 
 const SHORT_MAX = 0.4;
@@ -27,7 +30,12 @@ function mlCardZone(p: number | null): "bear" | "bull" | "neutral" | "loading" {
   return "neutral";
 }
 
-export function GaugeMatrix({ mlProb01, mlPercentLabel, rsi }: Props) {
+export function GaugeMatrix({
+  mlProb01,
+  mlPercentLabel,
+  rsi,
+  isLoading,
+}: Props) {
   const z = mlCardZone(mlProb01);
 
   return (
@@ -38,25 +46,32 @@ export function GaugeMatrix({ mlProb01, mlPercentLabel, rsi }: Props) {
           Gauge matrix
         </CardTitle>
       </div>
-      <div className="grid flex-1 grid-cols-2 gap-2">
-        <div
-          className={cn(
-            "flex flex-col items-center justify-center rounded-lg border py-4 transition-colors duration-300",
-            "bg-[#09090b]/60",
-            z === "loading" && "border-[#27272a]/80",
-            z === "bear" &&
-              "border-rose-500/70 bg-rose-950/25 shadow-[inset_0_0_28px_rgba(244,63,94,0.12),0_0_20px_rgba(255,32,86,0.18)]",
-            z === "bull" &&
-              "border-emerald-500/70 bg-emerald-950/20 shadow-[inset_0_0_28px_rgba(34,197,94,0.12),0_0_20px_rgba(57,255,20,0.15)]",
-            z === "neutral" && "border-sky-500/40 bg-sky-950/15"
-          )}
-        >
-          <MlRadialGauge value={mlProb01} percentLabel={mlPercentLabel} />
+      {isLoading ? (
+        <div className="grid flex-1 grid-cols-2 gap-2">
+          <Skeleton className="min-h-[200px] rounded-xl border border-zinc-700/50 bg-zinc-900/50 py-6" />
+          <Skeleton className="min-h-[200px] rounded-xl border border-zinc-700/50 bg-zinc-900/50 py-6" />
         </div>
-        <div className="flex flex-col items-center justify-center rounded-lg border border-[#27272a]/80 bg-[#09090b]/60 py-4">
-          <RsiRadialGauge value={rsi} />
+      ) : (
+        <div className="grid flex-1 grid-cols-2 gap-2">
+          <div
+            className={cn(
+              "flex flex-col items-center justify-center rounded-lg border py-4 transition-colors duration-300",
+              "bg-[#09090b]/60",
+              z === "loading" && "border-[#27272a]/80",
+              z === "bear" &&
+                "border-rose-500/70 bg-rose-950/25 shadow-[inset_0_0_28px_rgba(244,63,94,0.12),0_0_20px_rgba(255,32,86,0.18)]",
+              z === "bull" &&
+                "border-emerald-500/70 bg-emerald-950/20 shadow-[inset_0_0_28px_rgba(34,197,94,0.12),0_0_20px_rgba(57,255,20,0.15)]",
+              z === "neutral" && "border-sky-500/40 bg-sky-950/15"
+            )}
+          >
+            <MlRadialGauge value={mlProb01} percentLabel={mlPercentLabel} />
+          </div>
+          <div className="flex flex-col items-center justify-center rounded-lg border border-[#27272a]/80 bg-[#09090b]/60 py-4">
+            <RsiRadialGauge value={rsi} />
+          </div>
         </div>
-      </div>
+      )}
     </TerminalCard>
   );
 }

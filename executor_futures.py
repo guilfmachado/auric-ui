@@ -18,11 +18,13 @@ load_dotenv()
 
 _TAG = "[MAINNET FUTURES]"
 
-# Gestão de risco (frações): TP/SL em relação ao preço de entrada.
+# Gestão de risco (frações): gatilho de trailing/SL em relação ao preço de entrada.
 LONG_TP = 0.020
 LONG_SL = 0.010
 SHORT_TP = 0.015
 SHORT_SL = 0.008
+TRAILING_CALLBACK_RATE = 0.5  # % de recuo da máxima/mínima após ativação
+TRAILING_ACTIVATION_MULTIPLIER = 1.0  # 1.0 = mantém gatilho igual ao antigo TP
 
 # Alavancagem usada só no log de liquidação aproximada (ajuste em configurar_alavancagem / main).
 ALAVANCAGEM_REF_LOG_PADRAO = 3
@@ -432,22 +434,48 @@ def _criar_bracket_long(
     simbolo: str,
     qty: float,
     preco_entrada: float,
+    *,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """LIMIT take-profit (sell) + STOP_MARKET stop-loss (sell), reduce-only."""
+    """
+    Bracket LONG na Binance USDT-M:
+    - STOP_MARKET (SL fixo de proteção inicial)
+    - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
+    """
     q = float(exchange.amount_to_precision(simbolo, qty))
-    tp_raw = preco_entrada * (1.0 + LONG_TP)
+    cb_rate = (
+        float(trailing_callback_rate)
+        if trailing_callback_rate is not None
+        else float(TRAILING_CALLBACK_RATE)
+    )
+    act_mult = (
+        float(trailing_activation_multiplier)
+        if trailing_activation_multiplier is not None
+        else float(TRAILING_ACTIVATION_MULTIPLIER)
+    )
+    if cb_rate <= 0:
+        cb_rate = float(TRAILING_CALLBACK_RATE)
+    if act_mult <= 0:
+        act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
+
+    tp_raw = preco_entrada * (1.0 + (LONG_TP * act_mult))  # activationPrice do trailing
     sl_raw = preco_entrada * (1.0 - LONG_SL)
     tp_p = float(exchange.price_to_precision(simbolo, tp_raw))
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
     p_ro = _params_reduce_futures()
-    ord_tp = exchange.create_order(
+    ord_trailing = exchange.create_order(
         simbolo,
-        "limit",
+        "TRAILING_STOP_MARKET",
         "sell",
         q,
-        tp_p,
-        {**p_ro, "timeInForce": "GTC"},
+        None,
+        {
+            **p_ro,
+            "activationPrice": tp_p,
+            "callbackRate": cb_rate,
+        },
     )
     ord_sl = exchange.create_order(
         simbolo,
@@ -458,10 +486,11 @@ def _criar_bracket_long(
         {**p_ro, "stopPrice": sl_p},
     )
     print(
-        f"{_TAG} Bracket LONG: TP LIMIT sell @ {tp_p} (+{LONG_TP:.1%}), "
-        f"SL STOP_MARKET @ {sl_p} (−{LONG_SL:.1%}), qty={q}"
+        f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (−{LONG_SL:.1%}) + "
+        f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / +{(LONG_TP * act_mult):.1%}, "
+        f"callbackRate={cb_rate:.1f}%), qty={q}"
     )
-    return ord_tp, ord_sl
+    return ord_trailing, ord_sl
 
 
 def _criar_bracket_short(
@@ -469,22 +498,48 @@ def _criar_bracket_short(
     simbolo: str,
     qty: float,
     preco_entrada: float,
+    *,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """LIMIT take-profit (buy) + STOP_MARKET stop-loss (buy), reduce-only."""
+    """
+    Bracket SHORT na Binance USDT-M:
+    - STOP_MARKET (SL fixo de proteção inicial)
+    - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
+    """
     q = float(exchange.amount_to_precision(simbolo, qty))
-    tp_raw = preco_entrada * (1.0 - SHORT_TP)
+    cb_rate = (
+        float(trailing_callback_rate)
+        if trailing_callback_rate is not None
+        else float(TRAILING_CALLBACK_RATE)
+    )
+    act_mult = (
+        float(trailing_activation_multiplier)
+        if trailing_activation_multiplier is not None
+        else float(TRAILING_ACTIVATION_MULTIPLIER)
+    )
+    if cb_rate <= 0:
+        cb_rate = float(TRAILING_CALLBACK_RATE)
+    if act_mult <= 0:
+        act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
+
+    tp_raw = preco_entrada * (1.0 - (SHORT_TP * act_mult))  # activationPrice do trailing
     sl_raw = preco_entrada * (1.0 + SHORT_SL)
     tp_p = float(exchange.price_to_precision(simbolo, tp_raw))
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
     p_ro = _params_reduce_futures()
-    ord_tp = exchange.create_order(
+    ord_trailing = exchange.create_order(
         simbolo,
-        "limit",
+        "TRAILING_STOP_MARKET",
         "buy",
         q,
-        tp_p,
-        {**p_ro, "timeInForce": "GTC"},
+        None,
+        {
+            **p_ro,
+            "activationPrice": tp_p,
+            "callbackRate": cb_rate,
+        },
     )
     ord_sl = exchange.create_order(
         simbolo,
@@ -495,10 +550,11 @@ def _criar_bracket_short(
         {**p_ro, "stopPrice": sl_p},
     )
     print(
-        f"{_TAG} Bracket SHORT: TP LIMIT buy @ {tp_p} (−{SHORT_TP:.1%}), "
-        f"SL STOP_MARKET @ {sl_p} (+{SHORT_SL:.1%}), qty={q}"
+        f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (+{SHORT_SL:.1%}) + "
+        f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / −{(SHORT_TP * act_mult):.1%}, "
+        f"callbackRate={cb_rate:.1f}%), qty={q}"
     )
-    return ord_tp, ord_sl
+    return ord_trailing, ord_sl
 
 
 def _usdt_de_balance_unificado(bal: dict[str, Any]) -> float:
@@ -540,11 +596,13 @@ def abrir_long_market(
     *,
     alavancagem: float | None = None,
     notional_usdt_override: float | None = None,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
     Abre **long** com LIMIT **GTC** + **chase**: preço = último × (1 + offset 0,05%);
     após ~CHASE_ENTRADA_TIMEOUT_S sem fill, cancela e reabre no novo último.
-    Notional = 15%×banca×alav; depois bracket TP/SL.
+    Notional = 15%×banca×alav; depois bracket (SL fixo + trailing stop).
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
@@ -576,9 +634,17 @@ def abrir_long_market(
         print(f"{_TAG} Long aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "LONG", lev)
-        ord_tp, ord_sl = _criar_bracket_long(ex, sym, qty_pos, preco_ent)
+        ord_trailing, ord_sl = _criar_bracket_long(
+            ex,
+            sym,
+            qty_pos,
+            preco_ent,
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+        )
         out = dict(ordem)
-        out["auric_take_profit"] = ord_tp
+        out["auric_take_profit"] = ord_trailing  # compat legado
+        out["auric_trailing_stop"] = ord_trailing
         out["auric_stop_loss"] = ord_sl
         out["auric_entry_qty"] = qty_pos
         out["auric_entry_price"] = preco_ent
@@ -594,10 +660,12 @@ def abrir_short_market(
     *,
     alavancagem: float | None = None,
     notional_usdt_override: float | None = None,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """
     Abre **short** com LIMIT GTC + chase (−0,05% vs. último); mesmo fluxo que o long.
-    Depois **reduce-only** LIMIT (TP) e STOP_MARKET (SL).
+    Depois **reduce-only** STOP_MARKET (SL) e TRAILING_STOP_MARKET.
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
@@ -631,9 +699,17 @@ def abrir_short_market(
         print(f"{_TAG} Short aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "SHORT", lev)
-        ord_tp, ord_sl = _criar_bracket_short(ex, sym, qty_pos, preco_ent)
+        ord_trailing, ord_sl = _criar_bracket_short(
+            ex,
+            sym,
+            qty_pos,
+            preco_ent,
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+        )
         out = dict(ordem)
-        out["auric_take_profit"] = ord_tp
+        out["auric_take_profit"] = ord_trailing  # compat legado
+        out["auric_trailing_stop"] = ord_trailing
         out["auric_stop_loss"] = ord_sl
         out["auric_entry_qty"] = qty_pos
         out["auric_entry_price"] = preco_ent

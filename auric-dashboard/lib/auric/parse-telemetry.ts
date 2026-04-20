@@ -134,7 +134,22 @@ function mergePreferStr(
   return null;
 }
 
-/** ADX / RSI / ML / VWAP a partir do último log: `contexto_raw` (JSON TA) + texto `justificativa`. */
+function numCol(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const x = typeof v === "number" ? v : parseFloat(String(v));
+  return Number.isFinite(x) ? x : null;
+}
+
+/** RSI/ADX em colunas dedicadas da tabela `logs` (prioridade sobre texto/JSON). */
+function taFromTableColumns(log: LogRow): { adx: number | null; rsi: number | null } {
+  const r = log as unknown as Record<string, unknown>;
+  return {
+    rsi: numCol(log.rsi_14) ?? numCol(r.rsi),
+    adx: numCol(log.adx_14) ?? numCol(r.adx),
+  };
+}
+
+/** ADX / RSI / ML / VWAP a partir do último log: colunas TA, `contexto_raw` (JSON TA) + `justificativa`. */
 export function parseTelemetryFromLog(log: LogRow | null): ParsedTelemetry {
   const empty: ParsedTelemetry = {
     ml: null,
@@ -145,6 +160,7 @@ export function parseTelemetryFromLog(log: LogRow | null): ParsedTelemetry {
   };
   if (!log) return empty;
 
+  const cols = taFromTableColumns(log);
   const fromCtx = parseContextoRawTa(log.contexto_raw ?? null);
   const rawTa = extractAdxRsiFromContextoRaw(log.contexto_raw);
 
@@ -152,8 +168,14 @@ export function parseTelemetryFromLog(log: LogRow | null): ParsedTelemetry {
   if (!j.trim()) {
     return {
       ml: mergePrefer(fromCtx.ml, null),
-      adx: mergePrefer(mergePrefer(fromCtx.adx, null), rawTa.adx),
-      rsi: mergePrefer(mergePrefer(fromCtx.rsi, null), rawTa.rsi),
+      adx: mergePrefer(
+        cols.adx,
+        mergePrefer(mergePrefer(fromCtx.adx, null), rawTa.adx)
+      ),
+      rsi: mergePrefer(
+        cols.rsi,
+        mergePrefer(mergePrefer(fromCtx.rsi, null), rawTa.rsi)
+      ),
       vwapLabel: fromCtx.vwapLabel ?? null,
       bollingerLabel: fromCtx.bollingerLabel ?? null,
     };
@@ -167,8 +189,14 @@ export function parseTelemetryFromLog(log: LogRow | null): ParsedTelemetry {
         : structured.ml;
     return {
       ml: mergePrefer(normMl, fromCtx.ml),
-      adx: mergePrefer(mergePrefer(structured.adx, fromCtx.adx), rawTa.adx),
-      rsi: mergePrefer(mergePrefer(structured.rsi, fromCtx.rsi), rawTa.rsi),
+      adx: mergePrefer(
+        cols.adx,
+        mergePrefer(mergePrefer(structured.adx, fromCtx.adx), rawTa.adx)
+      ),
+      rsi: mergePrefer(
+        cols.rsi,
+        mergePrefer(mergePrefer(structured.rsi, fromCtx.rsi), rawTa.rsi)
+      ),
       vwapLabel: mergePreferStr(structured.vwapLabel, fromCtx.vwapLabel),
       bollingerLabel:
         mergePreferStr(structured.bollingerLabel, fromCtx.bollingerLabel) ??
@@ -193,12 +221,18 @@ export function parseTelemetryFromLog(log: LogRow | null): ParsedTelemetry {
   return {
     ml: mergePrefer(mlPct, fromCtx.ml),
     adx: mergePrefer(
-      mergePrefer(adxM ? parseFloat(adxM[1]) : null, fromCtx.adx),
-      rawTa.adx
+      cols.adx,
+      mergePrefer(
+        mergePrefer(adxM ? parseFloat(adxM[1]) : null, fromCtx.adx),
+        rawTa.adx
+      )
     ),
     rsi: mergePrefer(
-      mergePrefer(rsiM ? parseFloat(rsiM[1]) : null, fromCtx.rsi),
-      rawTa.rsi
+      cols.rsi,
+      mergePrefer(
+        mergePrefer(rsiM ? parseFloat(rsiM[1]) : null, fromCtx.rsi),
+        rawTa.rsi
+      )
     ),
     vwapLabel: mergePreferStr(sniffVwap(j), fromCtx.vwapLabel),
     bollingerLabel: mergePreferStr(sniffBollinger(j), fromCtx.bollingerLabel),

@@ -1,6 +1,6 @@
 "use client";
 
-import { Activity, Loader2, Radio, Zap } from "lucide-react";
+import { Activity, AlertTriangle, Loader2, Radio, Zap } from "lucide-react";
 import { motion } from "framer-motion";
 
 import { Switch } from "@/components/ui/switch";
@@ -19,7 +19,8 @@ type Props = {
   winRate?: string;
   onManualLong?: () => void;
   onManualShort?: () => void;
-  manualPending?: "LONG" | "SHORT" | null;
+  onManualCloseAll?: () => void;
+  manualPending?: "LONG" | "SHORT" | "CLOSE_ALL" | null;
 };
 
 export function AuricHeader({
@@ -34,6 +35,7 @@ export function AuricHeader({
   winRate,
   onManualLong,
   onManualShort,
+  onManualCloseAll,
   manualPending,
 }: Props) {
   const isFutures = tradingMode === "FUTURES";
@@ -110,51 +112,91 @@ export function AuricHeader({
         )}
 
         {onManualLong && onManualShort && (
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={manualPending !== null}
-              onClick={onManualLong}
-              className={cn(
-                "inline-flex min-w-[8.5rem] items-center justify-center gap-2 rounded-lg border border-emerald-500/50 bg-emerald-500/10 px-4 py-2 text-[10px] font-black tracking-[0.15em] text-emerald-300 uppercase",
-                "shadow-[0_0_20px_rgba(16,185,129,0.25)] transition hover:border-emerald-400 hover:bg-emerald-500/20 hover:shadow-[0_0_28px_rgba(16,185,129,0.35)]",
-                "disabled:pointer-events-none disabled:opacity-50"
-              )}
-              style={{
-                fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
-              }}
-            >
-              {manualPending === "LONG" ? (
-                <>
-                  <Loader2 className="size-3.5 animate-spin text-emerald-400" />
-                  Enviando
-                </>
-              ) : (
-                "Buy / Long"
-              )}
-            </button>
-            <button
-              type="button"
-              disabled={manualPending !== null}
-              onClick={onManualShort}
-              className={cn(
-                "inline-flex min-w-[8.5rem] items-center justify-center gap-2 rounded-lg border border-red-500/50 bg-red-950/40 px-4 py-2 text-[10px] font-black tracking-[0.15em] text-red-300 uppercase",
-                "shadow-[0_0_20px_rgba(248,113,113,0.2)] transition hover:border-red-400 hover:bg-red-950/60 hover:shadow-[0_0_28px_rgba(248,113,113,0.3)]",
-                "disabled:pointer-events-none disabled:opacity-50"
-              )}
-              style={{
-                fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
-              }}
-            >
-              {manualPending === "SHORT" ? (
-                <>
-                  <Loader2 className="size-3.5 animate-spin text-red-400" />
-                  Enviando
-                </>
-              ) : (
-                "Sell / Short"
-              )}
-            </button>
+          <div className="flex flex-col items-start gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-md border border-zinc-700/70 bg-zinc-900/70 px-2 py-1 text-[9px] font-bold tracking-[0.18em] text-zinc-400 uppercase">
+                Terminal Institucional · Manual Override
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={manualPending !== null}
+                onClick={onManualLong}
+                className={cn(
+                  "inline-flex min-w-[10rem] items-center justify-center gap-2 rounded-lg border border-emerald-400/80 bg-emerald-500/15 px-4 py-2 text-[11px] font-black tracking-[0.15em] text-emerald-200 uppercase",
+                  "shadow-[0_0_24px_rgba(16,185,129,0.45)] transition hover:border-emerald-300 hover:bg-emerald-500/25 hover:shadow-[0_0_36px_rgba(16,185,129,0.6)]",
+                  "disabled:pointer-events-none disabled:opacity-50"
+                )}
+                style={{
+                  fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+                }}
+              >
+                {manualPending === "LONG" ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin text-emerald-300" />
+                    A executar...
+                  </>
+                ) : (
+                  <>
+                    <Zap className="size-3.5 text-emerald-300" />
+                    FORCE LONG
+                  </>
+                )}
+              </button>
+              <button
+                type="button"
+                disabled={manualPending !== null}
+                onClick={onManualShort}
+                className={cn(
+                  "inline-flex min-w-[10rem] items-center justify-center gap-2 rounded-lg border border-red-400/80 bg-red-500/15 px-4 py-2 text-[11px] font-black tracking-[0.15em] text-red-200 uppercase",
+                  "shadow-[0_0_24px_rgba(248,113,113,0.45)] transition hover:border-red-300 hover:bg-red-500/25 hover:shadow-[0_0_36px_rgba(248,113,113,0.6)]",
+                  "disabled:pointer-events-none disabled:opacity-50"
+                )}
+                style={{
+                  fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+                }}
+              >
+                {manualPending === "SHORT" ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin text-red-300" />
+                    A executar...
+                  </>
+                ) : (
+                  <>
+                    <Zap className="size-3.5 text-red-300" />
+                    FORCE SHORT
+                  </>
+                )}
+              </button>
+            </div>
+            {onManualCloseAll && (
+              <button
+                type="button"
+                disabled={manualPending !== null}
+                onClick={onManualCloseAll}
+                className={cn(
+                  "inline-flex min-w-[10rem] items-center justify-center gap-2 rounded-md border border-amber-500/70 bg-amber-500/10 px-3 py-1.5 text-[10px] font-bold tracking-[0.14em] text-amber-200 uppercase",
+                  "shadow-[0_0_16px_rgba(245,158,11,0.25)] transition hover:border-amber-400 hover:bg-amber-500/20",
+                  "disabled:pointer-events-none disabled:opacity-50"
+                )}
+                style={{
+                  fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
+                }}
+              >
+                {manualPending === "CLOSE_ALL" ? (
+                  <>
+                    <Loader2 className="size-3.5 animate-spin text-amber-300" />
+                    A executar...
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="size-3.5 text-amber-300" />
+                    PANIC CLOSE ALL
+                  </>
+                )}
+              </button>
+            )}
           </div>
         )}
 

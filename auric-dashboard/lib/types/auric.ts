@@ -24,8 +24,13 @@ export interface LogRow {
   par_moeda?: string;
   /** Legado ou flag booleana na base; o dashboard usa `par_moeda` para exibir o par. */
   ativo?: string | boolean;
-  preco_atual: number;
+  preco_atual?: number | null;
+  /** Se existir na base (entrada da posição); senão usar `preco_atual` para referência no UI. */
+  preco_entrada?: number | null;
   probabilidade_ml: number;
+  /** Indicadores persistidos em colunas (opcional); senão vêm de `contexto_raw`. */
+  rsi_14?: number | null;
+  adx_14?: number | null;
   sentimento_ia: string;
   /** Veredito Brain (BULLISH / BEARISH / …); espelha `sentimento_ia` quando gravado pelo bot. */
   veredito_ia?: string | null;
