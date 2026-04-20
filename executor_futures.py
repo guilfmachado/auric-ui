@@ -121,10 +121,15 @@ def configurar_alavancagem(
 def notional_usdt_futuros_position_sizing(
     exchange: ccxt.binance,
     alavancagem: float,
+    *,
+    risk_fraction: float | None = None,
 ) -> float:
-    """Notional alvo: saldo USDT (margem futuros) × PERCENTUAL_BANCA × alavancagem."""
+    """Notional alvo: saldo USDT (margem futuros) × risk_fraction × alavancagem."""
     saldo = obter_saldo_usdt_margem(exchange)
-    return float(saldo) * PERCENTUAL_BANCA * float(alavancagem)
+    rf = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
+    if rf <= 0:
+        rf = float(PERCENTUAL_BANCA)
+    return float(saldo) * rf * float(alavancagem)
 
 
 def _quantidade_base_a_partir_de_usd(
@@ -596,6 +601,7 @@ def abrir_long_market(
     *,
     alavancagem: float | None = None,
     notional_usdt_override: float | None = None,
+    risk_fraction: float | None = None,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
@@ -610,7 +616,9 @@ def abrir_long_market(
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)
     else:
-        quantidade_usd = notional_usdt_futuros_position_sizing(ex, lev)
+        quantidade_usd = notional_usdt_futuros_position_sizing(
+            ex, lev, risk_fraction=risk_fraction
+        )
     if quantidade_usd <= 0:
         raise ValueError(
             f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
@@ -660,6 +668,7 @@ def abrir_short_market(
     *,
     alavancagem: float | None = None,
     notional_usdt_override: float | None = None,
+    risk_fraction: float | None = None,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
 ) -> dict[str, Any]:
@@ -673,7 +682,9 @@ def abrir_short_market(
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)
     else:
-        quantidade_usd = notional_usdt_futuros_position_sizing(ex, lev)
+        quantidade_usd = notional_usdt_futuros_position_sizing(
+            ex, lev, risk_fraction=risk_fraction
+        )
     if quantidade_usd <= 0:
         raise ValueError(
             f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."

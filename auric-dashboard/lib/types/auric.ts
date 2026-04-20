@@ -47,5 +47,35 @@ export interface LogRow {
   pnl_pct?: number | null;
 }
 
+/** Tabela `trade_outcomes` (Outcome Engine / auditoria pós-fecho). */
+export interface TradeOutcomeRow {
+  order_id: string;
+  symbol: string;
+  side: "LONG" | "SHORT" | string;
+  ml_probability_at_entry?: number | null;
+  claude_justification?: string | null;
+  pnl_realized?: number | null;
+  closed_at: string;
+}
+
+/** View `analytics_outcomes` (cards globais de auditoria). */
+export interface AnalyticsOutcomesRow {
+  win_rate?: number | null;
+  win_rate_real?: number | null;
+  pnl_accumulated?: number | null;
+  pnl_acumulado?: number | null;
+  total_trades?: number | null;
+  trades_total?: number | null;
+}
+
+/** Tabela `bot_config` (overrides táticos em tempo real). */
+export interface BotConfigRow {
+  id: number;
+  leverage?: number | null;
+  risk_fraction?: number | null; // 0..1
+  trailing_callback_rate?: number | null; // percentual (ex.: 0.5)
+  updated_at?: string | null;
+}
+
 /** @deprecated Use `LogRow` — nome antigo quando a tabela era `trade_logs`. */
 export type TradeLogRow = LogRow;

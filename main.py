@@ -9,9 +9,14 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import argparse
+import asyncio
+from collections import deque
+import contextlib
 import json
 import os
+import re
 import time
+import threading
 import traceback
 from datetime import datetime, timezone
 import urllib.error
@@ -27,9 +32,20 @@ import indicators
 import intelligence_hub
 import logger
 import ml_model
+import websockets
 
 SYMBOL_TRADE = "ETH/USDT"
+WS_FUTURES_KLINE_1M = "wss://fstream.binance.com/ws/ethusdt@kline_1m"
 ALAVANCAGEM_PADRAO = 3
+RISK_FRACTION_PADRAO = 0.10
+TRAILING_CALLBACK_PADRAO = 0.5
+TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
+TRIGGER_COOLDOWN_S = 15.0
+CLAUDE_RATE_LIMIT_MAX_CALLS = 1
+CLAUDE_RATE_LIMIT_WINDOW_S = 300.0
+METRICS_FLUSH_EVERY_TRIGGERS = 50
+METRICS_FLUSH_EVERY_S = 3600.0
+OUTCOME_AUDIT_INTERVAL_S = 300.0
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
 FATOR_STOP_LOSS = 0.99  # preço <= entrada × 0.99
@@ -39,6 +55,8 @@ FATOR_STOP_LOSS_SHORT = 1.01  # preço >= entrada × 1.01
 
 # Zona ML que aciona Hub + Brain: P(alta) ≥ limiar long OU P(alta) ≤ limiar short.
 ML_PROB_SHORT_MAX = 0.40
+WAKE_FILTER_SHORT_MAX = 0.40
+WAKE_FILTER_LONG_MIN = 0.60
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
@@ -50,6 +68,63 @@ posicao_aberta: bool = False
 preco_compra: float = 0.0
 direcao_posicao: str = "LONG"  # "LONG" | "SHORT" — lado da posição aberta (vigia / TP-SL)
 _last_modo_detectado: str | None = None
+_claude_call_timestamps: deque[float] = deque()
+_risk_fraction_cfg: float = RISK_FRACTION_PADRAO
+_alavancagem_cfg: float = float(ALAVANCAGEM_PADRAO)
+_trailing_callback_cfg: float = TRAILING_CALLBACK_PADRAO
+_trailing_activation_mult_cfg: float = TRAILING_ACTIVATION_MULTIPLIER_PADRAO
+_metrics_lock = threading.Lock()
+_metrics_counters: dict[str, int] = {
+    "triggers_total": 0,
+    "triggers_ignored_lock": 0,
+    "ignored_cooldown": 0,
+    "claude_rate_limited": 0,
+}
+
+
+def _metric_inc(nome: str, delta: int = 1) -> None:
+    with _metrics_lock:
+        _metrics_counters[nome] = int(_metrics_counters.get(nome, 0)) + int(delta)
+
+
+def _metrics_snapshot() -> dict[str, int]:
+    with _metrics_lock:
+        return {k: int(v) for k, v in _metrics_counters.items()}
+
+
+def _parse_order_id_from_justificativa(texto: str | None) -> str | None:
+    if not texto:
+        return None
+    m = re.search(r"\b(?:ordem\s+)?id\s*=\s*([A-Za-z0-9_-]+)\b", texto, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return str(m.group(1)).strip() or None
+
+
+def _safe_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _permitir_consulta_claude() -> tuple[bool, int, float]:
+    """
+    Limite de chamadas do Claude/Replicate:
+    no máximo `CLAUDE_RATE_LIMIT_MAX_CALLS` em `CLAUDE_RATE_LIMIT_WINDOW_S`.
+    """
+    now = time.monotonic()
+    while _claude_call_timestamps and (now - _claude_call_timestamps[0]) > CLAUDE_RATE_LIMIT_WINDOW_S:
+        _claude_call_timestamps.popleft()
+
+    if len(_claude_call_timestamps) >= CLAUDE_RATE_LIMIT_MAX_CALLS:
+        espera = max(0.0, CLAUDE_RATE_LIMIT_WINDOW_S - (now - _claude_call_timestamps[0]))
+        return False, len(_claude_call_timestamps), espera
+
+    _claude_call_timestamps.append(now)
+    return True, len(_claude_call_timestamps), 0.0
 
 
 def obter_modo_operacao() -> str:
@@ -151,6 +226,55 @@ def obter_parametros_trailing_supabase() -> tuple[float, float]:
     return callback, activation_mult
 
 
+def _obter_configuracoes_dinamicas_sync() -> dict[str, float]:
+    """
+    Lê `bot_config` (id=1) para parâmetros operacionais dinâmicos.
+    Fallback seguro em falha:
+    - risk_fraction=0.10
+    - leverage=3.0
+    - trailing_callback_rate=0.5
+    - trailing_activation_multiplier=1.0
+    """
+    cfg = {
+        "risk_fraction": float(RISK_FRACTION_PADRAO),
+        "leverage": float(ALAVANCAGEM_PADRAO),
+        "trailing_callback_rate": float(TRAILING_CALLBACK_PADRAO),
+        "trailing_activation_multiplier": float(TRAILING_ACTIVATION_MULTIPLIER_PADRAO),
+    }
+    if logger.supabase is None:
+        return cfg
+    try:
+        res = (
+            logger.supabase.table("bot_config")
+            .select(
+                "risk_fraction, leverage, trailing_callback_rate, trailing_activation_multiplier"
+            )
+            .eq("id", 1)
+            .single()
+            .execute()
+        )
+        row = res.data if isinstance(res.data, dict) else {}
+        rf = row.get("risk_fraction")
+        lv = row.get("leverage")
+        cb = row.get("trailing_callback_rate")
+        am = row.get("trailing_activation_multiplier")
+        if rf is not None and float(rf) > 0:
+            cfg["risk_fraction"] = float(rf)
+        if lv is not None and float(lv) > 0:
+            cfg["leverage"] = float(lv)
+        if cb is not None and float(cb) > 0:
+            cfg["trailing_callback_rate"] = float(cb)
+        if am is not None and float(am) > 0:
+            cfg["trailing_activation_multiplier"] = float(am)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ _obter_configuracoes_dinamicas: {e} — usando fallback seguro.")
+    return cfg
+
+
+async def _obter_configuracoes_dinamicas() -> dict[str, float]:
+    return await asyncio.to_thread(_obter_configuracoes_dinamicas_sync)
+
+
 def atualizar_saldo_supabase() -> None:
     """
     Lê o saldo USDT na carteira **Futuros USDT-M** via CCXT, exatamente:
@@ -229,7 +353,7 @@ def verificar_comandos_manuais() -> None:
             continue
         try:
             if cmd == "LONG":
-                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
+                trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
                 print(
                     f"👑 [GOD MODE] Manual Override ativo (id={rid}, LONG): "
                     "ignorando filtros RSI/ADX/VWAP e enviando ordem."
@@ -237,7 +361,8 @@ def verificar_comandos_manuais() -> None:
                 executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
                     ex,
-                    alavancagem=float(ALAVANCAGEM_PADRAO),
+                    alavancagem=float(_alavancagem_cfg),
+                    risk_fraction=float(_risk_fraction_cfg),
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
                 )
@@ -265,11 +390,12 @@ def verificar_comandos_manuais() -> None:
                     f"👑 [GOD MODE] Manual Override ativo (id={rid}, SHORT): "
                     "ignorando filtros RSI/ADX/VWAP e enviando ordem."
                 )
-                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
+                trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
                 executor_futures.abrir_short_market(
                     SYMBOL_TRADE,
                     ex,
-                    alavancagem=float(ALAVANCAGEM_PADRAO),
+                    alavancagem=float(_alavancagem_cfg),
+                    risk_fraction=float(_risk_fraction_cfg),
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
                 )
@@ -304,6 +430,145 @@ def verificar_comandos_manuais() -> None:
                 )
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ [MANUAL] Falha ao executar id={rid} cmd={cmd!r}: {e}")
+
+
+def _fetch_pending_manual_command_sync() -> dict[str, Any] | None:
+    """
+    Busca 1 comando manual pendente (mais antigo primeiro).
+    Preferência por `status='PENDING'`; fallback para esquema legado `executed=false`.
+    """
+    if logger.supabase is None:
+        return None
+    try:
+        res = (
+            logger.supabase.table("manual_commands")
+            .select("id, command, status")
+            .eq("status", "PENDING")
+            .order("id", desc=False)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            return rows[0]
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [MANUAL LISTENER] select status=PENDING falhou: {e}")
+
+    # Fallback legado
+    try:
+        res = (
+            logger.supabase.table("manual_commands")
+            .select("id, command")
+            .eq("executed", False)
+            .order("id", desc=False)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [MANUAL LISTENER] fallback executed=false falhou: {e}")
+        return None
+
+
+def _mark_manual_command_status_sync(row_id: int, status: str) -> None:
+    if logger.supabase is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {"status": status, "updated_at": now}
+    # Compat schema antigo/novo: manter também `executed`.
+    if status == "EXECUTED":
+        payload["executed"] = True
+    try:
+        logger.supabase.table("manual_commands").update(payload).eq("id", row_id).execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [MANUAL LISTENER] update status={status} id={row_id} falhou: {e}")
+
+
+def _executar_comando_manual_imediato_sync(cmd: str) -> None:
+    """
+    Executor GOD MODE: sem filtros de veto (RSI/ADX/VWAP).
+    """
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+
+    ex = executor_futures.criar_exchange_binance()
+    c = str(cmd or "").upper().strip()
+    if c == "LONG":
+        executor_futures.abrir_long_market(
+            SYMBOL_TRADE,
+            ex,
+            alavancagem=float(_alavancagem_cfg),
+            risk_fraction=float(_risk_fraction_cfg),
+            trailing_callback_rate=float(_trailing_callback_cfg),
+            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+        )
+        return
+    if c == "SHORT":
+        executor_futures.abrir_short_market(
+            SYMBOL_TRADE,
+            ex,
+            alavancagem=float(_alavancagem_cfg),
+            risk_fraction=float(_risk_fraction_cfg),
+            trailing_callback_rate=float(_trailing_callback_cfg),
+            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+        )
+        return
+    if c in ("CLOSE", "CLOSE_ALL"):
+        executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+        return
+    raise ValueError(f"Comando manual inválido: {c!r}")
+
+
+async def _escutar_comandos_manuais() -> None:
+    """
+    Listener assíncrono de comandos manuais:
+    - polling a cada 1s
+    - interceta 1 comando pendente
+    - marca EXECUTED imediatamente (evita duplo processamento)
+    - executa instantaneamente com config dinâmica atual
+    """
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+
+    while True:
+        await asyncio.sleep(1)
+        row = await asyncio.to_thread(_fetch_pending_manual_command_sync)
+        if not row:
+            continue
+
+        rid_raw = row.get("id")
+        cmd = str(row.get("command") or "").upper().strip()
+        try:
+            rid = int(rid_raw)
+        except Exception:
+            print(f"⚠️ [MANUAL LISTENER] id inválido: {rid_raw!r}")
+            continue
+
+        print(
+            f"👑 [GOD MODE] Comando MANUAL {cmd} intercetado e a ser executado INSTANTANEAMENTE! (id={rid})"
+        )
+
+        cfg_dyn = await _obter_configuracoes_dinamicas()
+        _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
+        _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
+        _trailing_callback_cfg = float(
+            cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
+        )
+        _trailing_activation_mult_cfg = float(
+            cfg_dyn.get(
+                "trailing_activation_multiplier",
+                TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+            )
+        )
+
+        # Marcar imediatamente como EXECUTED para evitar leitura duplicada.
+        await asyncio.to_thread(_mark_manual_command_status_sync, rid, "EXECUTED")
+
+        try:
+            await asyncio.to_thread(_executar_comando_manual_imediato_sync, cmd)
+            print(f"✅ [MANUAL LISTENER] Comando {cmd} (id={rid}) executado com sucesso.")
+        except Exception as e:  # noqa: BLE001
+            print(f"❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
+            await asyncio.to_thread(_mark_manual_command_status_sync, rid, "FAILED")
 
 
 def _simbolo_binance_rest(simbolo: str) -> str:
@@ -585,13 +850,13 @@ def _gerenciar_saida_modo_vigia(
 def rodar_ciclo(modo: str) -> None:
     """Um ciclo: Vigia (saída) OU Buscando Oportunidade (entrada ML + sentimento)."""
     global posicao_aberta, preco_compra, direcao_posicao, _last_modo_detectado
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
 
     if not logger.obter_bot_ativo():
         print("Bot em modo Standby via Dashboard")
         return
 
     atualizar_saldo_supabase()
-    verificar_comandos_manuais()
 
     ex_mod = executor_futures if modo == "FUTURES" else executor_spot
     modo_label = "FUTURES USDT-M" if modo == "FUTURES" else "SPOT"
@@ -600,7 +865,7 @@ def rodar_ciclo(modo: str) -> None:
         try:
             ex_cfg = executor_futures.criar_exchange_binance()
             executor_futures.configurar_alavancagem(
-                SYMBOL_TRADE, ALAVANCAGEM_PADRAO, ex_cfg
+                SYMBOL_TRADE, int(round(_alavancagem_cfg)), ex_cfg
             )
         except Exception as e_cfg:  # noqa: BLE001
             print(f"[Maestro] Aviso ao configurar alavancagem/margem: {e_cfg}")
@@ -697,8 +962,9 @@ def rodar_ciclo(modo: str) -> None:
         f"| viés VWAP: {vies} | squeeze BB: {snap.get('bollinger_squeeze')}"
     )
 
-    limiar_short = ML_PROB_SHORT_MAX
-    if probabilidade > limiar_short and probabilidade < limiar:
+    limiar_short = WAKE_FILTER_SHORT_MAX
+    limiar_long = WAKE_FILTER_LONG_MIN
+    if limiar_short <= probabilidade <= limiar_long:
         reg_vol = snap
         regime = str(reg_vol.get("regime") or "BAIXA").upper()
         squeeze = bool(reg_vol.get("bollinger_squeeze"))
@@ -781,7 +1047,7 @@ def rodar_ciclo(modo: str) -> None:
             f"---\n"
             f"CONTEXTO: {contexto_dashboard}\n"
             f"{metricas_txt} | P(alta)={probabilidade:.4f} ∈ "
-            f"({limiar_short},{limiar}); Hub/Brain inativos."
+            f"[{limiar_short:.2f},{limiar_long:.2f}] — Claude poupado (filtro de despertar ativo)."
         )
 
         print("\n    [Painel de mercado — zona neutra / heatmap]")
@@ -794,20 +1060,35 @@ def rodar_ciclo(modo: str) -> None:
             par_moeda=SYMBOL_TRADE,
             preco=preco,
             prob_ml=probabilidade,
-            sentimento="—",
+            sentimento="NEUTRAL",
             acao="MONITORANDO",
-            justificativa=just_dashboard,
+            justificativa=(
+                "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
+            ),
             contexto_raw=indicators.formatar_log_contexto_raw(
-                "(Intelligence Hub não consultado — ML na zona neutra.)",
+                "(Intelligence Hub/Claude não consultados — filtro de despertar ML na zona neutra.)",
                 {**snap, "prob_ml": probabilidade},
             ),
+            justificativa_ia=(
+                "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
+            ),
+        )
+        print(
+            "💤 [WAKE FILTER] XGBoost em zona neutra [0.40, 0.60] — Claude NÃO chamado. "
+            'Mock: {"sentimento":"NEUTRAL","posicao_recomendada":"VETO","justificativa_curta":"Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."}'
         )
         return
 
-    if probabilidade >= limiar:
+    if probabilidade > limiar_long:
         direcao_sugerida = "LONG"
-    else:
+    elif probabilidade < limiar_short:
         direcao_sugerida = "SHORT"
+    else:
+        print(
+            "⚠️ [WAKE FILTER] Probabilidade neutra detetada em ramo de segurança; "
+            "sem consulta ao Claude."
+        )
+        return
 
     print(f"    → direcao_sugerida={direcao_sugerida} (ML vs limiares long/short)")
 
@@ -840,16 +1121,40 @@ def rodar_ciclo(modo: str) -> None:
     contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
 
-    # 3. Ativa o Cérebro (Claude 3.5 Sonnet)
-    print("🧠 [BRAIN] Consultando Claude 3.5 Sonnet (Final Boss Mode)...")
-    veredito = brain.analisar_sentimento_mercado(
-        contexto,
-        prob_ml=probabilidade,
-        limiar_ml=limiar,
-        direcao_sugerida=direcao_sugerida,
-        verbose=False,
-        bloco_tecnico_prioritario=bloco_ta,
-    )
+    # 3. Ativa o Cérebro (Claude) com rate limiter para proteger a API.
+    pode_chamar_claude, n_chamadas, espera_s = _permitir_consulta_claude()
+    if pode_chamar_claude:
+        print(
+            "🧠 [BRAIN] Consultando Claude 3.5 Sonnet (Final Boss Mode)... "
+            f"(janela 60s: {n_chamadas}/{CLAUDE_RATE_LIMIT_MAX_CALLS})"
+        )
+        veredito = brain.analisar_sentimento_mercado(
+            contexto,
+            prob_ml=probabilidade,
+            limiar_ml=limiar,
+            direcao_sugerida=direcao_sugerida,
+            verbose=False,
+            bloco_tecnico_prioritario=bloco_ta,
+        )
+    else:
+        _metric_inc("claude_rate_limited", 1)
+        print(
+            "⚠️ [RATE LIMIT] Claude bloqueado: "
+            f"{n_chamadas}/{CLAUDE_RATE_LIMIT_MAX_CALLS} chamadas em "
+            f"{CLAUDE_RATE_LIMIT_WINDOW_S:.0f}s. "
+            f"Aguardando ~{espera_s:.1f}s. "
+            "Ciclo segue em modo CAUTIOUS (sem nova chamada LLM)."
+        )
+        veredito = {
+            "sentimento": "CAUTIOUS",
+            "confianca": 0,
+            "justificativa_curta": (
+                "Rate limiter Claude ativo (2 chamadas/60s); "
+                "execução adiada para proteger a API do Replicate."
+            ),
+            "alerta_macro": "rate_limit_claude",
+            "posicao_recomendada": "VETO",
+        }
 
     sent = str(veredito.get("sentimento", "")).upper().strip()
     try:
@@ -1105,11 +1410,13 @@ def rodar_ciclo(modo: str) -> None:
     if sent == "BULLISH":
         if modo == "FUTURES":
             notional_alvo = executor_futures.notional_usdt_futuros_position_sizing(
-                ex, float(ALAVANCAGEM_PADRAO)
+                ex,
+                float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
             )
             entrada_txt = (
                 f"COMPRA (Long) LIMIT (+0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
-                f"(15% banca × {ALAVANCAGEM_PADRAO}x, {modo_label}, mainnet)."
+                f"(risk {_risk_fraction_cfg*100:.1f}% × {_alavancagem_cfg:.2f}x, {modo_label}, mainnet)."
             )
         else:
             notional_alvo = executor_spot.obter_saldo_usdt(ex) * executor_spot.PERCENTUAL_BANCA
@@ -1128,11 +1435,12 @@ def rodar_ciclo(modo: str) -> None:
         try:
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             if modo == "FUTURES":
-                trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
+                trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
                 ordem = executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
                     ex,
-                    alavancagem=float(ALAVANCAGEM_PADRAO),
+                    alavancagem=float(_alavancagem_cfg),
+                    risk_fraction=float(_risk_fraction_cfg),
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
                 )
@@ -1201,11 +1509,13 @@ def rodar_ciclo(modo: str) -> None:
 
     elif sent == "BEARISH":
         notional_alvo = executor_futures.notional_usdt_futuros_position_sizing(
-            ex, float(ALAVANCAGEM_PADRAO)
+            ex,
+            float(_alavancagem_cfg),
+            risk_fraction=float(_risk_fraction_cfg),
         )
         entrada_txt = (
             f"VENDA (Short) LIMIT (−0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
-            f"(15% banca × {ALAVANCAGEM_PADRAO}x, {modo_label})."
+            f"(risk {_risk_fraction_cfg*100:.1f}% × {_alavancagem_cfg:.2f}x, {modo_label})."
         )
         print(
             f"    [Buscando Oportunidade] BEARISH + ML/Brain alinhados + "
@@ -1244,11 +1554,12 @@ def rodar_ciclo(modo: str) -> None:
             print(f"    ⚠️ Verificação volume spike (antes do SHORT): {e_sp}")
         try:
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
-            trailing_cb, trailing_mult = obter_parametros_trailing_supabase()
+            trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
             ordem = executor_futures.abrir_short_market(
                 SYMBOL_TRADE,
                 ex,
-                alavancagem=float(ALAVANCAGEM_PADRAO),
+                alavancagem=float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
                 trailing_callback_rate=trailing_cb,
                 trailing_activation_multiplier=trailing_mult,
             )
@@ -1303,7 +1614,360 @@ def rodar_ciclo(modo: str) -> None:
             )
 
 
-def main() -> None:
+async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
+    """Executa o ciclo completo em thread para não bloquear o event loop."""
+    try:
+        await asyncio.to_thread(rodar_ciclo, modo)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[ERRO CICLO — gatilho {origem}] {e}")
+        traceback.print_exc()
+        try:
+            preco = await asyncio.to_thread(obter_preco_referencia, SYMBOL_TRADE, modo)
+            await asyncio.to_thread(
+                logger.registrar_log_trade,
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=-1.0,
+                sentimento="—",
+                acao="ERRO_CICLO",
+                justificativa=f"Exceção no ciclo ({origem}): {e!s}",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _flush_metrics_supabase(uptime_s: float) -> None:
+    """
+    Upsert de métricas operacionais no Supabase.
+    Preferência: tabela `system_metrics` (id=1), fallback para `bot_control` (id=1).
+    """
+    if logger.supabase is None:
+        return
+
+    snap = _metrics_snapshot()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": 1,
+        "triggers_total": snap["triggers_total"],
+        "triggers_ignored_lock": snap["triggers_ignored_lock"],
+        "ignored_cooldown": snap["ignored_cooldown"],
+        "claude_rate_limited": snap["claude_rate_limited"],
+        "uptime_seconds": int(uptime_s),
+        "updated_at": now_iso,
+    }
+
+    def _write_sync() -> None:
+        # 1) Tabela dedicada (recomendado)
+        try:
+            logger.supabase.table("system_metrics").upsert(payload).execute()
+            return
+        except Exception as e_sys:  # noqa: BLE001
+            print(f"⚠️ [METRICS] upsert system_metrics falhou: {e_sys}")
+
+        # 2) Fallback bot_control (se a equipa preferir armazenar ali)
+        try:
+            logger.supabase.table("bot_control").update(payload).eq("id", 1).execute()
+            return
+        except Exception as e_bot:  # noqa: BLE001
+            print(f"⚠️ [METRICS] update bot_control falhou: {e_bot}")
+
+    await asyncio.to_thread(_write_sync)
+    print(
+        "[METRICS] Flush Supabase concluído: "
+        f"triggers={snap['triggers_total']}, "
+        f"lock={snap['triggers_ignored_lock']}, "
+        f"cooldown={snap['ignored_cooldown']}, "
+        f"claude_rl={snap['claude_rate_limited']}, "
+        f"uptime={int(uptime_s)}s"
+    )
+
+
+async def _metrics_reporter_task(start_monotonic: float) -> None:
+    """
+    Reporter em background (não bloqueante):
+    - flush a cada 50 triggers totais
+    - OU a cada 1h de uptime
+    """
+    last_flush_time = time.monotonic()
+    last_flush_triggers = 0
+    while True:
+        await asyncio.sleep(5)
+        snap = _metrics_snapshot()
+        now = time.monotonic()
+        uptime_s = now - start_monotonic
+        triggers_delta = snap["triggers_total"] - last_flush_triggers
+        due_triggers = triggers_delta >= METRICS_FLUSH_EVERY_TRIGGERS
+        due_time = (now - last_flush_time) >= METRICS_FLUSH_EVERY_S
+        if not (due_triggers or due_time):
+            continue
+        try:
+            await _flush_metrics_supabase(uptime_s)
+            last_flush_time = now
+            last_flush_triggers = snap["triggers_total"]
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ [METRICS] Falha no flush periódico: {e}")
+
+
+def _buscar_logs_recentes_para_outcome(limit: int = 400) -> list[dict[str, Any]]:
+    if logger.supabase is None:
+        return []
+    try:
+        res = (
+            logger.supabase.table("logs")
+            .select(
+                "id, created_at, par_moeda, probabilidade_ml, justificativa_ia, justificativa, acao_tomada"
+            )
+            .order("id", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        data = res.data or []
+        return data if isinstance(data, list) else []
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [AUDITORIA] Falha ao ler logs recentes: {e}")
+        return []
+
+
+def _deduzir_pnl_realizado_ordem(order: dict[str, Any]) -> float | None:
+    info = order.get("info") if isinstance(order, dict) else None
+    if isinstance(info, dict):
+        for key in ("realizedPnl", "realizedProfit", "profit", "pnl"):
+            v = _safe_float(info.get(key))
+            if v is not None:
+                return v
+    for key in ("pnl", "realizedPnl"):
+        v = _safe_float(order.get(key))
+        if v is not None:
+            return v
+    return None
+
+
+def _match_log_para_ordem(
+    order: dict[str, Any], logs: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    oid = str(order.get("id") or "").strip()
+    side = str(order.get("side") or "").lower().strip()
+    side_alvo = "SHORT" if side == "sell" else "LONG"
+
+    # 1) Match por order_id dentro da justificativa
+    if oid:
+        for row in logs:
+            jid = _parse_order_id_from_justificativa(str(row.get("justificativa") or ""))
+            if jid and jid == oid:
+                return row
+
+    # 2) Fallback por lado em ações de abertura (mais recente primeiro)
+    for row in logs:
+        ac = str(row.get("acao_tomada") or "").upper().strip()
+        if side_alvo == "LONG" and ac in (
+            "COMPRA_LONG",
+            "COMPRA_LONG_LIMIT",
+            "LONG_ADX_BYPASS",
+            "COMPRA_MARKET",
+            "COMPRA_LONG_MARKET",
+        ):
+            return row
+        if side_alvo == "SHORT" and ac in (
+            "ABRE_SHORT",
+            "ABRE_SHORT_LIMIT",
+            "SHORT_ADX_BYPASS",
+            "ABRE_SHORT_MARKET",
+        ):
+            return row
+    return None
+
+
+def _upsert_outcomes_sync(rows: list[dict[str, Any]]) -> None:
+    if logger.supabase is None or not rows:
+        return
+    logger.supabase.table("trade_outcomes").upsert(rows, on_conflict="order_id").execute()
+
+
+async def _auditoria_outcome_engine_task() -> None:
+    """
+    Reconciliação assíncrona:
+    - a cada 5 minutos busca ordens fechadas (futures)
+    - cruza com logs (ML + justificativa IA na entrada)
+    - upsert em trade_outcomes
+    """
+    last_audit_ms = int((time.time() - 24 * 3600) * 1000)  # bootstrap: últimas 24h
+    while True:
+        await asyncio.sleep(OUTCOME_AUDIT_INTERVAL_S)
+        try:
+            if logger.supabase is None:
+                continue
+            ex = await asyncio.to_thread(executor_futures.criar_exchange_binance)
+            sym = await asyncio.to_thread(executor_futures._resolver_simbolo_perp, ex, SYMBOL_TRADE)
+            closed = await asyncio.to_thread(ex.fetch_closed_orders, sym, last_audit_ms, 200)
+            now_ms = int(time.time() * 1000)
+            last_audit_ms = now_ms
+            if not closed:
+                continue
+
+            logs = await asyncio.to_thread(_buscar_logs_recentes_para_outcome, 500)
+            upserts: list[dict[str, Any]] = []
+            for order in closed:
+                oid = str(order.get("id") or "").strip()
+                if not oid:
+                    continue
+                symbol = str(order.get("symbol") or SYMBOL_TRADE)
+                side_raw = str(order.get("side") or "").lower().strip()
+                side = "SHORT" if side_raw == "sell" else "LONG"
+                pnl = _deduzir_pnl_realizado_ordem(order)
+                ts = order.get("timestamp") or order.get("lastTradeTimestamp") or now_ms
+                try:
+                    closed_at = datetime.fromtimestamp(float(ts) / 1000.0, tz=timezone.utc).isoformat()
+                except Exception:
+                    closed_at = datetime.now(timezone.utc).isoformat()
+
+                row_log = _match_log_para_ordem(order, logs)
+                ml_prob = _safe_float(row_log.get("probabilidade_ml")) if row_log else None
+                just_ia = ""
+                if row_log:
+                    just_ia = str(
+                        row_log.get("justificativa_ia")
+                        or row_log.get("justificativa")
+                        or ""
+                    )[:2000]
+
+                upserts.append(
+                    {
+                        "order_id": oid,
+                        "symbol": symbol,
+                        "side": side,
+                        "ml_probability_at_entry": ml_prob,
+                        "claude_justification": just_ia,
+                        "pnl_realized": pnl,
+                        "closed_at": closed_at,
+                    }
+                )
+                pnl_txt = f"{pnl:+.2f}" if pnl is not None else "N/A"
+                print(
+                    "[AUDITORIA] Ordem "
+                    f"{side} fechada. PnL Realizado: {pnl_txt} USDT. "
+                    "Resultado guardado no Outcome Engine."
+                )
+
+            if upserts:
+                await asyncio.to_thread(_upsert_outcomes_sync, upserts)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ [AUDITORIA] Falha no loop de reconciliação: {e}")
+
+
+async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
+    """
+    Engine orientado por eventos:
+    - escuta WebSocket 1m Futures (ETHUSDT)
+    - dispara ciclo em fechamento da vela OU pico de volume intra-vela
+    - mantém o socket vivo sem bloquear durante ML/Hub/Brain (to_thread)
+    """
+    del args  # mantido por compat CLI; loop é orientado por eventos WS.
+    ultima_vela_fechada_ts: int | None = None
+    volume_ultima_vela_fechada: float | None = None
+    execucao_lock = asyncio.Lock()
+    last_trigger_time = 0.0
+
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+
+    while True:
+        try:
+            print(f"🛰️ [WS] Ligando stream: {WS_FUTURES_KLINE_1M}")
+            async with websockets.connect(WS_FUTURES_KLINE_1M, ping_interval=20, ping_timeout=20) as ws:
+                print("✅ [WS] Conectado. Aguardando ticks 1m (ETHUSDT)...")
+
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    k = msg.get("k") if isinstance(msg, dict) else None
+                    if not isinstance(k, dict):
+                        continue
+
+                    preco = float(k.get("c") or 0.0)
+                    vol_atual = float(k.get("v") or 0.0)
+                    is_kline_closed = bool(k.get("x"))
+                    open_time = int(k.get("t") or 0)
+
+                    print(
+                        f"[WS] Tick: Preço {preco:.2f} | Aguardando fecho de vela ou pico de volume..."
+                    )
+
+                    trigger = None
+                    if is_kline_closed and open_time != ultima_vela_fechada_ts:
+                        trigger = "CLOSE_1M"
+                        ultima_vela_fechada_ts = open_time
+                        volume_ultima_vela_fechada = vol_atual
+                    elif volume_ultima_vela_fechada and volume_ultima_vela_fechada > 0:
+                        fator = 1.0 + float(indicators.VOLUME_SPIKE_FRACAO_1M)
+                        if vol_atual >= fator * volume_ultima_vela_fechada:
+                            trigger = "VOLUME_SPIKE_INTRA_1M"
+
+                    if not trigger:
+                        continue
+
+                    _metric_inc("triggers_total", 1)
+                    now = time.monotonic()
+                    if now - last_trigger_time < TRIGGER_COOLDOWN_S:
+                        _metric_inc("ignored_cooldown", 1)
+                        restante = TRIGGER_COOLDOWN_S - (now - last_trigger_time)
+                        print(
+                            f"[WS] {trigger} detetado, mas bloqueado por cooldown de "
+                            f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
+                        )
+                        continue
+
+                    if execucao_lock.locked():
+                        _metric_inc("triggers_ignored_lock", 1)
+                        print(
+                            f"⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
+                            "(ciclo em andamento)."
+                        )
+                        continue
+
+                    cfg_dyn = await _obter_configuracoes_dinamicas()
+                    _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
+                    _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
+                    _trailing_callback_cfg = float(
+                        cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
+                    )
+                    _trailing_activation_mult_cfg = float(
+                        cfg_dyn.get(
+                            "trailing_activation_multiplier",
+                            TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+                        )
+                    )
+                    print(
+                        "[WS] Config dinâmica carregada: "
+                        f"risk={_risk_fraction_cfg*100:.1f}% | "
+                        f"lev={_alavancagem_cfg:.2f}x | "
+                        f"trail_cb={_trailing_callback_cfg:.3f}% | "
+                        f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
+                    )
+
+                    permitido = await asyncio.to_thread(verificar_permissao_operacao)
+                    if not permitido:
+                        print("💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
+                        continue
+
+                    modo = await asyncio.to_thread(obter_modo_operacao)
+                    print(
+                        f"🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
+                    )
+                    async with execucao_lock:
+                        last_trigger_time = time.monotonic()
+                        try:
+                            await _executar_ciclo_assincrono(modo, trigger)
+                        finally:
+                            estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
+                            print(f"✅ [WS] Ciclo concluído. Estado atual: {estado}")
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ [WS] Conexão caiu/erro no loop ({e}). Reconectando em 3s...")
+            await asyncio.sleep(3)
+
+
+async def main() -> None:
     load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description="Maestro: ML + Intelligence Hub + Brain (Claude) + Executor + Logger.",
@@ -1328,54 +1992,36 @@ def main() -> None:
     )
 
     if args.once:
-        if not verificar_permissao_operacao():
+        if not await asyncio.to_thread(verificar_permissao_operacao):
             print("💤 [STANDBY] Bot desativado via Dashboard. Ciclo único não executado.")
             return
         print("🚀 [AURIC] Bot Ativo. Iniciando ciclo de análise...")
-        modo = obter_modo_operacao()
+        modo = await asyncio.to_thread(obter_modo_operacao)
         print(f"🔄 Modo de Operação detectado: {modo}")
-        try:
-            rodar_ciclo(modo)
-        except Exception as e:  # noqa: BLE001
-            print(f"\n[ERRO CICLO] {e}")
-            traceback.print_exc()
+        await _executar_ciclo_assincrono(modo, "ONCE")
         return
 
-    while True:
-        if not verificar_permissao_operacao():
-            print("💤 [STANDBY] Bot desativado via Dashboard. Aguardando 60s...")
-            time.sleep(60)
-            continue
-
-        print("🚀 [AURIC] Bot Ativo. Iniciando ciclo de análise...")
-        modo = obter_modo_operacao()
-        print(f"🔄 Modo de Operação detectado: {modo}")
-
-        try:
-            rodar_ciclo(modo)
-        except Exception as e:  # noqa: BLE001
-            print(f"\n[ERRO CICLO — bot continua] {e}")
-            traceback.print_exc()
-            try:
-                preco = obter_preco_referencia(SYMBOL_TRADE, modo)
-                logger.registrar_log_trade(
-                    par_moeda=SYMBOL_TRADE,
-                    preco=preco,
-                    prob_ml=-1.0,
-                    sentimento="—",
-                    acao="ERRO_CICLO",
-                    justificativa=f"Exceção no ciclo: {e!s}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
-
-        modo_txt = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
-        print(
-            f"\n[Aguardar] Próximo ciclo em {args.intervalo}s "
-            f"({args.intervalo / 60:.1f} min) | estado esperado: {modo_txt}\n"
-        )
-        time.sleep(args.intervalo)
+    print(
+        "\n[Maestro] Engine assíncrono ativado: loop bloqueante removido, "
+        "gatilhos por WebSocket (fecho de vela 1m / pico de volume intra-vela).\n"
+    )
+    start_monotonic = time.monotonic()
+    manual_listener_task = asyncio.create_task(_escutar_comandos_manuais())
+    metrics_task = asyncio.create_task(_metrics_reporter_task(start_monotonic))
+    outcome_task = asyncio.create_task(_auditoria_outcome_engine_task())
+    try:
+        await _loop_websocket_tempo_real(args)
+    finally:
+        manual_listener_task.cancel()
+        outcome_task.cancel()
+        metrics_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await manual_listener_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await outcome_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await metrics_task
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

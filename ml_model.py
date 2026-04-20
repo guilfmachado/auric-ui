@@ -207,6 +207,64 @@ def _regime_volatilidade_de_feat(feat: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _extrair_macd_snapshot(feat: pd.DataFrame) -> dict[str, Any]:
+    """
+    Extrai MACD(12,26,9) da última vela fechada:
+    - macd_line
+    - signal_line
+    - macd_hist
+    - macd_estado (texto para leitura humana)
+    """
+    out = {
+        "macd_line": None,
+        "signal_line": None,
+        "macd_hist": None,
+        "macd_estado": "Indefinido",
+    }
+    if feat.empty:
+        return out
+
+    macd_col = "MACD_12_26_9"
+    signal_col = "MACDs_12_26_9"
+    hist_col = "MACDh_12_26_9"
+    if macd_col not in feat.columns or signal_col not in feat.columns or hist_col not in feat.columns:
+        return out
+
+    def _to_f(x: Any) -> float | None:
+        try:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return None
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    last = feat.iloc[-1]
+    prev = feat.iloc[-2] if len(feat) >= 2 else None
+    macd_line = _to_f(last.get(macd_col))
+    signal_line = _to_f(last.get(signal_col))
+    hist = _to_f(last.get(hist_col))
+    prev_hist = _to_f(prev.get(hist_col)) if prev is not None else None
+
+    estado = "Indefinido"
+    if macd_line is not None and signal_line is not None and hist is not None:
+        if macd_line > signal_line and hist > 0:
+            estado = "Cruzamento de Alta (Bullish Momentum)"
+        elif macd_line < signal_line and hist < 0:
+            estado = "Cruzamento de Baixa (Bearish Momentum)"
+        if prev_hist is not None and abs(hist) < abs(prev_hist):
+            estado = "Perda de Momentum"
+
+    out.update(
+        {
+            "macd_line": macd_line,
+            "signal_line": signal_line,
+            "macd_hist": hist,
+            "macd_estado": estado,
+        }
+    )
+    return out
+
+
 def obter_regime_volatilidade(
     symbol: str = SYMBOL,
     timeframe: str = TIMEFRAME,
@@ -265,9 +323,12 @@ def obter_snapshot_indicadores_eth(
     bias = vies_vwap(close, vwap)
     adx_regime = regime_adx_semantico(adx)
 
+    macd = _extrair_macd_snapshot(feat)
+
     out: dict[str, Any] = {
         **reg,
         **bb_extra,
+        **macd,
         "adx_14": adx,
         "adx_regime": adx_regime,
         "rsi_14": rsi,

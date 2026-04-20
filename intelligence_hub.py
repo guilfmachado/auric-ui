@@ -15,6 +15,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+MAX_CONTEXTO_AGREGADO_CHARS = 1500
+TRUNCATION_SUFFIX = "... [TRUNCADO PARA POUPAR TOKENS]"
+
 import feedparser
 from dotenv import load_dotenv
 
@@ -400,7 +403,14 @@ class IntelligenceHub:
 
 {twitter_txt}
 """
-        return texto.strip()
+        texto_final = texto.strip()
+        if len(texto_final) <= MAX_CONTEXTO_AGREGADO_CHARS:
+            return texto_final
+
+        # Truncation rígida apenas no texto livre do hub (notícias/social),
+        # preservando o bloco técnico/ML que é enviado separadamente ao Claude.
+        limite_base = max(0, MAX_CONTEXTO_AGREGADO_CHARS - len(TRUNCATION_SUFFIX))
+        return texto_final[:limite_base].rstrip() + TRUNCATION_SUFFIX
 
 
 def obter_hub_padrao() -> IntelligenceHub:

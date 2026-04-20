@@ -1,10 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { coerceUsdtBalance } from "@/lib/auric/coerce-metrics";
 import { createClient } from "@/lib/supabase/client";
-import type { ConfigRow, LogRow, TradingMode } from "@/lib/types/auric";
+import type {
+  AnalyticsOutcomesRow,
+  BotConfigRow,
+  ConfigRow,
+  LogRow,
+  TradeOutcomeRow,
+  TradingMode,
+} from "@/lib/types/auric";
 
 const CONFIG_ID = 1;
 
@@ -50,6 +57,24 @@ export function useAuricDashboard() {
   const [ready, setReady] = useState(false);
   const [config, setConfig] = useState<ConfigRow>(defaultConfig());
   const [logs, setLogs] = useState<LogRow[]>([]);
+  const [tradeOutcomes, setTradeOutcomes] = useState<TradeOutcomeRow[]>([]);
+  const [tradeOutcomesLoading, setTradeOutcomesLoading] = useState(false);
+  const [analyticsOutcomes, setAnalyticsOutcomes] =
+    useState<AnalyticsOutcomesRow | null>(null);
+  const [analyticsOutcomesLoading, setAnalyticsOutcomesLoading] = useState(false);
+  const [botConfig, setBotConfig] = useState<BotConfigRow>({
+    id: 1,
+    leverage: 3,
+    risk_fraction: 0.1,
+    trailing_callback_rate: 0.5,
+  });
+  const [botConfigLoading, setBotConfigLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [showSynced, setShowSynced] = useState(false);
+  const botConfigDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const botConfigSyncedPulseRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const botConfigRef = useRef<BotConfigRow>(botConfig);
   const [pingMs, setPingMs] = useState<number | null>(null);
   const [trades24hComputed, setTrades24hComputed] = useState<number | null>(
     null
@@ -234,6 +259,118 @@ export function useAuricDashboard() {
       setTrades24hComputed(null);
     }
   }, [supabase]);
+
+  const refreshTradeOutcomes = useCallback(async () => {
+    if (!supabase) return;
+    setTradeOutcomesLoading(true);
+    const { data, error: e } = await supabase
+      .from("trade_outcomes")
+      .select("*")
+      .order("closed_at", { ascending: false })
+      .limit(50);
+    setTradeOutcomesLoading(false);
+    if (e) {
+      console.warn("[auric] refreshTradeOutcomes:", e.message);
+      return;
+    }
+    setTradeOutcomes((data ?? []) as TradeOutcomeRow[]);
+  }, [supabase]);
+
+  const refreshAnalyticsOutcomes = useCallback(async () => {
+    if (!supabase) return;
+    setAnalyticsOutcomesLoading(true);
+    const { data, error: e } = await supabase
+      .from("analytics_outcomes")
+      .select("*")
+      .single();
+    setAnalyticsOutcomesLoading(false);
+    if (e) {
+      console.warn("[auric] refreshAnalyticsOutcomes:", e.message);
+      return;
+    }
+    setAnalyticsOutcomes((data ?? null) as AnalyticsOutcomesRow | null);
+  }, [supabase]);
+
+  const refreshBotConfig = useCallback(async () => {
+    if (!supabase) return;
+    setBotConfigLoading(true);
+    const { data, error: e } = await supabase
+      .from("bot_config")
+      .select("id, leverage, risk_fraction, trailing_callback_rate, updated_at")
+      .eq("id", 1)
+      .maybeSingle();
+    setBotConfigLoading(false);
+    if (e) {
+      console.warn("[auric] refreshBotConfig:", e.message);
+      return;
+    }
+    if (data) {
+      setBotConfig((prev) => ({
+        ...prev,
+        ...(data as BotConfigRow),
+      }));
+      return;
+    }
+    const defaults: BotConfigRow = {
+      id: 1,
+      leverage: 3,
+      risk_fraction: 0.1,
+      trailing_callback_rate: 0.5,
+      updated_at: new Date().toISOString(),
+    };
+    const ins = await supabase.from("bot_config").upsert(defaults, { onConflict: "id" });
+    if (ins.error) {
+      console.warn("[auric] refreshBotConfig upsert:", ins.error.message);
+      return;
+    }
+    setBotConfig(defaults);
+  }, [supabase]);
+
+  const updateBotConfigDebounced = useCallback(
+    (patch: Partial<Pick<BotConfigRow, "leverage" | "risk_fraction" | "trailing_callback_rate">>) => {
+      setBotConfig((prev) => ({ ...prev, ...patch }));
+      if (!supabase) return;
+      if (botConfigDebounceRef.current) clearTimeout(botConfigDebounceRef.current);
+      setIsSyncing(true);
+      setSyncError(null);
+      setShowSynced(false);
+      botConfigDebounceRef.current = setTimeout(async () => {
+        const next = { ...botConfigRef.current, ...patch };
+        const leverage = Number(next.leverage ?? 3);
+        const riskFraction = parseFloat(String(next.risk_fraction ?? 0.1));
+        const trailingCallback = parseFloat(
+          String(next.trailing_callback_rate ?? 0.5)
+        );
+        const payload = {
+          leverage,
+          risk_fraction: riskFraction,
+          trailing_callback_rate: trailingCallback,
+          updated_at: new Date().toISOString(),
+        };
+        const { error: e } = await supabase
+          .from("bot_config")
+          .update(payload)
+          .eq("id", 1);
+        if (e) {
+          setIsSyncing(false);
+          setSyncError(e.message);
+          console.error("[auric] updateBotConfigDebounced:", e.message, e);
+          return;
+        }
+        setIsSyncing(false);
+        setShowSynced(true);
+        if (botConfigSyncedPulseRef.current) clearTimeout(botConfigSyncedPulseRef.current);
+        botConfigSyncedPulseRef.current = setTimeout(() => {
+          setShowSynced(false);
+        }, 2000);
+      }, 350);
+    },
+    [supabase]
+  );
+
+  useEffect(() => {
+    botConfigRef.current = botConfig;
+  }, [botConfig]);
 
   const measurePing = useCallback(async () => {
     if (!supabase) return;
@@ -426,6 +563,25 @@ export function useAuricDashboard() {
 
   useEffect(() => {
     if (!supabase) return;
+    void refreshTradeOutcomes();
+    void refreshAnalyticsOutcomes();
+    void refreshBotConfig();
+    const id = window.setInterval(() => {
+      void refreshTradeOutcomes();
+      void refreshAnalyticsOutcomes();
+    }, 30000);
+    return () => clearInterval(id);
+  }, [supabase, refreshTradeOutcomes, refreshAnalyticsOutcomes, refreshBotConfig]);
+
+  useEffect(() => {
+    return () => {
+      if (botConfigDebounceRef.current) clearTimeout(botConfigDebounceRef.current);
+      if (botConfigSyncedPulseRef.current) clearTimeout(botConfigSyncedPulseRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
     const chConfig = supabase
       .channel("auric-realtime-config")
       .on(
@@ -584,5 +740,15 @@ export function useAuricDashboard() {
     walletFetchFailed,
     manualPending,
     insertManualCommand,
+    tradeOutcomes,
+    tradeOutcomesLoading,
+    analyticsOutcomes,
+    analyticsOutcomesLoading,
+    botConfig,
+    botConfigLoading,
+    isSyncing,
+    syncError,
+    showSynced,
+    updateBotConfigDebounced,
   };
 }

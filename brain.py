@@ -239,6 +239,7 @@ def montar_bloco_tecnico_final_boss(snapshot: dict[str, Any]) -> str:
 
     vies = snapshot.get("vies_vwap", "INDEFINIDO")
     acima_ou_abaixo = indicators.texto_preco_vs_vwap(str(vies))
+    estado_macd = str(snapshot.get("macd_estado") or "Indefinido")
     status_bollinger = indicators.descrever_status_bollinger_para_prompt(snapshot)
     confluencia = snapshot.get("confluencia")
     if isinstance(confluencia, dict) and confluencia:
@@ -252,9 +253,11 @@ ADX: {adx_str} (Indica força da tendência)
 
 Preço vs VWAP: {acima_ou_abaixo} (Viés institucional)
 
+MACD: {estado_macd} (Mede o momentum da tendência)
+
 Bollinger: {status_bollinger} (Indica se o preço está esticado ou comprimido)
 
-Sua Missão: Se o ML der 83% de alta, mas o ADX estiver em 12 (lateral) e o preço abaixo da VWAP, você deve dar VETO. Só confirme o trade se houver CONFLUÊNCIA entre técnico e notícias."""
+Sua Missão: Se o ML der 83% de alta, mas o ADX estiver lateral e o MACD mostrar Cruzamento de Baixa, você deve dar VETO por falta de confluência. Só confirme o trade se houver CONFLUÊNCIA entre técnico e notícias."""
 
     detalhe = indicators.formatar_bloco_indicadores_para_llm(snapshot)
     return f"{missao}\n\n{detalhe}{bloco_conf}"

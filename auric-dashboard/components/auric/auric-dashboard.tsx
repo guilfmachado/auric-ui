@@ -11,11 +11,13 @@ import { parseTelemetryFromLog } from "@/lib/auric/parse-telemetry";
 import { ProfitChart } from "@/components/ProfitChart";
 
 import { AuricHeader } from "./auric-header";
+import { AiAuditPanel } from "./ai-audit-panel";
 import { BrainFeed } from "./brain-feed";
 import { GaugeMatrix } from "./gauge-matrix";
 import { IndicatorHub } from "./indicator-hub";
 import { LogsTable } from "./logs-table";
 import { PulseHero } from "./pulse-hero";
+import { TacticalOverridePanel } from "./tactical-override-panel";
 import { TerminalCard } from "./terminal-card";
 
 /** Saldo `wallet_status`: duas casas decimais. */
@@ -76,6 +78,16 @@ export function AuricDashboard() {
     walletFetchFailed,
     manualPending,
     insertManualCommand,
+    tradeOutcomes,
+    tradeOutcomesLoading,
+    analyticsOutcomes,
+    analyticsOutcomesLoading,
+    botConfig,
+    botConfigLoading,
+    isSyncing,
+    syncError,
+    showSynced,
+    updateBotConfigDebounced,
   } = useAuricDashboard();
 
   const { changePct: ethCh } = useEthTicker();
@@ -259,6 +271,14 @@ export function AuricDashboard() {
           onManualShort={() => void insertManualCommand("SHORT")}
           onManualCloseAll={() => void insertManualCommand("CLOSE_ALL")}
         />
+        <TacticalOverridePanel
+          config={botConfig}
+          loading={botConfigLoading}
+          isSyncing={isSyncing}
+          syncError={syncError}
+          showSynced={showSynced}
+          onPatch={updateBotConfigDebounced}
+        />
 
         {isMotorLoading && (
           <>
@@ -309,6 +329,14 @@ export function AuricDashboard() {
                   isLoading
                   rows={[]}
                   maxRows={LIVE_LOGS_N}
+                />
+              </section>
+              <section className="w-full min-w-0 shrink-0">
+                <AiAuditPanel
+                  rows={[]}
+                  analytics={null}
+                  isLoading
+                  metricsLoading
                 />
               </section>
             </div>
@@ -365,6 +393,14 @@ export function AuricDashboard() {
 
               <section className="w-full min-w-0 shrink-0">
                 <LogsTable rows={logsForTable} maxRows={LIVE_LOGS_N} />
+              </section>
+              <section className="w-full min-w-0 shrink-0">
+                <AiAuditPanel
+                  rows={tradeOutcomes}
+                  analytics={analyticsOutcomes}
+                  isLoading={tradeOutcomesLoading}
+                  metricsLoading={analyticsOutcomesLoading}
+                />
               </section>
             </div>
           </>
