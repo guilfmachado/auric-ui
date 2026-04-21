@@ -36,7 +36,7 @@ function formatPct(n: number | null | undefined) {
 }
 
 const BINANCE_FAPI_ETH_PRICE =
-  "https://fapi.binance.com/fapi/v1/ticker/price?symbol=ETHUSDT";
+  "https://fapi.binance.com/fapi/v1/ticker/price?symbol=ETHUSDC";
 
 const LIVE_LOGS_N = 5;
 
@@ -142,7 +142,7 @@ export function AuricDashboard() {
   }, []);
 
   const ethTickerFootnote =
-    "Binance USDT-M Futures · preço ~2s · % 24h (Spot ref.)";
+    "Binance USDC Futures · preço ~2s · % 24h (Spot ref.)";
 
   const { prob01: mlFromLatestLog, pctLabel: mlPctLabel } =
     mlFromProbabilidade(latestLog?.probabilidade_ml);
@@ -174,7 +174,26 @@ export function AuricDashboard() {
       ? "—"
       : `$${formatWalletUsd(walletUsdt)}`;
 
-  const pnl = config.pnl_day_pct;
+  const pnlFromLogsEthUsdc = (() => {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    let sum = 0;
+    let has = false;
+    for (const row of logs) {
+      const par = String(row.par_moeda ?? "").toUpperCase();
+      if (par !== "ETH/USDC" && par !== "ETH/USDC:USDC") continue;
+      const tsRaw = row.created_at;
+      const ts = tsRaw ? new Date(tsRaw) : null;
+      if (!ts || Number.isNaN(ts.getTime()) || ts < dayStart) continue;
+      const vRaw = row.pnl_pct ?? row.resultado_trade;
+      const v = Number(vRaw);
+      if (!Number.isFinite(v)) continue;
+      sum += v;
+      has = true;
+    }
+    return has ? sum : null;
+  })();
+  const pnl = pnlFromLogsEthUsdc ?? config.pnl_day_pct;
   const pnlPositive =
     pnl === null || pnl === undefined ? null : pnl > 0 ? true : pnl < 0 ? false : null;
 

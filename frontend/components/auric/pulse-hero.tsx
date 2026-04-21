@@ -108,7 +108,7 @@ export function PulseHero({
               </Mono>
             )}
             <p className="mt-1 text-[10px] text-zinc-600">
-              USDT · <span className="text-zinc-500">wallet_status</span>
+              USDC · <span className="text-zinc-500">wallet_status</span>
             </p>
           </div>
         </TerminalCard>
@@ -153,7 +153,7 @@ export function PulseHero({
         <TerminalCard className="flex min-h-[140px] flex-col justify-between">
           <div className="flex items-center justify-between gap-2">
             <span className="text-[10px] font-semibold tracking-[0.2em] text-zinc-500 uppercase">
-              ETH / USDT
+              ETH / USDC
             </span>
             <TrendingUp
               className={cn(

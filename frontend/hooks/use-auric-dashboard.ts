@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { coerceUsdtBalance } from "@/lib/auric/coerce-metrics";
+import { coerceQuoteBalance } from "@/lib/auric/coerce-metrics";
 import { createClient } from "@/lib/supabase/client";
 import type {
   AnalyticsOutcomesRow,
@@ -99,7 +99,7 @@ export function useAuricDashboard() {
   /** Falha crítica no fetch inicial ao Supabase (UI de ecrã cheio). */
   const [connectionError, setConnectionError] = useState<Error | null>(null);
 
-  /** `wallet_status.usdt_balance` (id = 1). */
+  /** `wallet_status` saldo quote (USDC preferencial; fallback USDT). */
   const fetchWalletBalance = useCallback(async () => {
     if (!supabase) {
       setWalletHydrated(true);
@@ -109,7 +109,7 @@ export function useAuricDashboard() {
     try {
       const { data, error } = await supabase
         .from("wallet_status")
-        .select("usdt_balance")
+        .select("usdc_balance, usdt_balance")
         .eq("id", 1)
         .single();
 
@@ -122,8 +122,10 @@ export function useAuricDashboard() {
         setWalletFetchFailed(true);
         setWalletUsdt(null);
       } else {
-        const row = data as { usdt_balance?: unknown } | null;
-        setWalletUsdt(row ? coerceUsdtBalance(row.usdt_balance) : null);
+        const row = data as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
+        setWalletUsdt(
+          row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
+        );
       }
     } catch (err) {
       console.error("[auric] fetchWalletBalance:", err);
@@ -213,7 +215,7 @@ export function useAuricDashboard() {
     try {
       const { data, error: e } = await supabase
         .from("wallet_status")
-        .select("usdt_balance")
+        .select("usdc_balance, usdt_balance")
         .eq("id", 1)
         .single();
       if (e) {
@@ -222,8 +224,10 @@ export function useAuricDashboard() {
         return;
       }
       setWalletFetchFailed(false);
-      const row = data as { usdt_balance?: unknown } | null;
-      setWalletUsdt(row ? coerceUsdtBalance(row.usdt_balance) : null);
+      const row = data as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
+      setWalletUsdt(
+        row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
+      );
     } finally {
       setWalletHydrated(true);
     }
@@ -452,7 +456,7 @@ export function useAuricDashboard() {
         const [wRes, lRes] = await Promise.all([
           supabase
             .from("wallet_status")
-            .select("usdt_balance")
+            .select("usdc_balance, usdt_balance")
             .eq("id", 1)
             .single(),
           supabase
@@ -467,9 +471,9 @@ export function useAuricDashboard() {
           return;
         }
         setWalletFetchFailed(false);
-        const wrow = wRes.data as { usdt_balance?: unknown } | null;
+        const wrow = wRes.data as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
         setWalletUsdt(
-          wrow != null ? coerceUsdtBalance(wrow.usdt_balance) : null
+          wrow != null ? coerceQuoteBalance(wrow.usdc_balance ?? wrow.usdt_balance) : null
         );
         setWalletHydrated(true);
 
@@ -613,9 +617,9 @@ export function useAuricDashboard() {
         "postgres_changes",
         { event: "*", schema: "public", table: "wallet_status" },
         (payload) => {
-          const row = payload.new as { usdt_balance?: unknown } | null;
-          if (row && "usdt_balance" in row) {
-            const n = coerceUsdtBalance(row.usdt_balance);
+          const row = payload.new as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
+          if (row && ("usdc_balance" in row || "usdt_balance" in row)) {
+            const n = coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance);
             if (n !== null) {
               setWalletFetchFailed(false);
               setWalletUsdt(n);

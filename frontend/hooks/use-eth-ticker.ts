@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-const BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT";
+const BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDC";
 
 export type EthTickerState = {
   price: number | null;

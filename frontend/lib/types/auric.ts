@@ -7,6 +7,7 @@ export interface ConfigRow {
   /** Coluna usada pelo bot Python (`obter_modo_operacao`). */
   modo_operacao?: TradingMode;
   balance_usdt: number | null;
+  balance_usdc?: number | null;
   pnl_day_pct: number | null;
   trades_24h: number | null;
   xgboost_accuracy: number | null;
@@ -20,7 +21,7 @@ export interface ConfigRow {
 export interface LogRow {
   id: number;
   created_at?: string;
-  /** Par negociado (ex.: ETH/USDT) — coluna canónica no Supabase. */
+  /** Par negociado (ex.: ETH/USDC) — coluna canónica no Supabase. */
   par_moeda?: string;
   /** Legado ou flag booleana na base; o dashboard usa `par_moeda` para exibir o par. */
   ativo?: string | boolean;

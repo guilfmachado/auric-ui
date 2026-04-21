@@ -38,7 +38,7 @@ export function StatsGrid({
     {
       label: "Saldo total",
       value: balance,
-      hint: "Carteira USDT",
+      hint: "Carteira USDC",
       icon: <Wallet className="size-4" />,
       accent: "neutral" as const,
     },

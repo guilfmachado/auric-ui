@@ -1,10 +1,13 @@
 /** PostgREST / JSON podem devolver `numeric` como string. */
-export function coerceUsdtBalance(raw: unknown): number | null {
+export function coerceQuoteBalance(raw: unknown): number | null {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === "number" && !Number.isNaN(raw)) return raw;
   const n = Number(String(raw).replace(",", "."));
   return Number.isFinite(n) ? n : null;
 }
+
+/** Compat legado. */
+export const coerceUsdtBalance = coerceQuoteBalance;
 
 /**
  * `probabilidade_ml` em [0, 1] no bot; aceita legado em [0, 100] (ex.: 26.5 → 0.265).

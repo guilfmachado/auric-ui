@@ -87,7 +87,7 @@ export function AiAuditPanel({
         </div>
         <div className="rounded-lg border border-[#27272a] bg-[#09090b]/60 p-3">
           <p className="text-[10px] tracking-[0.16em] text-zinc-500 uppercase">
-            PnL Acumulado (USDT)
+            PnL Acumulado (USDC)
           </p>
           {metricsLoading ? (
             <Skeleton className="mt-2 h-7 w-28 rounded-md" />
