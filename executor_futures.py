@@ -23,14 +23,15 @@ LONG_TP = 0.020
 LONG_SL = 0.010
 SHORT_TP = 0.015
 SHORT_SL = 0.008
-TRAILING_CALLBACK_RATE = 0.5  # % de recuo da máxima/mínima após ativação
+TRAILING_CALLBACK_RATE = 0.7  # % de recuo da máxima/mínima após ativação
 TRAILING_ACTIVATION_MULTIPLIER = 1.0  # 1.0 = mantém gatilho igual ao antigo TP
 
 # Alavancagem usada só no log de liquidação aproximada (ajuste em configurar_alavancagem / main).
 ALAVANCAGEM_REF_LOG_PADRAO = 3
 
 # Position sizing: notional USDT = saldo_USDT × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
-PERCENTUAL_BANCA = 0.15
+# Fallback quando `risk_fraction` não é passado (alinhado a main.RISK_FRACTION_PADRAO em sessão agressiva).
+PERCENTUAL_BANCA = 0.20
 
 # LIMIT + offset vs. livro: compra ref. bid (+0,05%); venda ref. ask (−0,05%).
 # Entradas: timeInForce IOC (sem GTC pendurado — liberta margem). Fechos reduce-only: GTC + chase.
@@ -742,27 +743,37 @@ def abrir_long_market(
     """
     Abre **long** com LIMIT **IOC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
     após ~CHASE_ENTRADA_TIMEOUT_S sem fill suficiente, reabre no novo livro (sem GTC pendurado).
-    Notional = 15%×banca×alav; depois bracket (SL fixo + trailing stop).
+    Notional = risk_fraction×saldo_margem×alav (fallback PERCENTUAL_BANCA); depois bracket (SL + trailing).
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)
+        rf_used = None
     else:
         quantidade_usd = notional_usdt_futuros_position_sizing(
             ex, lev, risk_fraction=risk_fraction
         )
+        rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
+        if rf_used <= 0:
+            rf_used = float(PERCENTUAL_BANCA)
     if quantidade_usd <= 0:
         raise ValueError(
             f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
         )
     amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
+    saldo_m = obter_saldo_usdt_margem(ex)
+    risk_txt = (
+        f"{rf_used * 100:.1f}% margem USDT"
+        if rf_used is not None
+        else "notional override (risk N/A)"
+    )
 
     print(
         f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDT "
-        f"(15% banca × alav {lev:g}x; qty base ≈ {amt}); chase até {CHASE_ENTRADA_MAX_ROUNDS}×/"
-        f"{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
+        f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
+        f"chase até {CHASE_ENTRADA_MAX_ROUNDS}×/{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
     )
     try:
         ordem = _entrar_limite_com_chase_futuros(
@@ -815,19 +826,29 @@ def abrir_short_market(
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)
+        rf_used = None
     else:
         quantidade_usd = notional_usdt_futuros_position_sizing(
             ex, lev, risk_fraction=risk_fraction
         )
+        rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
+        if rf_used <= 0:
+            rf_used = float(PERCENTUAL_BANCA)
     if quantidade_usd <= 0:
         raise ValueError(
             f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
         )
     amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
+    saldo_m = obter_saldo_usdt_margem(ex)
+    risk_txt = (
+        f"{rf_used * 100:.1f}% margem USDT"
+        if rf_used is not None
+        else "notional override (risk N/A)"
+    )
 
     print(
         f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDT "
-        f"(15% banca × alav {lev:g}x; qty base ≈ {amt}); "
+        f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
         f"chase SHORT {CHASE_SHORT_MAX_ROUNDS}×/{CHASE_SHORT_TIMEOUT_S:.0f}s "
         f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
     )
@@ -991,6 +1012,71 @@ def consultar_posicao_futures(
         "saldo_base_livre": abs(contratos),
         "min_quantidade_base": min_amt,
         "posicao_aberta": aberta,
+    }
+
+
+def _rsi_14_de_fechamentos(fechamentos: list[float]) -> float | None:
+    """RSI(14) simples (Wilder) para série de fechamentos já ordenada."""
+    if len(fechamentos) < 16:
+        return None
+    ganhos: list[float] = []
+    perdas: list[float] = []
+    for i in range(1, len(fechamentos)):
+        d = float(fechamentos[i]) - float(fechamentos[i - 1])
+        ganhos.append(max(d, 0.0))
+        perdas.append(max(-d, 0.0))
+    period = 14
+    avg_gain = sum(ganhos[:period]) / period
+    avg_loss = sum(perdas[:period]) / period
+    for i in range(period, len(ganhos)):
+        avg_gain = ((avg_gain * (period - 1)) + ganhos[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + perdas[i]) / period
+    if avg_loss <= 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def obter_sinais_exaustao_short_15m(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> dict[str, Any]:
+    """
+    Snapshot 15m para proteção de SHORT:
+    - low_15m + candle_ts para regra de stall (sem nova mínima).
+    - RSI(14) atual e anterior para detetar repique de fundo (rsi<30 e a subir).
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    candles = ex.fetch_ohlcv(sym, timeframe="15m", limit=80) or []
+    if len(candles) < 20:
+        return {
+            "ok": False,
+            "motivo": "ohlcv_insuficiente",
+            "candle_ts_15m": None,
+            "low_15m": None,
+            "rsi_14_15m": None,
+            "rsi_14_15m_prev": None,
+            "rsi_repique_fundo": False,
+        }
+
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    rsi_now = _rsi_14_de_fechamentos(closes)
+    rsi_prev = _rsi_14_de_fechamentos(closes[:-1]) if len(closes) >= 17 else None
+    repique = bool(
+        rsi_now is not None
+        and rsi_prev is not None
+        and rsi_prev < 30.0
+        and rsi_now > rsi_prev
+    )
+    return {
+        "ok": True,
+        "candle_ts_15m": int(candles[-1][0]),
+        "low_15m": float(lows[-1]),
+        "rsi_14_15m": rsi_now,
+        "rsi_14_15m_prev": rsi_prev,
+        "rsi_repique_fundo": repique,
     }
 
 

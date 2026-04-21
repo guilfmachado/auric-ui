@@ -37,8 +37,8 @@ import websockets
 SYMBOL_TRADE = "ETH/USDT"
 WS_FUTURES_KLINE_1M = "wss://fstream.binance.com/ws/ethusdt@kline_1m"
 ALAVANCAGEM_PADRAO = 3
-RISK_FRACTION_PADRAO = 0.10
-TRAILING_CALLBACK_PADRAO = 0.5
+RISK_FRACTION_PADRAO = 0.20
+TRAILING_CALLBACK_PADRAO = 0.7
 TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
 TRIGGER_COOLDOWN_S = 15.0
 CLAUDE_RATE_LIMIT_MAX_CALLS = 1
@@ -60,14 +60,19 @@ FATOR_TAKE_PROFIT_SHORT = 0.98  # preço <= entrada × 0.98
 FATOR_STOP_LOSS_SHORT = 1.01  # preço >= entrada × 1.01
 
 # Zona ML que aciona Hub + Brain: P(alta) ≥ limiar long OU P(alta) ≤ limiar short.
-ML_PROB_SHORT_MAX = 0.40
-WAKE_FILTER_SHORT_MAX = 0.40
-WAKE_FILTER_LONG_MIN = 0.60
+# Zona neutra (sessão teste HF): P ∈ [SHORT_MAX, LONG_MIN] → sem Hub/Claude.
+ML_PROB_SHORT_MAX = 0.45
+WAKE_FILTER_SHORT_MAX = 0.45
+WAKE_FILTER_LONG_MIN = 0.55
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
-TRAILING_CALLBACK_RATE_PADRAO = 0.5
+TRAILING_CALLBACK_RATE_PADRAO = 0.7
 TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
+ROI_APERTO_SEGURANCA_ATIVACAO = 0.02  # +2%
+TRAILING_CALLBACK_APERTO_SEGURANCA = 0.4
+STALL_EXIT_VELAS_15M = 4
+TRAILING_CALLBACK_RSI_TIGHTEN = 0.3
 
 # --- Estado do bot (memória do processo; reinício do script perde o estado) ---
 posicao_aberta: bool = False
@@ -79,6 +84,11 @@ _risk_fraction_cfg: float = RISK_FRACTION_PADRAO
 _alavancagem_cfg: float = float(ALAVANCAGEM_PADRAO)
 _trailing_callback_cfg: float = TRAILING_CALLBACK_PADRAO
 _trailing_activation_mult_cfg: float = TRAILING_ACTIVATION_MULTIPLIER_PADRAO
+_aperto_seguranca_ativo: bool = False
+_rsi_tighten_ativo: bool = False
+_short_stall_count_15m: int = 0
+_short_last_candle_ts_15m: int | None = None
+_short_last_low_15m: float | None = None
 _metrics_lock = threading.Lock()
 _metrics_counters: dict[str, int] = {
     "triggers_total": 0,
@@ -229,11 +239,11 @@ def verificar_permissao_operacao() -> bool:
 def obter_parametros_trailing_supabase() -> tuple[float, float]:
     """
     Lê parâmetros dinâmicos do trailing no Supabase (`config`, id=1):
-    - `trailing_callback_rate` (percentual; ex.: 0.5)
+    - `trailing_callback_rate` (percentual; ex.: 0.7)
     - `trailing_activation_multiplier` (multiplicador do antigo TP; ex.: 1.0)
 
     Fallback seguro:
-    - callback_rate = 0.5
+    - callback_rate = 0.7
     - activation_multiplier = 1.0 (mantém lógica atual de ativação)
     """
     callback = TRAILING_CALLBACK_RATE_PADRAO
@@ -272,9 +282,9 @@ def _obter_configuracoes_dinamicas_sync() -> dict[str, float]:
     """
     Lê `bot_config` (id=1) para parâmetros operacionais dinâmicos.
     Fallback seguro em falha:
-    - risk_fraction=0.10
+    - risk_fraction=0.20
     - leverage=3.0
-    - trailing_callback_rate=0.5
+    - trailing_callback_rate=0.7
     - trailing_activation_multiplier=1.0
     """
     cfg = {
@@ -350,6 +360,15 @@ def atualizar_saldo_supabase() -> None:
         logger.persistir_saldo_usdt(saldo)
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ atualizar_saldo_supabase (Supabase): {e}")
+        return
+    rf = float(_risk_fraction_cfg)
+    lev = float(_alavancagem_cfg)
+    notional_ref = float(saldo) * rf * lev
+    print(
+        f"💰 [WALLET] Position sizing (futuros): {saldo:.4f} USDT (margem) × "
+        f"risk={rf*100:.1f}% × lev={lev:g}x → notional_ref≈{notional_ref:.2f} USDT "
+        "(qty base ≈ notional / preço ticker)."
+    )
 
 
 def _marcar_comando_manual_executado(row_id: int) -> None:
@@ -929,13 +948,140 @@ def _gerenciar_saida_modo_vigia(
     """
     [Modo Vigia] Com posição aberta: TP/SL sobre preco_compra (LONG: alta=lucro; SHORT: queda=lucro).
     """
-    global posicao_aberta, preco_compra, direcao_posicao
+    global posicao_aberta, preco_compra, direcao_posicao, _aperto_seguranca_ativo
+    global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
+
+    roi = 0.0
+    if direcao_posicao == "SHORT":
+        roi = (preco_compra - preco) / preco_compra
+    else:
+        roi = (preco - preco_compra) / preco_compra
+
+    trailing_ativo = float(_trailing_callback_cfg)
+    if roi >= ROI_APERTO_SEGURANCA_ATIVACAO:
+        trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_APERTO_SEGURANCA)
+        if not _aperto_seguranca_ativo:
+            _aperto_seguranca_ativo = True
+            print(
+                "🔒 [MODO VIGIA] Aperto de Segurança ATIVADO: "
+                f"ROI={roi*100:.2f}% (>= {ROI_APERTO_SEGURANCA_ATIVACAO*100:.1f}%) → "
+                f"trailing_callback_rate ativo={trailing_ativo:.3f}%."
+            )
+            if "FUTURES" in modo_label:
+                try:
+                    snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+                    qty = abs(float(snap.get("contratos") or 0.0))
+                    if qty > 0:
+                        executor_futures.assegurar_brackets_apos_reconciliacao(
+                            SYMBOL_TRADE,
+                            ex,
+                            direcao_posicao,
+                            qty,
+                            preco_compra,
+                            trailing_callback_rate=trailing_ativo,
+                            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                        )
+                        print(
+                            "🔒 [MODO VIGIA] Brackets Futures atualizados com "
+                            f"callbackRate={trailing_ativo:.3f}% (anti-devolução de lucro)."
+                        )
+                except Exception as e_ap:  # noqa: BLE001
+                    print(f"⚠️ [MODO VIGIA] Falha ao aplicar Aperto de Segurança: {e_ap}")
+    else:
+        if _aperto_seguranca_ativo:
+            print(
+                "ℹ️ [MODO VIGIA] Aperto de Segurança desativado "
+                f"(ROI={roi*100:.2f}% < {ROI_APERTO_SEGURANCA_ATIVACAO*100:.1f}%)."
+            )
+        _aperto_seguranca_ativo = False
+
+    if direcao_posicao == "SHORT" and "FUTURES" in modo_label:
+        try:
+            sx = executor_futures.obter_sinais_exaustao_short_15m(SYMBOL_TRADE, ex)
+            if sx.get("ok"):
+                candle_ts = int(sx.get("candle_ts_15m"))
+                low_now = float(sx.get("low_15m"))
+                if _short_last_candle_ts_15m != candle_ts:
+                    if _short_last_low_15m is None or low_now < _short_last_low_15m:
+                        _short_stall_count_15m = 0
+                    else:
+                        _short_stall_count_15m += 1
+                    _short_last_low_15m = low_now
+                    _short_last_candle_ts_15m = candle_ts
+                rsi_now = sx.get("rsi_14_15m")
+                rsi_prev = sx.get("rsi_14_15m_prev")
+                rsi_repique = bool(sx.get("rsi_repique_fundo"))
+                if rsi_repique:
+                    trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_RSI_TIGHTEN)
+                    if not _rsi_tighten_ativo:
+                        _rsi_tighten_ativo = True
+                        print(
+                            "⚡ [RSI TIGHTEN] RSI subindo no fundo. Apertando Trailing para 0.3%."
+                        )
+                    try:
+                        snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+                        qty = abs(float(snap.get("contratos") or 0.0))
+                        if qty > 0:
+                            executor_futures.assegurar_brackets_apos_reconciliacao(
+                                SYMBOL_TRADE,
+                                ex,
+                                "SHORT",
+                                qty,
+                                preco_compra,
+                                trailing_callback_rate=trailing_ativo,
+                                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                            )
+                    except Exception as e_tight:  # noqa: BLE001
+                        print(f"⚠️ [RSI TIGHTEN] Falha ao aplicar trailing apertado: {e_tight}")
+                else:
+                    _rsi_tighten_ativo = False
+
+                print(
+                    "    [VIGIA SHORT 15m] "
+                    f"stall_count={_short_stall_count_15m}/{STALL_EXIT_VELAS_15M} | "
+                    f"low15m={low_now:.4f} | RSI14={rsi_now if rsi_now is not None else 'N/A'} "
+                    f"(prev={rsi_prev if rsi_prev is not None else 'N/A'})"
+                )
+        except Exception as e_sx:  # noqa: BLE001
+            print(f"⚠️ [VIGIA SHORT 15m] Falha ao ler sinais de exaustão: {e_sx}")
+
+    print(
+        f"    [VIGIA] ROI atual={roi*100:.2f}% | trailing_callback_rate ativo={trailing_ativo:.3f}%"
+    )
 
     if preco_compra <= 0:
         print("[Modo Vigia] preco_compra inválido — não é possível avaliar TP/SL.")
         return
 
     if direcao_posicao == "SHORT":
+        if _short_stall_count_15m >= STALL_EXIT_VELAS_15M and "FUTURES" in modo_label:
+            print("⚠️ [STALL EXIT] Preço preso em suporte por 4 velas. Fechando para proteger lucro.")
+            try:
+                ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=0.0,
+                    sentimento="—",
+                    acao="STALL_EXIT_SHORT",
+                    justificativa=(
+                        f"SHORT sem nova mínima por {STALL_EXIT_VELAS_15M} velas de 15m; "
+                        "saída de emergência por exaustão em suporte."
+                    ),
+                    lado_ordem="SHORT",
+                )
+                posicao_aberta = False
+                preco_compra = 0.0
+                direcao_posicao = "LONG"
+                _short_stall_count_15m = 0
+                _short_last_candle_ts_15m = None
+                _short_last_low_15m = None
+                _rsi_tighten_ativo = False
+                print(f"  [Estado] posição encerrada por STALL EXIT. id={ordem.get('id')}")
+            except Exception as e_stall:  # noqa: BLE001
+                print(f"  [ERRO] STALL EXIT SHORT: {e_stall}")
+            return
+
         limite_tp = preco_compra * FATOR_TAKE_PROFIT_SHORT
         limite_sl = preco_compra * FATOR_STOP_LOSS_SHORT
         print(
@@ -945,7 +1091,10 @@ def _gerenciar_saida_modo_vigia(
         if preco <= limite_tp:
             print("\n  [Take Profit SHORT] Preço <= entrada × 0,98 — fechando posição...")
             try:
-                ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
+                if "FUTURES" in modo_label:
+                    ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+                else:
+                    ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
                 just = (
                     f"TP short −2%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
                     f"id={ordem.get('id')}."
@@ -979,7 +1128,10 @@ def _gerenciar_saida_modo_vigia(
         if preco >= limite_sl:
             print("\n  [Stop Loss SHORT] Preço >= entrada × 1,01 — fechando posição...")
             try:
-                ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
+                if "FUTURES" in modo_label:
+                    ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+                else:
+                    ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
                 just = (
                     f"SL short +1%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
                     f"id={ordem.get('id')}."
@@ -1026,7 +1178,10 @@ def _gerenciar_saida_modo_vigia(
     if preco >= limite_tp:
         print("\n  [Take Profit] Preço atual >= entrada × 1,02 — executando saída total...")
         try:
-            ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
+            if "FUTURES" in modo_label:
+                ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+            else:
+                ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
             just = (
                 f"TP +2%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
                 f"ordem id={ordem.get('id')}."
@@ -1058,7 +1213,10 @@ def _gerenciar_saida_modo_vigia(
     if preco <= limite_sl:
         print("\n  [Stop Loss] Preço atual <= entrada × 0,99 — executando saída total...")
         try:
-            ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
+            if "FUTURES" in modo_label:
+                ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+            else:
+                ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
             just = (
                 f"SL -1%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
                 f"ordem id={ordem.get('id')}."
@@ -1095,7 +1253,8 @@ def _gerenciar_saida_modo_vigia(
 
 def rodar_ciclo(modo: str) -> None:
     """Um ciclo: Vigia (saída) OU Buscando Oportunidade (entrada ML + sentimento)."""
-    global posicao_aberta, preco_compra, direcao_posicao, _last_modo_detectado
+    global posicao_aberta, preco_compra, direcao_posicao, _last_modo_detectado, _aperto_seguranca_ativo
+    global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
 
     if not logger.obter_bot_ativo():
@@ -1117,7 +1276,6 @@ def rodar_ciclo(modo: str) -> None:
             print(f"[Maestro] Aviso ao configurar alavancagem/margem: {e_cfg}")
     _last_modo_detectado = modo
 
-    limiar = ml_model.CONFIDENCE_THRESHOLD
     preco = obter_preco_referencia(SYMBOL_TRADE, modo)
     ex = ex_mod.criar_exchange_binance()
 
@@ -1161,6 +1319,11 @@ def rodar_ciclo(modo: str) -> None:
         )
         _gerenciar_saida_modo_vigia(preco, ex, ex_mod, modo_label)
         return
+    _aperto_seguranca_ativo = False
+    _rsi_tighten_ativo = False
+    _short_stall_count_15m = 0
+    _short_last_candle_ts_15m = None
+    _short_last_low_15m = None
 
     # Busca de oportunidade (sem posição em RAM após sync+recon): limpar livro na Binance (margem livre).
     if modo == "FUTURES":
@@ -1171,7 +1334,14 @@ def rodar_ciclo(modo: str) -> None:
 
     print("\n>>> BUSCANDO OPORTUNIDADE <<<")
     print(
-        "    ML P(alta)≥0,60 (LONG) ou P(alta)≤0,40 (SHORT) → Hub → Brain → posicao_recomendada."
+        "    [Filtros — sessão teste / alta frequência] "
+        f"VETO_ADX_LATERAL: ADX(14) < {indicators.ADX_LIMIAR_TENDENCIA:.0f} (sem squeeze BB). "
+        f"Wake XGBoost zona neutra P(alta) ∈ [{WAKE_FILTER_SHORT_MAX:.2f}, {WAKE_FILTER_LONG_MIN:.2f}] "
+        "(dentro → sem Hub/Claude; fora → Hub + Brain)."
+    )
+    print(
+        f"    ML P(alta)≥{WAKE_FILTER_LONG_MIN:.2f} (LONG) ou P(alta)≤{WAKE_FILTER_SHORT_MAX:.2f} (SHORT) "
+        "→ Hub → Brain → posicao_recomendada."
     )
 
     print("\n--- [AURIC CYCLE START] ---")
@@ -1328,7 +1498,8 @@ def rodar_ciclo(modo: str) -> None:
             ),
         )
         print(
-            "💤 [WAKE FILTER] XGBoost em zona neutra [0.40, 0.60] — Claude NÃO chamado. "
+            f"💤 [WAKE FILTER] XGBoost em zona neutra "
+            f"[{limiar_short:.2f}, {limiar_long:.2f}] — Claude NÃO chamado. "
             'Mock: {"sentimento":"NEUTRAL","posicao_recomendada":"VETO","justificativa_curta":"Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."}'
         )
         return
@@ -1385,7 +1556,8 @@ def rodar_ciclo(modo: str) -> None:
         veredito = brain.analisar_sentimento_mercado(
             contexto,
             prob_ml=probabilidade,
-            limiar_ml=limiar,
+            limiar_ml=WAKE_FILTER_LONG_MIN,
+            limiar_ml_short=WAKE_FILTER_SHORT_MAX,
             direcao_sugerida=direcao_sugerida,
             verbose=False,
             bloco_tecnico_prioritario=bloco_ta,
@@ -1674,9 +1846,10 @@ def rodar_ciclo(modo: str) -> None:
             )
         else:
             notional_alvo = executor_spot.obter_saldo_usdt(ex) * executor_spot.PERCENTUAL_BANCA
+            pct_spot = executor_spot.PERCENTUAL_BANCA * 100.0
             entrada_txt = (
                 f"COMPRA (Long) LIMIT (+0,05%) — custo ≈ {notional_alvo:.2f} USDT "
-                f"(15% saldo spot, {modo_label}, mainnet)."
+                f"({pct_spot:.1f}% saldo spot, {modo_label}, mainnet)."
             )
         print(
             f"    [Buscando Oportunidade] BULLISH + ML/Brain alinhados + "
@@ -2198,8 +2371,8 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                     )
                     print(
                         "[WS] Config dinâmica carregada: "
-                        f"risk={_risk_fraction_cfg*100:.1f}% | "
-                        f"lev={_alavancagem_cfg:.2f}x | "
+                        f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDT (margem) por trade | "
+                        f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
                         f"trail_cb={_trailing_callback_cfg:.3f}% | "
                         f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
                     )

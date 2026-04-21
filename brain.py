@@ -268,6 +268,7 @@ def analisar_sentimento_mercado(
     *,
     prob_ml: float | None = None,
     limiar_ml: float | None = None,
+    limiar_ml_short: float | None = None,
     direcao_sugerida: str = "LONG",
     verbose: bool = True,
     bloco_indicadores: str | None = None,
@@ -294,12 +295,14 @@ def analisar_sentimento_mercado(
     ref_xg: str | None = None
     if prob_ml is not None:
         lim_txt = f"{limiar_ml:.4f}" if limiar_ml is not None else "N/A"
+        lim_s = limiar_ml_short if limiar_ml_short is not None else 0.45
+        lim_s_txt = f"{float(lim_s):.4f}"
         p = float(prob_ml)
         pct_br = _pct_br_ml(p)
         ref_xg = (
             "=== SINAL TÉCNICO (XGBoost — referência do orquestrador neste ciclo) ===\n"
             f"P(alta próximo horizonte): {pct_br} (valor em [0,1]: {p:.6f}; também {p:.4f}).\n"
-            f"Limiar long do maestro (ativa Hub): {lim_txt}; zona short: P(alta) ≤ 0,40. "
+            f"Limiar long do maestro (ativa Hub): {lim_txt}; zona short: P(alta) ≤ {lim_s_txt}. "
             f"Direção sugerida neste ciclo: {d}.\n"
             "Obrigatório: cruza esta percentagem com as manchetes e texto da secção "
             "«=== CONTEXTO AGREGADO» (notícias / Reddit / Twitter) acima; divergência crítica "

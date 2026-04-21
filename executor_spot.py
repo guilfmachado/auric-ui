@@ -20,7 +20,7 @@ load_dotenv()
 _TAG = "[MAINNET SPOT]"
 
 # Spot: custo em USDT = saldo_USDT × PERCENTUAL_BANCA (sem alavancagem).
-PERCENTUAL_BANCA = 0.15
+PERCENTUAL_BANCA = 0.20
 PRECO_ABERTURA_LIMITE_OFFSET = 0.0005  # 0,05% acima do último (compra)
 CHASE_ENTRADA_TIMEOUT_S = float(os.getenv("AURIC_CHASE_TIMEOUT_S", "15"))
 CHASE_ENTRADA_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_MAX_ROUNDS", "3"))
@@ -156,7 +156,7 @@ def executar_compra_spot_market(
 ) -> dict[str, Any]:
     """
     Compra **limit** GTC com chase: teto = último × (1 + offset 0,05%); sleep + cancel + reabre.
-    Quantidade base ≈ custo_alvo / preço de referência inicial. Se `valor_usd` for None, custo = saldo × 15%.
+    Quantidade base ≈ custo_alvo / preço de referência inicial. Se `valor_usd` for None, custo = saldo × PERCENTUAL_BANCA.
     """
     ex = exchange or criar_exchange_binance()
     ex.load_markets()
@@ -174,8 +174,9 @@ def executar_compra_spot_market(
     )
     q_raw = valor_usd / preco_lim0
     amt = float(ex.amount_to_precision(simbolo, q_raw))
+    pct = PERCENTUAL_BANCA * 100.0
     print(
-        f"{_TAG} Compra LIMIT {simbolo} — custo alvo ~{valor_usd:.2f} USDT (15% banca), "
+        f"{_TAG} Compra LIMIT {simbolo} — custo alvo ~{valor_usd:.2f} USDT ({pct:.1f}% saldo USDT spot), "
         f"qty base ≈ {amt}; chase até {CHASE_ENTRADA_MAX_ROUNDS}×/{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
     )
     try:

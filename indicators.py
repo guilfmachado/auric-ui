@@ -13,8 +13,9 @@ import pandas as pd
 import pandas_ta as ta
 
 # ADX abaixo disto → mercado em geral lateral (sem tendência forte); rompimentos são menos fiáveis.
-ADX_LIMIAR_TENDENCIA = 25.0
-# Camada TA «quant»: <20 → ruído/lateral fraco; ≥25 → tendência mais clara (confluência com notícias).
+# Sessão teste HF: 15 aceita tendências iniciais / mais fracas (antes 25).
+ADX_LIMIAR_TENDENCIA = 15.0
+# Camada TA «quant»: <20 → ruído/lateral fraco; acima do limiar de tendência → leitura mais direcional.
 ADX_LIMIAR_LATERAL_RUIDO = 20.0
 
 # Se P(ML) ≥ isto e houver squeeze nas BB, a confiança operacional sobe para CONFIANCA_BOOST_SQUEEZE.
@@ -233,9 +234,11 @@ def regime_adx_semantico(adx: float | None) -> str:
     if adx is None or (isinstance(adx, float) and np.isnan(adx)):
         return "INDEFINIDO"
     x = float(adx)
-    if x < ADX_LIMIAR_LATERAL_RUIDO:
+    lo = min(ADX_LIMIAR_LATERAL_RUIDO, ADX_LIMIAR_TENDENCIA)
+    hi = max(ADX_LIMIAR_LATERAL_RUIDO, ADX_LIMIAR_TENDENCIA)
+    if x < lo:
         return "LATERAL_RUIDO"
-    if x < ADX_LIMIAR_TENDENCIA:
+    if x < hi:
         return "TRANSICAO"
     return "TENDENCIA_FORTE"
 
@@ -245,11 +248,13 @@ def legenda_forca_adx_prompt(adx: float | None) -> str:
     if adx is None or (isinstance(adx, float) and np.isnan(adx)):
         return "indisponível"
     x = float(adx)
-    if x < ADX_LIMIAR_LATERAL_RUIDO:
-        return "mercado lateral / baixa força de tendência (ADX<20)"
-    if x < ADX_LIMIAR_TENDENCIA:
-        return "zona de transição (20≤ADX<25)"
-    return "tendência com força típica (ADX≥25)"
+    lo = min(ADX_LIMIAR_LATERAL_RUIDO, ADX_LIMIAR_TENDENCIA)
+    hi = max(ADX_LIMIAR_LATERAL_RUIDO, ADX_LIMIAR_TENDENCIA)
+    if x < lo:
+        return f"mercado lateral / baixa força de tendência (ADX<{lo:.0f})"
+    if x < hi:
+        return f"zona de transição ({lo:.0f}≤ADX<{hi:.0f})"
+    return f"tendência com força típica (ADX≥{hi:.0f})"
 
 
 def texto_preco_vs_vwap(vies: str | None) -> str:
@@ -402,7 +407,7 @@ def rotulo_regime_rsi(rsi: float | None) -> str:
 
 
 def rotulo_regime_adx(adx: float | None) -> str:
-    """ADX vs limiar de tendência (ex.: <25 = lateral)."""
+    """ADX vs limiar de tendência (ex.: < ADX_LIMIAR_TENDENCIA = lateral)."""
     if adx is None or (isinstance(adx, float) and np.isnan(adx)):
         return "N/A"
     if float(adx) < ADX_LIMIAR_TENDENCIA:
@@ -449,8 +454,8 @@ def formatar_bloco_indicadores_para_llm(snapshot: dict[str, Any]) -> str:
         "=== INDICADORES TÉCNICOS (ETH — referência institucional) ===",
         f"ADX(14) = {adx if adx is not None else 'N/A'} | regime={adx_reg} | "
         f"leitura: {legenda_forca_adx_prompt(adx_f)}. "
-        f"Referência: ADX<{ADX_LIMIAR_LATERAL_RUIDO} lateral/ruído; "
-        f"ADX≥{ADX_LIMIAR_TENDENCIA} tendência mais clara.",
+        f"Veto rompimento (sem squeeze): mercado_lateral se ADX<{ADX_LIMIAR_TENDENCIA:.0f}; "
+        f"referência ruído típico: ADX<{ADX_LIMIAR_LATERAL_RUIDO:.0f}.",
         f"VWAP (diário): preço fechamento vs VWAP → viés = {bias} "
         f"({texto_preco_vs_vwap(bias)}). "
         "Acima do VWAP favorece leitura altista de curto prazo; abaixo, baixista.",

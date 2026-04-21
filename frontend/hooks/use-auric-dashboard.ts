@@ -66,7 +66,7 @@ export function useAuricDashboard() {
     id: 1,
     leverage: 3,
     risk_fraction: 0.1,
-    trailing_callback_rate: 0.5,
+    trailing_callback_rate: 0.7,
   });
   const [botConfigLoading, setBotConfigLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -315,7 +315,7 @@ export function useAuricDashboard() {
       id: 1,
       leverage: 3,
       risk_fraction: 0.1,
-      trailing_callback_rate: 0.5,
+      trailing_callback_rate: 0.7,
       updated_at: new Date().toISOString(),
     };
     const ins = await supabase.from("bot_config").upsert(defaults, { onConflict: "id" });
@@ -339,7 +339,7 @@ export function useAuricDashboard() {
         const leverage = Number(next.leverage ?? 3);
         const riskFraction = parseFloat(String(next.risk_fraction ?? 0.1));
         const trailingCallback = parseFloat(
-          String(next.trailing_callback_rate ?? 0.5)
+          String(next.trailing_callback_rate ?? 0.7)
         );
         const payload = {
           leverage,
