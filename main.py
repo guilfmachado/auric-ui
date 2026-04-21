@@ -34,9 +34,9 @@ import logger
 import ml_model
 import websockets
 
-SYMBOL_TRADE = "ETH/USDT"
-WS_FUTURES_KLINE_1M = "wss://fstream.binance.com/ws/ethusdt@kline_1m"
-ALAVANCAGEM_PADRAO = 3
+SYMBOL_TRADE = "ETH/USDC"
+WS_FUTURES_KLINE_1M = "wss://fstream.binance.com/ws/ethusdc@kline_1m"
+ALAVANCAGEM_PADRAO = 6
 RISK_FRACTION_PADRAO = 0.20
 TRAILING_CALLBACK_PADRAO = 0.7
 TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
@@ -89,6 +89,8 @@ _rsi_tighten_ativo: bool = False
 _short_stall_count_15m: int = 0
 _short_last_candle_ts_15m: int | None = None
 _short_last_low_15m: float | None = None
+_equity_inicio_dia: float | None = None
+_travado_ate_ts: float = 0.0
 _metrics_lock = threading.Lock()
 _metrics_counters: dict[str, int] = {
     "triggers_total": 0,
@@ -160,6 +162,22 @@ def _cooldown_apos_falha_ordem_desde_thread_ciclo() -> None:
             time.sleep(sec)
     else:
         time.sleep(sec)
+
+
+def _commission_and_maker_from_order(ordem: dict[str, Any]) -> tuple[float | None, bool]:
+    fee = ordem.get("fee") or {}
+    c = fee.get("cost") if isinstance(fee, dict) else None
+    try:
+        commission = float(c) if c is not None else None
+    except (TypeError, ValueError):
+        commission = None
+    info = ordem.get("info") or {}
+    maker = False
+    if isinstance(info, dict):
+        maker = str(info.get("maker") or "").lower() in ("true", "1", "yes")
+    if commission is not None and commission == 0.0:
+        maker = True
+    return commission, maker
 
 
 def _permitir_consulta_claude() -> tuple[bool, int, float]:
@@ -329,8 +347,7 @@ async def _obter_configuracoes_dinamicas() -> dict[str, float]:
 
 def atualizar_saldo_supabase() -> None:
     """
-    Lê o saldo USDT na carteira **Futuros USDT-M** via CCXT, exatamente:
-    ``exchange.fetch_balance(params={'type': 'future'})['total']['USDT']``.
+    Lê o saldo USDC na carteira de Futures via CCXT.
 
     Depois persiste com ``logger.persistir_saldo_usdt`` (**upsert** em
     ``wallet_status.usdt_balance``, id=1; opcionalmente **update** em
@@ -744,8 +761,8 @@ async def _escutar_comandos_manuais() -> None:
 
 
 def _simbolo_binance_rest(simbolo: str) -> str:
-    """ETH/USDT ou ETH/USDT:USDT → ETHUSDT (formato query Binance)."""
-    s = simbolo.strip().upper().replace(":USDT", "")
+    """ETH/USDC ou ETH/USDC:USDC → ETHUSDC (formato query Binance)."""
+    s = simbolo.strip().upper().replace(":USDC", "")
     if "/" in s:
         a, b = s.split("/", 1)
         return f"{a}{b}"
@@ -759,8 +776,8 @@ def _preco_via_ccxt_ticker(simbolo: str, modo: str) -> float:
             {"enableRateLimit": True, "options": {"defaultType": "future"}}
         )
         sym = simbolo
-        if ":USDT" not in simbolo and "/USDT" in simbolo:
-            sym = f"{simbolo.split('/')[0]}/USDT:USDT"
+        if ":USDC" not in simbolo and "/USDC" in simbolo:
+            sym = f"{simbolo.split('/')[0]}/USDC:USDC"
         t = ex.fetch_ticker(sym)
     else:
         ex = ccxt.binance({"enableRateLimit": True})
@@ -774,7 +791,7 @@ def obter_preco_atual(simbolo: str = SYMBOL_TRADE, modo: str = "FUTURES") -> flo
     Preço de mercado ao vivo: cada chamada abre um pedido HTTP novo à API pública Binance
     (REST), sem variáveis globais nem cache — adequado a ser chamado a cada ciclo.
 
-    FUTURES USDT-M: fapi.binance.com/fapi/v1/ticker/price
+    FUTURES: fapi.binance.com/fapi/v1/ticker/price
     SPOT: api.binance.com/api/v3/ticker/price
     """
     sym_rest = _simbolo_binance_rest(simbolo)
@@ -904,7 +921,7 @@ def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
     if not tem_log:
         acao = "RECON_EMERGENCY_LONG" if lado_bn == "LONG" else "RECON_EMERGENCY_SHORT"
         just = (
-            "Reconciliação: posição aberta na Binance USDT-M sem log de abertura ativo no "
+            "Reconciliação: posição aberta na Binance Futures sem log de abertura ativo no "
             f"Supabase. entryPrice={ep:.6f}, contracts={qty}, side={lado_bn} (API carteira)."
         )
         print(
@@ -1255,6 +1272,7 @@ def rodar_ciclo(modo: str) -> None:
     """Um ciclo: Vigia (saída) OU Buscando Oportunidade (entrada ML + sentimento)."""
     global posicao_aberta, preco_compra, direcao_posicao, _last_modo_detectado, _aperto_seguranca_ativo
     global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
+    global _equity_inicio_dia, _travado_ate_ts
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
 
     if not logger.obter_bot_ativo():
@@ -1264,7 +1282,7 @@ def rodar_ciclo(modo: str) -> None:
     atualizar_saldo_supabase()
 
     ex_mod = executor_futures if modo == "FUTURES" else executor_spot
-    modo_label = "FUTURES USDT-M" if modo == "FUTURES" else "SPOT"
+    modo_label = "FUTURES USDC" if modo == "FUTURES" else "SPOT"
 
     if modo == "FUTURES" and _last_modo_detectado != "FUTURES":
         try:
@@ -1280,6 +1298,62 @@ def rodar_ciclo(modo: str) -> None:
     ex = ex_mod.criar_exchange_binance()
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
+
+    now = time.time()
+    if now < _travado_ate_ts:
+        rem_h = (_travado_ate_ts - now) / 3600.0
+        print(f"🛑 [RISK LOCK] Execução travada por drawdown diário. Retoma em ~{rem_h:.2f}h.")
+        return
+    if modo == "FUTURES":
+        try:
+            bal = ex.fetch_balance(params={"type": "future"})
+            total = bal.get("total") if isinstance(bal, dict) else {}
+            free = bal.get("free") if isinstance(bal, dict) else {}
+            usdc_tot = float((total or {}).get("USDC") or 0.0)
+            usdc_free = float((free or {}).get("USDC") or 0.0)
+            snap_dd = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+            unreal = 0.0
+            try:
+                sym = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+                for p in ex.fetch_positions([sym]):
+                    c = float(p.get("contracts") or 0.0)
+                    if abs(c) > 0:
+                        unreal = float(p.get("unrealizedPnl") or p.get("info", {}).get("unRealizedProfit") or 0.0)
+                        break
+            except Exception:
+                pass
+            equity = usdc_tot + unreal
+            if _equity_inicio_dia is None or _equity_inicio_dia <= 0:
+                _equity_inicio_dia = max(1e-9, equity)
+            dd = (_equity_inicio_dia - equity) / _equity_inicio_dia
+            if dd >= 0.25:
+                print("🛑 [DRAWDOWN] 25% diário atingido. Acionando travão de mão.")
+                try:
+                    executor_futures.cancelar_todas_ordens_abertas(SYMBOL_TRADE, ex)
+                except Exception:
+                    pass
+                if snap_dd.get("posicao_aberta"):
+                    try:
+                        executor_futures.fechar_posicao_emergencia_market(SYMBOL_TRADE, ex)
+                    except Exception as e_em:
+                        print(f"⚠️ [DRAWDOWN] Falha no fecho emergência: {e_em}")
+                _travado_ate_ts = time.time() + 24 * 3600
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=0.0,
+                    sentimento="CRITICAL",
+                    acao="EMERGENCY_DRAWDOWN_LOCK",
+                    justificativa="Drawdown diário >=25% (realizado+flutuante). Execução travada por 24h.",
+                    is_maker=False,
+                )
+                return
+            print(
+                f"🧯 [RISK] Equity diária={equity:.4f} USDC | início={_equity_inicio_dia:.4f} | "
+                f"drawdown={dd*100:.2f}% | free={usdc_free:.4f} USDC"
+            )
+        except Exception as e_dd:
+            print(f"⚠️ [RISK] checkDailyDrawdown falhou: {e_dd}")
 
     if modo == "FUTURES":
         _reconciliar_posicao_futures_binance_supabase(ex, modo)
@@ -1349,6 +1423,30 @@ def rodar_ciclo(modo: str) -> None:
     # 1. Sinal Técnico (XGBoost) + snapshot ADX / VWAP / BB (um download OHLCV)
     probabilidade = ml_model.obter_sinal_atual()
     print(f"📊 [ML] Probabilidade de Alta: {probabilidade:.2%}")
+    prob_ml_base = float(probabilidade)
+    parede_venda_proxima_confirma_short = False
+    parede_venda_preco_ref: float | None = None
+    if modo == "FUTURES":
+        try:
+            obp = executor_futures.analisar_pressao_order_book(SYMBOL_TRADE, ex, depth_limit=100)
+            if obp.get("muralha_venda"):
+                short_prob = max(0.0, min(1.0, 1.0 - prob_ml_base))
+                short_prob_aj = min(1.0, short_prob * 1.20)
+                probabilidade = max(0.0, min(1.0, 1.0 - short_prob_aj))
+                print(
+                    "🧱 [ORDER BOOK] Pressão vendedora forte no raio 1%: "
+                    f"asks={obp.get('ask_volume_1pct'):.4f} vs bids={obp.get('bid_volume_1pct'):.4f} "
+                    f"(ratio={obp.get('ask_bid_ratio'):.2f}x). "
+                    f"P(alta) ajustada {prob_ml_base:.2%} → {probabilidade:.2%} "
+                    "(peso +20% na probabilidade de SHORT)."
+                )
+                if obp.get("muralha_proxima"):
+                    parede_venda_proxima_confirma_short = True
+                    dist = obp.get("dist_muralha_frac")
+                    if dist is not None:
+                        parede_venda_preco_ref = float(obp.get("preco_atual")) * (1.0 + float(dist))
+        except Exception as e_ob:  # noqa: BLE001
+            print(f"⚠️ [ORDER BOOK] Falha ao analisar depth Binance: {e_ob}")
 
     try:
         snap = ml_model.obter_snapshot_indicadores_eth(
@@ -1633,6 +1731,23 @@ def rodar_ciclo(modo: str) -> None:
             f"execução forçada para {alvo}."
         )
 
+    if (
+        parede_venda_proxima_confirma_short
+        and modo == "FUTURES"
+        and direcao_sugerida == "SHORT"
+        and not manual_override_veredito
+        and sent == "CAUTIOUS"
+    ):
+        px_wall = (
+            f"{parede_venda_preco_ref:.2f}"
+            if parede_venda_preco_ref is not None
+            else "X.XX"
+        )
+        print(f"🧱 [WALL DETECTED] Muralha de venda detectada em {px_wall}. Confirmando Short.")
+        sent = "BEARISH"
+        pos_rec = "SHORT"
+        conf_num = max(conf_num, CONFIANCA_BRAIN_MIN_ENTRADA)
+
     # 4. Filtro de execução (entrada)
     if not manual_override_veredito and sent not in ("BULLISH", "BEARISH"):
         print(
@@ -1652,7 +1767,11 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    if not manual_override_veredito and (pos_rec == "VETO" or pos_rec != direcao_sugerida):
+    if (
+        not manual_override_veredito
+        and not (parede_venda_proxima_confirma_short and sent == "BEARISH" and direcao_sugerida == "SHORT")
+        and (pos_rec == "VETO" or pos_rec != direcao_sugerida)
+    ):
         print(
             "    [Buscando Oportunidade] Brain não confirma a direção técnica (VETO ou divergência)."
         )
@@ -1875,6 +1994,7 @@ def rodar_ciclo(modo: str) -> None:
                 ordem = ex_mod.executar_compra_spot_market(SYMBOL_TRADE, exchange=ex)
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")
+            commission, is_maker = _commission_and_maker_from_order(ordem)
             preco_compra = float(ordem.get("auric_entry_price") or preco)
             posicao_aberta = True
             direcao_posicao = "LONG"
@@ -1904,6 +2024,8 @@ def rodar_ciclo(modo: str) -> None:
                 contexto_raw=contexto_raw_supabase,
                 justificativa_ia=just_ia,
                 noticias_agregadas=contexto,
+                commission=commission,
+                is_maker=is_maker,
             )
             print(
                 f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
@@ -1993,6 +2115,7 @@ def rodar_ciclo(modo: str) -> None:
             )
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")
+            commission, is_maker = _commission_and_maker_from_order(ordem)
             preco_compra = float(ordem.get("auric_entry_price") or preco)
             posicao_aberta = True
             direcao_posicao = "SHORT"
@@ -2017,6 +2140,8 @@ def rodar_ciclo(modo: str) -> None:
                 contexto_raw=contexto_raw_supabase,
                 justificativa_ia=just_ia,
                 noticias_agregadas=contexto,
+                commission=commission,
+                is_maker=is_maker,
             )
             print(
                 f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
@@ -2286,7 +2411,7 @@ async def _auditoria_outcome_engine_task() -> None:
 async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     """
     Engine orientado por eventos:
-    - escuta WebSocket 1m Futures (ETHUSDT)
+    - escuta WebSocket 1m Futures (ETHUSDC)
     - dispara ciclo em fechamento da vela OU pico de volume intra-vela
     - mantém o socket vivo sem bloquear durante ML/Hub/Brain (to_thread)
     - `while True` + backoff: quedas de WS não derrubam o processo; durante o sleep
@@ -2304,7 +2429,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
         try:
             print(f"🛰️ [WS] Ligando stream: {WS_FUTURES_KLINE_1M}")
             async with websockets.connect(WS_FUTURES_KLINE_1M, ping_interval=20, ping_timeout=20) as ws:
-                print("✅ [WS] Conectado. Aguardando ticks 1m (ETHUSDT)...")
+                print("✅ [WS] Conectado. Aguardando ticks 1m (ETHUSDC)...")
 
                 async for raw in ws:
                     try:
@@ -2404,6 +2529,17 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
             await asyncio.sleep(WS_RECONNECT_DELAY_S)
 
 
+def _validar_preflight_futures_usdc() -> None:
+    ex = executor_futures.criar_exchange_binance()
+    bal = ex.fetch_balance(params={"type": "future"})
+    free = bal.get("free") if isinstance(bal, dict) else {}
+    usdc_free = float((free or {}).get("USDC") or 0.0)
+    if usdc_free <= 0:
+        raise RuntimeError("Preflight falhou: sem saldo USDC livre em Futures.")
+    executor_futures.configurar_alavancagem(SYMBOL_TRADE, 6, ex)
+    print(f"✅ [PREFLIGHT] Futures USDC ok | saldo livre={usdc_free:.4f} | leverage=6x confirmado.")
+
+
 async def main() -> None:
     load_dotenv(override=True)
     parser = argparse.ArgumentParser(
@@ -2428,6 +2564,7 @@ async def main() -> None:
         "\n[Maestro] Bot quantitativo | MAINNET | modo SPOT/FUTURES via Supabase (config) | "
         "TP/SL 1.02 / 0.99.\n"
     )
+    await asyncio.to_thread(_validar_preflight_futures_usdc)
 
     if args.once:
         if not await asyncio.to_thread(verificar_permissao_operacao):

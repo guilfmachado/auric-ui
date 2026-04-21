@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _TAG = "[MAINNET FUTURES]"
+QUOTE_ASSET = "USDC"
 
 # Gestão de risco (frações): gatilho de trailing/SL em relação ao preço de entrada.
 LONG_TP = 0.020
@@ -80,19 +81,20 @@ def criar_exchange_binance() -> ccxt.binance:
 
 def _resolver_simbolo_perp(exchange: ccxt.binance, simbolo: str) -> str:
     """
-    Converte ETH/USDT no símbolo unificado do perpétuo USDT-M (ex.: ETH/USDT:USDT).
+    Converte ETH/USDC no símbolo unificado do perpétuo linear (ex.: ETH/USDC:USDC).
     """
     exchange.load_markets()
     if simbolo in exchange.markets:
         m = exchange.markets[simbolo]
         if m.get("swap") and m.get("linear"):
             return simbolo
-    if "/USDT" in simbolo and ":USDT" not in simbolo:
-        cand = f"{simbolo.split('/')[0]}/USDT:USDT"
+    if "/" in simbolo and ":" not in simbolo:
+        base, quote = simbolo.split("/", 1)
+        cand = f"{base}/{quote}:{quote}"
         if cand in exchange.markets:
             return cand
     raise ValueError(
-        f"{_TAG} Par USDT-M não encontrado: {simbolo}. Use ex. ETH/USDT ou ETH/USDT:USDT."
+        f"{_TAG} Par perp linear não encontrado: {simbolo}. Use ex. ETH/{QUOTE_ASSET} ou ETH/{QUOTE_ASSET}:{QUOTE_ASSET}."
     )
 
 
@@ -132,6 +134,68 @@ def notional_usdt_futuros_position_sizing(
     if rf <= 0:
         rf = float(PERCENTUAL_BANCA)
     return float(saldo) * rf * float(alavancagem)
+
+
+def analisar_pressao_order_book(
+    simbolo: str = "ETH/USDC",
+    exchange: ccxt.binance | None = None,
+    *,
+    depth_limit: int = 100,
+    raio_frac: float = 0.01,
+    parede_proxima_frac: float = 0.005,
+) -> dict[str, Any]:
+    """
+    Analisa depth (100 níveis por omissão) e soma volumes no raio de preço:
+    - bids em [preço_atual * (1-raio), preço_atual]
+    - asks em [preço_atual, preço_atual * (1+raio)]
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    ticker = ex.fetch_ticker(sym)
+    preco = float(ticker.get("last") or ticker.get("close") or 0.0)
+    if preco <= 0:
+        raise RuntimeError(f"{_TAG} Preço inválido para análise de order book em {sym}.")
+    ob = ex.fetch_order_book(sym, limit=int(depth_limit))
+    bids = ob.get("bids") or []
+    asks = ob.get("asks") or []
+    p_min = preco * (1.0 - float(raio_frac))
+    p_max = preco * (1.0 + float(raio_frac))
+
+    bid_vol = 0.0
+    for lvl in bids:
+        p = float(lvl[0])
+        q = float(lvl[1])
+        if p >= p_min and p <= preco:
+            bid_vol += q
+
+    ask_vol = 0.0
+    min_ask_dist = None
+    for lvl in asks:
+        p = float(lvl[0])
+        q = float(lvl[1])
+        if p >= preco and p <= p_max:
+            ask_vol += q
+            dist = (p - preco) / preco
+            if min_ask_dist is None or dist < min_ask_dist:
+                min_ask_dist = dist
+
+    ratio = ask_vol / bid_vol if bid_vol > 0 else float("inf") if ask_vol > 0 else 0.0
+    muralha_venda = ask_vol >= (3.0 * bid_vol) and ask_vol > 0
+    muralha_proxima = bool(
+        muralha_venda
+        and min_ask_dist is not None
+        and float(min_ask_dist) <= float(parede_proxima_frac)
+    )
+    return {
+        "simbolo": sym,
+        "preco_atual": preco,
+        "bid_volume_1pct": bid_vol,
+        "ask_volume_1pct": ask_vol,
+        "ask_bid_ratio": ratio,
+        "muralha_venda": muralha_venda,
+        "muralha_proxima": muralha_proxima,
+        "dist_muralha_frac": min_ask_dist,
+    }
 
 
 def _quantidade_base_a_partir_de_usd(
@@ -258,14 +322,12 @@ def _entrar_limite_com_chase_futuros(
     reduce_only: bool = False,
 ) -> dict[str, Any]:
     """
-    LIMIT + offset (bid/ask ±0,05%):
-    - Entrada (reduce_only=False): timeInForce **IOC** — evita ordens GTC presas no livro (margin lock).
-    - Fecho reduce-only: **GTC** + chase (comportamento anterior).
-    Ajusta `qty_left` após fills parciais (IOC).
+    LIMIT + offset (bid/ask ±0,05%) com protocolo maker-only (GTX / Post-Only).
+    Se rejeitar por Post-Only, reenvia com ajuste de 1 tick no preço.
     """
     cap = max_rounds if max_rounds is not None else CHASE_ENTRADA_MAX_ROUNDS
     wait = float(timeout_s) if timeout_s is not None else CHASE_ENTRADA_TIMEOUT_S
-    tif = "GTC" if reduce_only else "IOC"
+    tif = "GTX"
     params_order: dict[str, Any] = {"timeInForce": tif}
     if reduce_only:
         params_order["reduceOnly"] = True
@@ -298,8 +360,37 @@ def _entrar_limite_com_chase_futuros(
                 params_order,
             )
         except ccxt.BaseError as e:
-            print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
-            continue
+            err = str(e).lower()
+            post_only = ("post" in err and "only" in err) or "gtx" in err
+            if not post_only:
+                print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
+                continue
+            try:
+                market = ex.market(simbolo)
+                tick = float(
+                    (((market.get("limits") or {}).get("price") or {}).get("min"))
+                    or 0.01
+                )
+                preco_aj = (
+                    max(tick, float(preco_limite) - tick)
+                    if str(side).lower() == "buy"
+                    else float(preco_limite) + tick
+                )
+                preco_aj = float(ex.price_to_precision(simbolo, preco_aj))
+                print(
+                    f"{_TAG} ⚠️ Rejeição Post-Only; retry com 1 tick ({preco_limite} -> {preco_aj})."
+                )
+                order = ex.create_order(
+                    simbolo,
+                    "limit",
+                    side,
+                    qty_left,
+                    preco_aj,
+                    params_order,
+                )
+            except ccxt.BaseError as e2:
+                print(f"{_TAG} ❌ Erro no retry GTX 1 tick: {e2}", file=sys.stderr)
+                continue
 
         oid = order.get("id")
         if oid is None:
@@ -697,34 +788,34 @@ def _criar_bracket_short(
     return ord_trailing, ord_sl
 
 
-def _usdt_de_balance_unificado(bal: dict[str, Any]) -> float:
+def _quote_de_balance_unificado(bal: dict[str, Any]) -> float:
     """
-    Extrai USDT do dict devolvido por `fetch_balance`: preferência `free` (disponível),
+    Extrai saldo da moeda de cotação do dict devolvido por `fetch_balance`: preferência `free`,
     senão `total` (saldo líquido na conta de futuros).
     """
-    usdt = bal.get("USDT")
-    if usdt is None:
+    quote = bal.get(QUOTE_ASSET)
+    if quote is None:
         return 0.0
-    if isinstance(usdt, dict):
-        livre = usdt.get("free")
-        total = usdt.get("total")
+    if isinstance(quote, dict):
+        livre = quote.get("free")
+        total = quote.get("total")
         if livre is not None:
             return float(livre)
         if total is not None:
             return float(total)
         return 0.0
     try:
-        return float(usdt)
+        return float(quote)
     except (TypeError, ValueError):
         return 0.0
 
 
 def obter_saldo_usdt_margem(exchange: ccxt.binance | None = None) -> float:
-    """Saldo USDT na carteira de Futuros USDT-M — `fetch_balance` explícito para `type: future`."""
+    """Saldo de cotação (USDC) na carteira de Futuros — `fetch_balance` com `type: future`."""
     ex = exchange or criar_exchange_binance()
     try:
         bal = ex.fetch_balance(params={"type": "future"})
-        return _usdt_de_balance_unificado(bal)
+        return _quote_de_balance_unificado(bal)
     except ccxt.BaseError as e:
         print(f"{_TAG} Erro ao obter saldo USDT (futures): {e}", file=sys.stderr)
         raise
@@ -956,6 +1047,30 @@ def fechar_posicao_market(
         cancelar_todas_ordens_abertas(simbolo, ex)
     except ccxt.BaseError as e2:
         print(f"{_TAG} Pós-fecho: cancelamento extra: {e2}", file=sys.stderr)
+    return ordem
+
+
+def fechar_posicao_emergencia_market(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> dict[str, Any]:
+    """
+    Exceção de segurança: fecha posição com MARKET reduce-only.
+    """
+    ex = exchange or criar_exchange_binance()
+    snap = consultar_posicao_futures(simbolo, ex)
+    if not snap.get("posicao_aberta"):
+        raise ccxt.InvalidOrder(f"{_TAG} Nenhuma posição aberta para fecho de emergência.")
+    qty = abs(float(snap.get("contratos") or 0.0))
+    if qty <= 0:
+        raise ccxt.InvalidOrder(f"{_TAG} Quantidade inválida para fecho emergência: {qty}")
+    side = "sell" if str(snap.get("direcao_posicao") or "LONG").upper() == "LONG" else "buy"
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    ordem = ex.create_order(sym, "market", side, qty, None, _params_reduce_futures())
+    try:
+        cancelar_todas_ordens_abertas(simbolo, ex)
+    except Exception:
+        pass
     return ordem
 
 

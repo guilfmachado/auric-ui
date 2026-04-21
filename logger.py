@@ -167,6 +167,8 @@ def registrar_log_trade(
     contexto_raw: str | None = None,
     justificativa_ia: str | None = None,
     noticias_agregadas: str | None = None,
+    commission: float | None = None,
+    is_maker: bool | None = None,
 ):
     """
     INSERT na tabela `logs` no Supabase.
@@ -183,7 +185,7 @@ def registrar_log_trade(
     if lado_ordem:
         justificativa = f"[{lado_ordem}] {justificativa}"
 
-    par = (par_moeda or "").strip() or "ETH/USDT"
+    par = (par_moeda or "").strip() or "ETH/USDC"
 
     dados_log: dict[str, Any] = {
         "par_moeda": par,
@@ -199,6 +201,10 @@ def registrar_log_trade(
         dados_log["justificativa_ia"] = justificativa_ia
     if noticias_agregadas is not None:
         dados_log["noticias_agregadas"] = noticias_agregadas
+    if commission is not None:
+        dados_log["commission"] = float(commission)
+    if is_maker is not None:
+        dados_log["is_maker"] = bool(is_maker)
 
     if not supabase:
         print(f"\n[SIMULAÇÃO] {acao} | Preço: {preco} | Justificativa: {justificativa}")
