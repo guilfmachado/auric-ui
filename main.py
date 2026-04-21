@@ -365,11 +365,11 @@ def atualizar_saldo_supabase() -> None:
                 f"tipo={type(total).__name__}"
             )
             return
-        raw_usdt = total.get("USDT")
-        if raw_usdt is None:
-            print("⚠️ atualizar_saldo_supabase: total['USDT'] ausente no balance futures.")
+        raw_usdc = total.get("USDC")
+        if raw_usdc is None:
+            print("⚠️ atualizar_saldo_supabase: total['USDC'] ausente no balance futures.")
             return
-        saldo = float(raw_usdt)
+        saldo = float(raw_usdc)
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ atualizar_saldo_supabase (Binance): {e}")
         return
@@ -382,8 +382,8 @@ def atualizar_saldo_supabase() -> None:
     lev = float(_alavancagem_cfg)
     notional_ref = float(saldo) * rf * lev
     print(
-        f"💰 [WALLET] Position sizing (futuros): {saldo:.4f} USDT (margem) × "
-        f"risk={rf*100:.1f}% × lev={lev:g}x → notional_ref≈{notional_ref:.2f} USDT "
+        f"💰 [WALLET] Position sizing (futuros): {saldo:.4f} USDC (margem) × "
+        f"risk={rf*100:.1f}% × lev={lev:g}x → notional_ref≈{notional_ref:.2f} USDC "
         "(qty base ≈ notional / preço ticker)."
     )
 

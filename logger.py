@@ -25,6 +25,7 @@ TABELA_LOGS = "logs"
 TABELA_WALLET_STATUS = "wallet_status"
 TABELA_CONFIG = "config"
 COLUNA_USDT_BALANCE = "usdt_balance"
+COLUNA_USDC_BALANCE = "usdc_balance"
 
 
 def obter_bot_ativo() -> bool:
@@ -130,6 +131,7 @@ def persistir_saldo_usdt(saldo: float, *, row_id: int = 1) -> None:
     v = float(saldo)
     payload = {
         "id": row_id,
+        COLUNA_USDC_BALANCE: v,
         COLUNA_USDT_BALANCE: v,
         "updated_at": now,
     }
@@ -140,7 +142,7 @@ def persistir_saldo_usdt(saldo: float, *, row_id: int = 1) -> None:
         ).execute()
         print(
             f"💰 [WALLET] Supabase {TABELA_WALLET_STATUS} upsert: "
-            f"{COLUNA_USDT_BALANCE}={v:.4f} USDT (id={row_id})"
+            f"{COLUNA_USDC_BALANCE}={v:.4f} USDC (id={row_id})"
         )
     except Exception as e:
         print(f"⚠️ persistir_saldo_usdt — {TABELA_WALLET_STATUS} (Supabase): {e}")

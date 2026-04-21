@@ -366,19 +366,22 @@ def _entrar_limite_com_chase_futuros(
                 print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
                 continue
             try:
+                time.sleep(0.2)  # backoff curto para evitar spam de API em rejeições encadeadas
                 market = ex.market(simbolo)
                 tick = float(
                     (((market.get("limits") or {}).get("price") or {}).get("min"))
                     or 0.01
                 )
+                tick_steps = 2 if (rnd % 2 == 1) else 3
                 preco_aj = (
-                    max(tick, float(preco_limite) - tick)
+                    max(tick, float(preco_limite) - (tick * tick_steps))
                     if str(side).lower() == "buy"
-                    else float(preco_limite) + tick
+                    else float(preco_limite) + (tick * tick_steps)
                 )
                 preco_aj = float(ex.price_to_precision(simbolo, preco_aj))
                 print(
-                    f"{_TAG} ⚠️ Rejeição Post-Only; retry com 1 tick ({preco_limite} -> {preco_aj})."
+                    f"{_TAG} ⚠️ Rejeição Post-Only; retry com {tick_steps} ticks "
+                    f"({preco_limite} -> {preco_aj})."
                 )
                 order = ex.create_order(
                     simbolo,
@@ -389,7 +392,11 @@ def _entrar_limite_com_chase_futuros(
                     params_order,
                 )
             except ccxt.BaseError as e2:
-                print(f"{_TAG} ❌ Erro no retry GTX 1 tick: {e2}", file=sys.stderr)
+                print(f"{_TAG} ❌ Erro no retry GTX dinâmico: {e2}", file=sys.stderr)
+                if rnd >= cap:
+                    msg = "OPORTUNIDADE PERDIDA - VOLATILIDADE ALTA"
+                    print(f"{_TAG} ⚠️ [{msg}] {nome_lado} após {cap} tentativas GTX.")
+                    raise RuntimeError(f"{_TAG} {msg}") from e2
                 continue
 
         oid = order.get("id")
@@ -442,9 +449,9 @@ def _entrar_limite_com_chase_futuros(
             f"(qty_left={qty_left})..."
         )
 
-    raise RuntimeError(
-        f"{_TAG} Entrada LIMIT: esgotadas {cap} tentativas de chase."
-    )
+    msg = "OPORTUNIDADE PERDIDA - VOLATILIDADE ALTA"
+    print(f"{_TAG} ⚠️ [{msg}] {nome_lado} após {cap} tentativas GTX.")
+    raise RuntimeError(f"{_TAG} {msg}")
 
 
 def _log_liquidacao_estimada(
