@@ -200,6 +200,7 @@ def _montar_prompt_completo_claude(
     ref_xgboost: str | None = None,
     direcao_sugerida: str = "LONG",
     bloco_tecnico_prioritario: str | None = None,
+    micro_estrutura_posicionamento: dict[str, Any] | None = None,
 ) -> str:
     base = _prompt_sistema_claude(direcao_sugerida)
     if bloco_tecnico_prioritario and str(bloco_tecnico_prioritario).strip():
@@ -214,6 +215,21 @@ def _montar_prompt_completo_claude(
     )
     if ref_xgboost:
         bloco += "\n\n" + ref_xgboost
+    if micro_estrutura_posicionamento:
+        fr = micro_estrutura_posicionamento.get("funding_rate")
+        lsr = micro_estrutura_posicionamento.get("long_short_ratio")
+        fr_txt = "None" if fr is None else f"{float(fr):.8f}"
+        lsr_txt = "None" if lsr is None else f"{float(lsr):.6f}"
+        bloco += (
+            "\n\n📈 MICRO-ESTRUTURA E POSICIONAMENTO\n"
+            f"- funding_rate: {fr_txt}\n"
+            f"- long_short_ratio: {lsr_txt}\n"
+            "Atenção: Use o Funding Rate e o Long/Short Ratio como indicadores contrários. "
+            "Se o Funding Rate estiver excessivamente positivo e o Long/Short Ratio for alto, "
+            "significa que o varejo está super-alavancado em Longs. Use isso para aumentar o peso "
+            "de um VETO ou procurar divergências para SHORT. Se os dados vierem como None, ignore "
+            "esta métrica no ciclo atual."
+        )
     bloco += (
         "\n\nResponde agora somente com o objeto JSON pedido acima "
         "(cinco chaves, incluindo posicao_recomendada)."
@@ -273,6 +289,7 @@ def analisar_sentimento_mercado(
     verbose: bool = True,
     bloco_indicadores: str | None = None,
     bloco_tecnico_prioritario: str | None = None,
+    micro_estrutura_posicionamento: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Replicate (Claude 4.5 por omissão).
@@ -320,6 +337,7 @@ def analisar_sentimento_mercado(
         ref_xgboost=ref_xg,
         direcao_sugerida=d,
         bloco_tecnico_prioritario=ta_block,
+        micro_estrutura_posicionamento=micro_estrutura_posicionamento,
     )
 
     model_slug = REPLICATE_MODEL

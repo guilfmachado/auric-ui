@@ -35,6 +35,8 @@ _FEATURES_LOG_DEFAULTS: dict[str, Any] = {
     "book_imbalance": None,
     "hora_do_dia": None,
     "atr_14": None,
+    "funding_rate": None,
+    "long_short_ratio": None,
 }
 
 
@@ -45,6 +47,8 @@ def configurar_features_log_ciclo(
     book_imbalance: float | None = None,
     hora_do_dia: int | None = None,
     atr_14: float | None = None,
+    funding_rate: float | None = None,
+    long_short_ratio: float | None = None,
 ) -> None:
     """Atualiza defaults de features para os próximos `registrar_log_trade`."""
     global _FEATURES_LOG_DEFAULTS
@@ -54,6 +58,8 @@ def configurar_features_log_ciclo(
         "book_imbalance": book_imbalance,
         "hora_do_dia": hora_do_dia,
         "atr_14": atr_14,
+        "funding_rate": funding_rate,
+        "long_short_ratio": long_short_ratio,
     }
 
 
@@ -289,6 +295,8 @@ def registrar_log_trade(
     book_imbalance: float | None = None,
     hora_do_dia: int | None = None,
     atr_14: float | None = None,
+    funding_rate: float | None = None,
+    long_short_ratio: float | None = None,
 ):
     """
     INSERT na tabela `logs` no Supabase.
@@ -331,6 +339,14 @@ def registrar_log_trade(
         ),
         "atr_14": (
             atr_14 if atr_14 is not None else _FEATURES_LOG_DEFAULTS["atr_14"]
+        ),
+        "funding_rate": (
+            funding_rate if funding_rate is not None else _FEATURES_LOG_DEFAULTS["funding_rate"]
+        ),
+        "long_short_ratio": (
+            long_short_ratio
+            if long_short_ratio is not None
+            else _FEATURES_LOG_DEFAULTS["long_short_ratio"]
         ),
     }
     if justificativa_ia is not None:

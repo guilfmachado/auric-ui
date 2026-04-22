@@ -10,6 +10,10 @@ import os
 import sys
 import time
 import math
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any
 
 import ccxt
@@ -227,6 +231,81 @@ def criar_exchange_binance() -> ccxt.binance:
 def _simbolo_para_rest(symbol: str) -> str:
     s = str(symbol or "").strip().upper().replace(":USDC", "").replace(":USDT", "")
     return s.replace("/", "")
+
+
+def obter_funding_rate(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> float | None:
+    """
+    Funding rate atual (premiumIndex) para o perp do símbolo.
+    Em erro (timeout/rate limit/rede/API), devolve None.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym_rest = _simbolo_para_rest(simbolo)
+    try:
+        # CCXT implicit endpoint Binance Futures: /fapi/v1/premiumIndex
+        data = ex.fapiPublicGetPremiumIndex({"symbol": sym_rest})  # type: ignore[attr-defined]
+        fr = data.get("lastFundingRate") if isinstance(data, dict) else None
+        if fr is None:
+            return None
+        return float(fr)
+    except Exception:
+        # Fallback HTTP direto (mesmo endpoint), com timeout curto.
+        try:
+            url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym_rest}"
+            with urllib.request.urlopen(url, timeout=3.0) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                data = json.loads(body) if body else {}
+            fr = data.get("lastFundingRate") if isinstance(data, dict) else None
+            if fr is None:
+                return None
+            return float(fr)
+        except Exception as e_fr:  # noqa: BLE001
+            print(f"{_TAG} ⚠️ funding_rate indisponível ({sym_rest}): {e_fr}")
+            return None
+
+
+def obter_long_short_ratio_global(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+    *,
+    period: str = "5m",
+) -> float | None:
+    """
+    Global Long/Short Account Ratio (Binance Futures Data API).
+    Em erro (timeout/rate limit/rede/API), devolve None.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym_rest = _simbolo_para_rest(simbolo)
+    params = {"symbol": sym_rest, "period": period, "limit": 1}
+    try:
+        # CCXT implicit endpoint Binance Futures Data:
+        # /futures/data/globalLongShortAccountRatio
+        rows = ex.fapiDataGetGlobalLongShortAccountRatio(params)  # type: ignore[attr-defined]
+        if isinstance(rows, list) and rows:
+            ratio = rows[-1].get("longShortRatio")
+            if ratio is None:
+                return None
+            return float(ratio)
+        return None
+    except Exception:
+        # Fallback HTTP direto
+        try:
+            qs = urllib.parse.urlencode(params)
+            url = f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio?{qs}"
+            with urllib.request.urlopen(url, timeout=3.0) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                rows = json.loads(body) if body else []
+            if isinstance(rows, list) and rows:
+                ratio = rows[-1].get("longShortRatio")
+                if ratio is None:
+                    return None
+                return float(ratio)
+            return None
+        except Exception as e_lsr:  # noqa: BLE001
+            print(f"{_TAG} ⚠️ long_short_ratio indisponível ({sym_rest}): {e_lsr}")
+            return None
 
 
 def get_price_via_rest(symbol: str = "ETHUSDC") -> dict[str, float]:

@@ -2019,6 +2019,16 @@ def rodar_ciclo(modo: str) -> None:
     ex = ex_mod.criar_exchange_binance()
     try:
         atr_14 = _atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo)
+        funding_rate = (
+            executor_futures.obter_funding_rate(SYMBOL_TRADE, ex)
+            if modo == "FUTURES"
+            else None
+        )
+        long_short_ratio = (
+            executor_futures.obter_long_short_ratio_global(SYMBOL_TRADE, ex)
+            if modo == "FUTURES"
+            else None
+        )
         spread_boot, _ = _features_dataset_intraday(
             best_bid=float(_best_bid_ws or 0.0),
             best_ask=float(_best_ask_ws or 0.0),
@@ -2031,6 +2041,8 @@ def rodar_ciclo(modo: str) -> None:
             book_imbalance=None,
             hora_do_dia=int(datetime.now(timezone.utc).hour),
             atr_14=atr_14,
+            funding_rate=funding_rate,
+            long_short_ratio=long_short_ratio,
         )
     except Exception:  # noqa: BLE001
         logger.configurar_features_log_ciclo(
@@ -2039,6 +2051,8 @@ def rodar_ciclo(modo: str) -> None:
             book_imbalance=None,
             hora_do_dia=None,
             atr_14=None,
+            funding_rate=None,
+            long_short_ratio=None,
         )
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
@@ -2235,12 +2249,24 @@ def rodar_ciclo(modo: str) -> None:
             vol_bids=_safe_float((obp or {}).get("bid_volume_1pct")),
             vol_asks=_safe_float((obp or {}).get("ask_volume_1pct")),
         )
+        funding_rate = (
+            executor_futures.obter_funding_rate(SYMBOL_TRADE, ex)
+            if modo == "FUTURES"
+            else None
+        )
+        long_short_ratio = (
+            executor_futures.obter_long_short_ratio_global(SYMBOL_TRADE, ex)
+            if modo == "FUTURES"
+            else None
+        )
         logger.configurar_features_log_ciclo(
             dist_ema200_pct=dist_ema200_pct,
             spread_atual=spread_atual,
             book_imbalance=book_imbalance,
             hora_do_dia=int(datetime.now(timezone.utc).hour),
             atr_14=_atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo),
+            funding_rate=funding_rate,
+            long_short_ratio=long_short_ratio,
         )
     except Exception:  # noqa: BLE001
         logger.configurar_features_log_ciclo(
@@ -2249,6 +2275,8 @@ def rodar_ciclo(modo: str) -> None:
             book_imbalance=None,
             hora_do_dia=int(datetime.now(timezone.utc).hour),
             atr_14=None,
+            funding_rate=None,
+            long_short_ratio=None,
         )
 
     try:
@@ -2519,6 +2547,14 @@ def rodar_ciclo(modo: str) -> None:
     snap_log = {**snap, "prob_ml": probabilidade, "auric_price_action": pa_bundle}
     if confluencia is not None:
         snap_log["confluencia"] = confluencia
+    snap_log["funding_rate"] = (
+        executor_futures.obter_funding_rate(SYMBOL_TRADE, ex) if modo == "FUTURES" else None
+    )
+    snap_log["long_short_ratio"] = (
+        executor_futures.obter_long_short_ratio_global(SYMBOL_TRADE, ex)
+        if modo == "FUTURES"
+        else None
+    )
 
     contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
@@ -2538,6 +2574,10 @@ def rodar_ciclo(modo: str) -> None:
             direcao_sugerida=direcao_sugerida,
             verbose=False,
             bloco_tecnico_prioritario=bloco_ta,
+            micro_estrutura_posicionamento={
+                "funding_rate": snap_log.get("funding_rate"),
+                "long_short_ratio": snap_log.get("long_short_ratio"),
+            },
         )
     else:
         _metric_inc("claude_rate_limited", 1)
