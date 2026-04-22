@@ -1,10 +1,27 @@
 import { cn } from "@/lib/utils";
 
+const ACAO_LABEL_PT: Record<string, string> = {
+  HYBRID_BE_TRAILING: "Movimentação de stop (BE + trailing)",
+  PARTIAL_TP_50: "Take profit parcial (~50%)",
+};
+
+/**
+ * Rótulo curto para a coluna de logs; mantém o código canónico em `title` na UI.
+ */
+export function formatAcaoTomadaDisplay(acao: string | null | undefined): string {
+  if (acao == null || acao.trim() === "") return "—";
+  const key = acao.trim().toUpperCase();
+  return ACAO_LABEL_PT[key] ?? acao;
+}
+
 /**
  * Normaliza ações do bot para exibição BUY / SELL / HOLD.
  */
 export function mapActionToBadge(acao: string): "BUY" | "SELL" | "HOLD" {
   const u = acao.toUpperCase();
+  if (u === "HYBRID_BE_TRAILING" || u === "PARTIAL_TP_50") {
+    return "HOLD";
+  }
   if (u === "MONITORANDO" || u.includes("HOLD_VOL")) {
     return "HOLD";
   }
@@ -34,6 +51,12 @@ export function mapActionToBadge(acao: string): "BUY" | "SELL" | "HOLD" {
 /** Classes Tailwind para badge compacto da ação bruta (ex.: VETO_RSI, ABRE_SHORT_LIMIT). */
 export function actionBadgeClass(acao: string): string {
   const u = acao.toUpperCase();
+  if (u === "HYBRID_BE_TRAILING" || u === "PARTIAL_TP_50") {
+    return cn(
+      "border-amber-500/40 bg-amber-500/12 text-amber-200/95",
+      "shadow-[0_0_12px_rgba(251,191,36,0.1)]"
+    );
+  }
   if (u.includes("ERRO") || u.includes("FAIL")) {
     return "border-orange-500/50 bg-orange-950/50 text-orange-300";
   }

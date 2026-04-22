@@ -13,7 +13,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { actionBadgeClass, mapActionToBadge } from "@/lib/auric/map-action";
+import {
+  actionBadgeClass,
+  formatAcaoTomadaDisplay,
+  mapActionToBadge,
+} from "@/lib/auric/map-action";
 import type { LogRow } from "@/lib/types/auric";
 import { toMlProb01 } from "@/lib/auric/coerce-metrics";
 import { cn } from "@/lib/utils";
@@ -134,8 +138,9 @@ export function LogsTable({ rows, maxRows = 5, isLoading }: Props) {
               ) : (
                 <AnimatePresence initial={false} mode="popLayout">
                   {rows.map((row) => {
-                    const badge = mapActionToBadge(row.acao_tomada);
+                    const badge = mapActionToBadge(row.acao_tomada ?? "");
                     const ac = row.acao_tomada ?? "—";
+                    const acDisplay = formatAcaoTomadaDisplay(row.acao_tomada);
                     return (
                       <motion.tr
                         key={row.id}
@@ -183,7 +188,7 @@ export function LogsTable({ rows, maxRows = 5, isLoading }: Props) {
                               )}
                               title={ac}
                             >
-                              {ac}
+                              {acDisplay}
                             </span>
                           </div>
                         </TableCell>
