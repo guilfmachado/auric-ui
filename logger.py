@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -366,7 +367,9 @@ def registrar_log_trade(
         resposta = supabase.table(TABELA_LOGS).insert(dados_log).execute()
         print(f"💾 Log salvo com sucesso! ID: {resposta.data[0]['id']}")
     except Exception as e:
-        print(f"❌ Erro ao salvar no Supabase: {e}")
+        print(f"❌ ERRO CRÍTICO AO SALVAR LOG: {e}", flush=True)
+        print(f"❌ ERRO CRÍTICO AO SALVAR LOG — chaves do payload: {list(dados_log.keys())}", flush=True)
+        traceback.print_exc()
 
 # Teste rápido se rodar o arquivo diretamente
 if __name__ == "__main__":

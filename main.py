@@ -2191,6 +2191,12 @@ def rodar_ciclo(modo: str) -> None:
         f"    ML P(alta)≥{WAKE_FILTER_LONG_MIN:.2f} (LONG) ou P(alta)≤{WAKE_FILTER_SHORT_MAX:.2f} (SHORT) "
         "→ Hub → Brain → posicao_recomendada."
     )
+    hora_do_dia_cycle = int(datetime.now(timezone.utc).hour)
+    spread_atual: float | None = None
+    book_imbalance: float | None = None
+    atr_14_cycle: float | None = None
+    funding_rate: float | None = None
+    long_short_ratio: float | None = None
     macro = _detectar_tendencia_macro_ema200_15m(
         ex,
         simbolo=SYMBOL_TRADE,
@@ -2259,12 +2265,13 @@ def rodar_ciclo(modo: str) -> None:
             if modo == "FUTURES"
             else None
         )
+        atr_14_cycle = _atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo)
         logger.configurar_features_log_ciclo(
             dist_ema200_pct=dist_ema200_pct,
             spread_atual=spread_atual,
             book_imbalance=book_imbalance,
-            hora_do_dia=int(datetime.now(timezone.utc).hour),
-            atr_14=_atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo),
+            hora_do_dia=hora_do_dia_cycle,
+            atr_14=atr_14_cycle,
             funding_rate=funding_rate,
             long_short_ratio=long_short_ratio,
         )
@@ -2273,7 +2280,7 @@ def rodar_ciclo(modo: str) -> None:
             dist_ema200_pct=dist_ema200_pct,
             spread_atual=None,
             book_imbalance=None,
-            hora_do_dia=int(datetime.now(timezone.utc).hour),
+            hora_do_dia=hora_do_dia_cycle,
             atr_14=None,
             funding_rate=None,
             long_short_ratio=None,
@@ -2457,25 +2464,39 @@ def rodar_ciclo(modo: str) -> None:
             "macro_allow_dir": macro_allow,
             "macro_ema200": ema200_v,
         }
-        logger.registrar_log_trade(
-            par_moeda=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento="NEUTRAL",
-            acao="VETO_TENDENCIA_EMA200",
-            justificativa=(
-                "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
-                f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
-            ),
-            contexto_raw=indicators.formatar_log_contexto_raw(
+        try:
+            ctx_veto = indicators.formatar_log_contexto_raw(
                 "VETO_TENDENCIA_EMA200 por Chop Zone (EMA200 15m).",
                 snap_veto,
-            ),
-            justificativa_ia=(
-                "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
-                f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
-            ),
-        )
+            )
+        except Exception:
+            ctx_veto = None
+        try:
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento="NEUTRAL",
+                acao="VETO_TENDENCIA_EMA200",
+                justificativa=(
+                    "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
+                    f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
+                ),
+                contexto_raw=ctx_veto,
+                justificativa_ia=(
+                    "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
+                    f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
+                ),
+                dist_ema200_pct=dist_ema200_pct,
+                spread_atual=spread_atual,
+                book_imbalance=book_imbalance,
+                hora_do_dia=hora_do_dia_cycle,
+                atr_14=atr_14_cycle,
+                funding_rate=funding_rate,
+                long_short_ratio=long_short_ratio,
+            )
+        except Exception as e_veto:  # noqa: BLE001
+            print(f"⚠️ [VETO_TENDENCIA_EMA200] Falha ao salvar log: {e_veto}")
         return
 
     if macro_allow in ("LONG", "SHORT") and direcao_sugerida != macro_allow:
@@ -2491,25 +2512,39 @@ def rodar_ciclo(modo: str) -> None:
             "macro_ema200": ema200_v,
             "direcao_sugerida": direcao_sugerida,
         }
-        logger.registrar_log_trade(
-            par_moeda=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento="NEUTRAL",
-            acao="VETO_TENDENCIA_EMA200",
-            justificativa=(
-                f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
-                f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
-            ),
-            contexto_raw=indicators.formatar_log_contexto_raw(
+        try:
+            ctx_veto = indicators.formatar_log_contexto_raw(
                 "VETO_TENDENCIA_EMA200 por direção oposta ao filtro macro EMA200 15m.",
                 snap_veto,
-            ),
-            justificativa_ia=(
-                f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
-                f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
-            ),
-        )
+            )
+        except Exception:
+            ctx_veto = None
+        try:
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento="NEUTRAL",
+                acao="VETO_TENDENCIA_EMA200",
+                justificativa=(
+                    f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                    f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+                ),
+                contexto_raw=ctx_veto,
+                justificativa_ia=(
+                    f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                    f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+                ),
+                dist_ema200_pct=dist_ema200_pct,
+                spread_atual=spread_atual,
+                book_imbalance=book_imbalance,
+                hora_do_dia=hora_do_dia_cycle,
+                atr_14=atr_14_cycle,
+                funding_rate=funding_rate,
+                long_short_ratio=long_short_ratio,
+            )
+        except Exception as e_veto:  # noqa: BLE001
+            print(f"⚠️ [VETO_TENDENCIA_EMA200] Falha ao salvar log: {e_veto}")
         return
 
     print(f"    → direcao_sugerida={direcao_sugerida} (ML vs limiares long/short)")
@@ -2845,20 +2880,30 @@ def rodar_ciclo(modo: str) -> None:
                 f"< {indicators.ADX_LIMIAR_TENDENCIA} sem squeeze BB): não operar "
                 "rompimento na direção do ML — preferir reversão/mean-reversion."
             )
-            logger.registrar_log_trade(
-                par_moeda=SYMBOL_TRADE,
-                preco=preco,
-                prob_ml=probabilidade,
-                sentimento=sent,
-                acao="VETO_ADX_LATERAL",
-                justificativa=(
-                    f"{just_ia} | ADX(14)={adx_s} < {indicators.ADX_LIMIAR_TENDENCIA} "
-                    "sem Bollinger Squeeze — sinal de continuação/tendência desvalorizado."
-                ),
-                contexto_raw=contexto_raw_supabase,
-                justificativa_ia=just_ia,
-                noticias_agregadas=contexto,
-            )
+            try:
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento="NEUTRAL",
+                    acao="VETO_ADX_LATERAL",
+                    justificativa=(
+                        f"{just_ia} | ADX(14)={adx_s} < {indicators.ADX_LIMIAR_TENDENCIA} "
+                        "sem Bollinger Squeeze — sinal de continuação/tendência desvalorizado."
+                    ),
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia,
+                    noticias_agregadas=contexto,
+                    dist_ema200_pct=dist_ema200_pct,
+                    spread_atual=spread_atual,
+                    book_imbalance=book_imbalance,
+                    hora_do_dia=hora_do_dia_cycle,
+                    atr_14=atr_14_cycle,
+                    funding_rate=funding_rate,
+                    long_short_ratio=long_short_ratio,
+                )
+            except Exception as e_veto_adx:  # noqa: BLE001
+                print(f"⚠️ [VETO_ADX_LATERAL] Falha ao salvar log: {e_veto_adx}")
             return
 
     dry_run = os.getenv("AURIC_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
