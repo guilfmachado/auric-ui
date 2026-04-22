@@ -66,7 +66,7 @@ export function useAuricDashboard() {
     id: 1,
     leverage: 3,
     risk_fraction: 0.1,
-    trailing_callback_rate: 0.7,
+    trailing_callback_rate: 0.6,
   });
   const [botConfigLoading, setBotConfigLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -99,7 +99,7 @@ export function useAuricDashboard() {
   /** Falha crítica no fetch inicial ao Supabase (UI de ecrã cheio). */
   const [connectionError, setConnectionError] = useState<Error | null>(null);
 
-  /** `wallet_status` saldo quote (USDC preferencial; fallback USDT). */
+  /** `wallet_status` saldo quote (USDC preferencial; fallback legado). */
   const fetchWalletBalance = useCallback(async () => {
     if (!supabase) {
       setWalletHydrated(true);
@@ -319,7 +319,7 @@ export function useAuricDashboard() {
       id: 1,
       leverage: 3,
       risk_fraction: 0.1,
-      trailing_callback_rate: 0.7,
+      trailing_callback_rate: 0.6,
       updated_at: new Date().toISOString(),
     };
     const ins = await supabase.from("bot_config").upsert(defaults, { onConflict: "id" });
@@ -343,7 +343,7 @@ export function useAuricDashboard() {
         const leverage = Number(next.leverage ?? 3);
         const riskFraction = parseFloat(String(next.risk_fraction ?? 0.1));
         const trailingCallback = parseFloat(
-          String(next.trailing_callback_rate ?? 0.7)
+          String(next.trailing_callback_rate ?? 0.6)
         );
         const payload = {
           leverage,

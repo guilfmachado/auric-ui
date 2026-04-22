@@ -78,7 +78,7 @@ export function TacticalOverridePanel({
   );
   const trailing = Math.max(
     0.1,
-    Math.min(5.0, Number((Number(config.trailing_callback_rate ?? 0.7)).toFixed(1)))
+    Math.min(5.0, Number((Number(config.trailing_callback_rate ?? 0.6)).toFixed(1)))
   );
 
   return (
