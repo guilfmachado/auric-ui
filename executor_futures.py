@@ -1,5 +1,5 @@
 """
-executor_futures — Binance Futures USDT-M (perpétuos), MAINNET via ccxt.
+executor_futures — Binance Futures linear (USDC), MAINNET via ccxt.
 
 Margem isolada e alavancagem configuráveis. Logs em português com tag [MAINNET FUTURES].
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import math
 from typing import Any
 
 import ccxt
@@ -18,25 +19,31 @@ load_dotenv()
 
 _TAG = "[MAINNET FUTURES]"
 QUOTE_ASSET = "USDC"
+_SYMBOL_ENV = str(os.getenv("SYMBOL", "ETHUSDC")).strip().upper()
+MARKET_SYMBOL = "ETH/USDC:USDC" if _SYMBOL_ENV in ("ETHUSDC", "ETH/USDC", "ETH/USDC:USDC") else _SYMBOL_ENV
 
 # Gestão de risco (frações): gatilho de trailing/SL em relação ao preço de entrada.
 LONG_TP = 0.020
 LONG_SL = 0.010
 SHORT_TP = 0.015
 SHORT_SL = 0.008
-TRAILING_CALLBACK_RATE = 0.7  # % de recuo da máxima/mínima após ativação
+TRAILING_CALLBACK_RATE = 0.6  # % de recuo da máxima/mínima após ativação (sweet spot ETH/USDC)
 TRAILING_ACTIVATION_MULTIPLIER = 1.0  # 1.0 = mantém gatilho igual ao antigo TP
+# SL inicial na bolsa = N × (trailing em % expresso como fração de preço). Ex.: trailing 0,7% → SL ~1,05%.
+SL_DISTANCE_VS_TRAILING_MULT = float(os.getenv("AURIC_SL_VS_TRAILING_MULT", "1.5"))
 
 # Alavancagem usada só no log de liquidação aproximada (ajuste em configurar_alavancagem / main).
 ALAVANCAGEM_REF_LOG_PADRAO = 3
 
-# Position sizing: notional USDT = saldo_USDT × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
+# Position sizing: notional USDC = saldo_quote × PERCENTUAL_BANCA × alavancagem; qty = notional / preço.
 # Fallback quando `risk_fraction` não é passado (alinhado a main.RISK_FRACTION_PADRAO em sessão agressiva).
 PERCENTUAL_BANCA = 0.20
 
 # LIMIT + offset vs. livro: compra ref. bid (+0,05%); venda ref. ask (−0,05%).
 # Entradas: timeInForce IOC (sem GTC pendurado — liberta margem). Fechos reduce-only: GTC + chase.
 PRECO_ABERTURA_LIMITE_OFFSET = 0.0005  # 0,05%
+# Nível 3: livro vazio após REST — bid/ask sintéticos em torno de mark/last (USDC).
+SYNTHETIC_BOOK_HALF_SPREAD = 0.05
 
 # Trailing stop: após lucro ≥ este valor, SL vai a break-even e depois segue o preço a TRAILING_SL_DIST_FRAC.
 TRAILING_LUCRO_ATIVACAO_FRAC = 0.01  # 1%
@@ -50,6 +57,139 @@ CHASE_ENTRADA_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_MAX_ROUNDS", "3"))
 # Chase agressivo só para abertura SHORT (ETH a «despencar» — ordem não fica pendurada acima do mercado).
 CHASE_SHORT_TIMEOUT_S = float(os.getenv("AURIC_CHASE_SHORT_TIMEOUT_S", "8"))
 CHASE_SHORT_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_SHORT_MAX_ROUNDS", "6"))
+# Realização parcial: `market` (default) ou `ioc` (LIMIT IOC agressivo).
+PARTIAL_TP_EXECUTION = os.getenv("AURIC_PARTIAL_TP_EXEC", "market").strip().lower()
+
+# ORDER-GUARD (vigia): verificar SL + TP na bolsa no máximo 1×/30s por ciclo agregado.
+ORDER_GUARD_INTERVAL_S = 30.0
+_order_guard_last_monotonic: float = 0.0
+
+
+def reset_protective_order_guard_throttle() -> None:
+    """Repor o throttle do ORDER-GUARD (ex.: ao fechar posição / reset vigia)."""
+    global _order_guard_last_monotonic
+    _order_guard_last_monotonic = 0.0
+
+
+def _order_reduce_only_flag(o: dict[str, Any]) -> bool:
+    if bool(o.get("reduceOnly")):
+        return True
+    info = o.get("info") or {}
+    v = str(info.get("reduceOnly", "")).lower()
+    return v in ("true", "1", "yes")
+
+
+def _order_type_norm(o: dict[str, Any]) -> str:
+    t = str(o.get("type") or "").upper().replace("-", "_")
+    if t:
+        return t
+    info = o.get("info") or {}
+    raw = info.get("type") or info.get("origType") or info.get("orderType") or ""
+    return str(raw).upper().replace("-", "_")
+
+
+def _protective_stop_and_tp_present(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    direcao: str,
+) -> tuple[bool, bool]:
+    """
+    Ordens reduce-only de fecho: LONG → sell; SHORT → buy.
+    SL = STOP_MARKET; TP (vigia Auric) = TRAILING_STOP_MARKET (ou TAKE_PROFIT_MARKET se existir).
+    """
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return False, False
+    need_side = "sell" if d == "LONG" else "buy"
+    has_sl = False
+    has_tp = False
+    try:
+        rows = exchange.fetch_open_orders(simbolo_ccxt)
+    except ccxt.BaseError:
+        return False, False
+    for o in rows:
+        if not _order_reduce_only_flag(o):
+            continue
+        if str(o.get("side") or "").lower() != need_side:
+            continue
+        typ = _order_type_norm(o)
+        if typ == "STOP_MARKET":
+            has_sl = True
+        elif typ in (
+            "TRAILING_STOP_MARKET",
+            "TAKE_PROFIT_MARKET",
+            "TAKE_PROFIT",
+        ):
+            has_tp = True
+    return has_sl, has_tp
+
+
+def check_and_verify_protective_orders(
+    simbolo: str,
+    exchange: ccxt.binance,
+    direcao: str,
+    preco_entrada_ram: float,
+    *,
+    trailing_callback_rate: float,
+    trailing_activation_multiplier: float,
+    sl_break_even: bool = False,
+) -> None:
+    """
+    Redundância em MODO VIGIA: confirma STOP_MARKET (SL) + ordem de TP (TRAILING_STOP_MARKET
+    ou TAKE_PROFIT_MARKET) em aberto; se faltar alguma, recria o par via `assegurar_brackets_apos_reconciliacao`.
+    """
+    global _order_guard_last_monotonic
+    now = time.monotonic()
+    if now - _order_guard_last_monotonic < float(ORDER_GUARD_INTERVAL_S):
+        return
+    _order_guard_last_monotonic = now
+
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    snap = consultar_posicao_futures(simbolo, exchange)
+    if not snap.get("posicao_aberta"):
+        return
+
+    qty = abs(float(snap.get("contratos") or 0.0))
+    if qty <= 0:
+        return
+
+    pe = float(preco_entrada_ram)
+    if pe <= 0:
+        ep = snap.get("entry_price")
+        if ep is not None:
+            try:
+                pe = float(ep)
+            except (TypeError, ValueError):
+                pe = 0.0
+    if pe <= 0:
+        return
+
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return
+
+    has_sl, has_tp = _protective_stop_and_tp_present(exchange, sym, d)
+    if has_sl and has_tp:
+        return
+
+    for tipo, ok in (("Stop Loss", has_sl), ("Take Profit", has_tp)):
+        if ok:
+            continue
+        print(
+            f"🚨 [ORDER-GUARD] Ordem de {tipo} ausente! Recriando para proteção do capital...."
+        )
+
+    assegurar_brackets_apos_reconciliacao(
+        simbolo,
+        exchange,
+        d,
+        qty,
+        pe,
+        trailing_callback_rate=float(trailing_callback_rate),
+        trailing_activation_multiplier=float(trailing_activation_multiplier),
+        source_tag="ORDER_GUARD",
+        sl_break_even=bool(sl_break_even),
+    )
 
 
 def _carregar_chaves() -> tuple[str, str]:
@@ -64,7 +204,7 @@ def _carregar_chaves() -> tuple[str, str]:
 
 def criar_exchange_binance() -> ccxt.binance:
     """
-    Cliente Binance em modo **Futures USDT-M** (defaultType = future), MAINNET.
+    Cliente Binance em modo **Futures linear** (defaultType = future), MAINNET.
     """
     api_key, api_secret = _carregar_chaves()
     exchange = ccxt.binance(
@@ -72,11 +212,179 @@ def criar_exchange_binance() -> ccxt.binance:
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "future"},
+            "options": {
+                "defaultType": "future",
+                "defaultSubType": "linear",
+                "settlement": QUOTE_ASSET,
+                "settle": QUOTE_ASSET,
+            },
         }
     )
     exchange.set_sandbox_mode(False)
     return exchange
+
+
+def _simbolo_para_rest(symbol: str) -> str:
+    s = str(symbol or "").strip().upper().replace(":USDC", "").replace(":USDT", "")
+    return s.replace("/", "")
+
+
+def get_price_via_rest(symbol: str = "ETHUSDC") -> dict[str, float]:
+    """
+    Fallback REST direto (python-binance) para preço + L2 mínimo.
+    Retorna dict com `price`, `bid`, `ask` (0.0 em falha).
+    """
+    api_key, api_secret = _carregar_chaves()
+    try:
+        from binance.client import Client  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        print(f"{_TAG} REST fallback indisponível (python-binance não instalado): {e}")
+        return {"price": 0.0, "bid": 0.0, "ask": 0.0}
+
+    try:
+        # Preferência por CCXT com símbolo perp (ETH/USDC:USDC) para evitar vazio no livro.
+        ex = criar_exchange_binance()
+        sym_ccxt = _resolver_simbolo_perp(ex, symbol)
+        t_ccxt = ex.fetch_ticker(sym_ccxt)
+        ob_ccxt = ex.fetch_order_book(sym_ccxt, limit=5)
+        p_ccxt = float(t_ccxt.get("last") or t_ccxt.get("close") or 0.0)
+        mk_c, lt_c = _extract_mark_and_last_from_ticker(t_ccxt)
+        if p_ccxt <= 0 and mk_c > 0:
+            p_ccxt = mk_c
+        elif p_ccxt <= 0 and lt_c > 0:
+            p_ccxt = lt_c
+        bids_ccxt = (ob_ccxt or {}).get("bids") or []
+        asks_ccxt = (ob_ccxt or {}).get("asks") or []
+        b_ccxt = float(bids_ccxt[0][0]) if bids_ccxt else 0.0
+        a_ccxt = float(asks_ccxt[0][0]) if asks_ccxt else 0.0
+        if p_ccxt > 0:
+            return {"price": p_ccxt, "bid": b_ccxt, "ask": a_ccxt}
+    except Exception:
+        pass
+
+    try:
+        rest_symbol = _simbolo_para_rest(symbol)
+        client = Client(api_key, api_secret)
+        t = client.futures_symbol_ticker(symbol=rest_symbol)
+        ob = client.futures_order_book(symbol=rest_symbol, limit=5)
+        price = float((t or {}).get("price") or 0.0)
+        if price <= 0:
+            try:
+                mp_raw = client.futures_mark_price(symbol=rest_symbol)
+                mp_row: dict[str, Any] = {}
+                if isinstance(mp_raw, list) and mp_raw:
+                    mp_row = mp_raw[0] if isinstance(mp_raw[0], dict) else {}
+                elif isinstance(mp_raw, dict):
+                    mp_row = mp_raw
+                mv = (mp_row or {}).get("markPrice") or (mp_row or {}).get("price")
+                if mv is not None:
+                    price = float(mv)
+            except Exception:
+                pass
+        bids = (ob or {}).get("bids") or []
+        asks = (ob or {}).get("asks") or []
+        best_bid = float(bids[0][0]) if bids else 0.0
+        best_ask = float(asks[0][0]) if asks else 0.0
+        return {"price": price, "bid": best_bid, "ask": best_ask}
+    except Exception as e:  # noqa: BLE001
+        print(f"{_TAG} REST fallback falhou ({symbol}): {e}")
+        return {"price": 0.0, "bid": 0.0, "ask": 0.0}
+
+
+def _extract_mark_and_last_from_ticker(t: dict[str, Any]) -> tuple[float, float]:
+    """Mark price e last (CCXT Binance futures — `info` traz `markPrice`)."""
+    last = float(t.get("last") or t.get("close") or 0.0)
+    mark = 0.0
+    raw_mark = t.get("mark")
+    if raw_mark is not None:
+        try:
+            mark = float(raw_mark)
+        except (TypeError, ValueError):
+            mark = 0.0
+    info = t.get("info") or {}
+    if mark <= 0 and isinstance(info, dict):
+        for key in ("markPrice", "indexPrice", "lastPrice", "p"):
+            v = info.get(key)
+            if v is None:
+                continue
+            try:
+                mf = float(v)
+                if mf > 0:
+                    mark = mf
+                    break
+            except (TypeError, ValueError):
+                pass
+    if last <= 0 and isinstance(info, dict):
+        for key in ("lastPrice", "c"):
+            v = info.get(key)
+            if v is None:
+                continue
+            try:
+                lf = float(v)
+                if lf > 0:
+                    last = lf
+                    break
+            except (TypeError, ValueError):
+                pass
+    return mark, last
+
+
+def _synthetic_book_level3(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    ticker: dict[str, Any] | None = None,
+    *,
+    emit_log: bool = True,
+) -> tuple[float, float, float] | None:
+    """
+    Last resort: markPrice (preferido) ou lastPrice → bid = ref − 0.05, ask = ref + 0.05.
+    Devolve (bid, ask, ref) com ref = preço de referência usado.
+    Se `ticker` for passado (ex.: primeiro fetch_ticker), evita round-trip extra à API.
+    """
+    t: dict[str, Any] | None = ticker
+    if t is None:
+        try:
+            t = exchange.fetch_ticker(simbolo_ccxt)
+        except Exception:
+            return None
+    mk, lt = _extract_mark_and_last_from_ticker(t)
+    ref = mk if mk > 0 else (lt if lt > 0 else 0.0)
+    if ref <= 0:
+        return None
+    h = float(SYNTHETIC_BOOK_HALF_SPREAD)
+    bid = ref - h
+    ask = ref + h
+    if bid <= 0 or ask <= bid:
+        return None
+    if emit_log:
+        if mk > 0:
+            print(
+                "⚠️ [SYNTHETIC-BOOK] Livro vazio no REST/WS. "
+                "Usando Mark Price como referência para execução."
+            )
+        else:
+            print(
+                "⚠️ [SYNTHETIC-BOOK] Livro vazio no REST/WS. "
+                "Usando Last Price como referência para execução."
+            )
+    return bid, ask, ref
+
+
+def _obter_tick_size(exchange: ccxt.binance, simbolo: str) -> float:
+    m = exchange.market(simbolo)
+    precision = (m.get("precision") or {}).get("price")
+    if precision is not None:
+        return float(10 ** (-int(precision)))
+    price_filter_tick = None
+    filters = (m.get("info") or {}).get("filters")
+    if isinstance(filters, list):
+        for f in filters:
+            if str((f or {}).get("filterType") or "").upper() == "PRICE_FILTER":
+                price_filter_tick = (f or {}).get("tickSize")
+                break
+    if price_filter_tick is not None:
+        return float(price_filter_tick)
+    return 0.01
 
 
 def _resolver_simbolo_perp(exchange: ccxt.binance, simbolo: str) -> str:
@@ -84,6 +392,9 @@ def _resolver_simbolo_perp(exchange: ccxt.binance, simbolo: str) -> str:
     Converte ETH/USDC no símbolo unificado do perpétuo linear (ex.: ETH/USDC:USDC).
     """
     exchange.load_markets()
+    s_norm = str(simbolo or "").strip().upper()
+    if s_norm in ("ETHUSDC", "ETH/USDC", "ETH/USDC:USDC"):
+        simbolo = MARKET_SYMBOL
     if simbolo in exchange.markets:
         m = exchange.markets[simbolo]
         if m.get("swap") and m.get("linear"):
@@ -104,7 +415,7 @@ def configurar_alavancagem(
     exchange: ccxt.binance | None = None,
 ) -> None:
     """
-    Define margem **isolada** e alavancagem no contrato (USDT-M).
+    Define margem **isolada** e alavancagem no contrato linear.
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
@@ -128,7 +439,7 @@ def notional_usdt_futuros_position_sizing(
     *,
     risk_fraction: float | None = None,
 ) -> float:
-    """Notional alvo: saldo USDT (margem futuros) × risk_fraction × alavancagem."""
+    """Notional alvo: saldo USDC (margem futuros) × risk_fraction × alavancagem."""
     saldo = obter_saldo_usdt_margem(exchange)
     rf = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
     if rf <= 0:
@@ -204,7 +515,7 @@ def _quantidade_base_a_partir_de_usd(
     quantidade_usd: float,
 ) -> float:
     """
-    Converte notional em USDT para quantidade na base (contratos ETH), com precisão.
+    Converte notional em USDC para quantidade na base (contratos ETH), com precisão.
     Equivale a (notional_usd / preco_atual), com `amount_to_precision`.
     """
     if quantidade_usd <= 0:
@@ -226,12 +537,54 @@ def _preco_referencia_ultimo(exchange: ccxt.binance, simbolo: str) -> float:
     return preco
 
 
+def _auto_heal_orderbook_via_rest(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+) -> tuple[float, float, float] | None:
+    """
+    REST (CCXT + fallback) quando o livro/ticker vêm zerados; depois Nível 3 (mark/last ±0,05).
+    Devolve (bid, ask, last_ref) ou None se não existir preço de referência.
+    """
+    print(
+        "🔄 [AUTO-HEALING] WebSocket zerado, recuperando dados via REST para entrada automática..."
+    )
+    rest_sym = _simbolo_para_rest(simbolo_ccxt)
+    data = get_price_via_rest(rest_sym)
+    price = float(data.get("price") or 0.0)
+    best_bid = float(data.get("bid") or 0.0)
+    best_ask = float(data.get("ask") or 0.0)
+    if price > 0 and best_bid > 0 and best_ask > 0:
+        return best_bid, best_ask, price
+
+    synth = _synthetic_book_level3(exchange, simbolo_ccxt)
+    if synth is not None:
+        return synth
+
+    if price > 0:
+        tick = _obter_tick_size(exchange, simbolo_ccxt)
+        return max(0.0, price - tick), price + tick, price
+
+    diag_bid, diag_ask, diag_last = best_bid, best_ask, price
+    try:
+        tf = exchange.fetch_ticker(simbolo_ccxt)
+        diag_bid = float(tf.get("bid") or 0.0)
+        diag_ask = float(tf.get("ask") or 0.0)
+        diag_last = float(tf.get("last") or tf.get("close") or 0.0)
+    except Exception:
+        pass
+    last_price = float(diag_last)
+    print(f"[DEBUG] Abortado: bid={diag_bid}, ask={diag_ask}, last={last_price}")
+    return None
+
+
 def _preco_limite_limit_offset_book(
     exchange: ccxt.binance,
     simbolo: str,
     side: str,
     *,
     offset_frac: float | None = None,
+    force_reference_price: float | None = None,
+    is_manual_force: bool = False,
 ) -> tuple[float, float, float, float]:
     """
     Preço LIMIT com offset 0,05% a partir do livro:
@@ -244,18 +597,55 @@ def _preco_limite_limit_offset_book(
     bid = float(ticker.get("bid") or 0.0)
     ask = float(ticker.get("ask") or 0.0)
     last = float(ticker.get("last") or ticker.get("close") or 0.0)
+    if bid > 0 and ask > 0:
+        pass
+    elif is_manual_force:
+        ref = float(force_reference_price or last or 0.0)
+        used_synth_book = False
+        if ref <= 0:
+            healed_m = _synthetic_book_level3(exchange, simbolo, ticker=ticker, emit_log=True)
+            if healed_m is not None:
+                bid, ask, last = healed_m
+                ref = float(last)
+                used_synth_book = True
+            if ref <= 0:
+                msg = "❌ [DATA-ERROR] Orderbook zerado. Abortando entrada para evitar preço inválido."
+                print(msg, file=sys.stderr)
+                last_price = float(last)
+                print(f"[DEBUG] Abortado: bid={bid}, ask={ask}, last={last_price}")
+                raise RuntimeError(msg)
+        if not used_synth_book:
+            bid = max(0.0, ref - 0.01)
+            ask = ref + 0.01
+        print(
+            "⚠️ [FORCE-BYPASS] Orderbook zerado, usando Preço WS como referência para não travar a execução."
+        )
+    else:
+        syn_first = _synthetic_book_level3(exchange, simbolo, ticker=ticker, emit_log=True)
+        if syn_first is not None:
+            bid, ask, last = syn_first
+        else:
+            healed = _auto_heal_orderbook_via_rest(exchange, simbolo)
+            if healed is None:
+                msg = "❌ [CRITICAL] Dados indisponíveis em todos os canais. Abortando IA."
+                print(msg, file=sys.stderr)
+                raise RuntimeError(msg)
+            bid, ask, last = healed
     s = str(side).strip().lower()
     if s == "buy":
         base = bid if bid > 0 else last
         raw = base * (1.0 + off)
     elif s == "sell":
         base = ask if ask > 0 else last
-        raw = base * (1.0 - off)
+        raw_offset = base * (1.0 - off)
+        raw = max(ask, raw_offset)  # maker-guaranteed: SHORT nunca cruza abaixo do melhor ASK
     else:
         raise ValueError(f"{_TAG} side inválido para LIMIT+offset: {side!r}")
     if base <= 0 or raw <= 0:
+        last_price = float(last)
+        print(f"[DEBUG] Abortado: bid={bid}, ask={ask}, last={last_price}")
         raise RuntimeError(
-            f"{_TAG} bid/ask/last inválidos para {simbolo} (bid={bid}, ask={ask}, last={last})."
+            f"{_TAG} bid/ask/last inválidos para {simbolo} após cálculo de offset."
         )
     limite = float(exchange.price_to_precision(simbolo, raw))
     return limite, base, bid, ask
@@ -320,6 +710,8 @@ def _entrar_limite_com_chase_futuros(
     max_rounds: int | None = None,
     timeout_s: float | None = None,
     reduce_only: bool = False,
+    force_reference_price: float | None = None,
+    is_manual_force: bool = False,
 ) -> dict[str, Any]:
     """
     LIMIT + offset (bid/ask ±0,05%) com protocolo maker-only (GTX / Post-Only).
@@ -341,7 +733,12 @@ def _entrar_limite_com_chase_futuros(
 
     for rnd in range(1, cap + 1):
         preco_limite, base, bid, ask = _preco_limite_limit_offset_book(
-            ex, simbolo, side, offset_frac=PRECO_ABERTURA_LIMITE_OFFSET
+            ex,
+            simbolo,
+            side,
+            offset_frac=PRECO_ABERTURA_LIMITE_OFFSET,
+            force_reference_price=force_reference_price,
+            is_manual_force=is_manual_force,
         )
         ref = "bid" if str(side).lower() == "buy" else "ask"
         ro_txt = ", reduceOnly" if reduce_only else ""
@@ -349,6 +746,7 @@ def _entrar_limite_com_chase_futuros(
             f"{_TAG} [LIMIT+offset {rnd}/{cap}] {nome_lado} {side.upper()} @ {preco_limite} "
             f"qty={qty_left} (ref {ref}={base:.4f}, bid={bid:.4f}, ask={ask:.4f}, {tif}{ro_txt})"
         )
+        print(f"[DEBUG] Spread: {ask - bid:.4f} | Alvo Maker: {preco_limite:.4f}")
 
         try:
             order = ex.create_order(
@@ -363,21 +761,69 @@ def _entrar_limite_com_chase_futuros(
             err = str(e).lower()
             post_only = ("post" in err and "only" in err) or "gtx" in err
             if not post_only:
+                print(f"{_TAG} ❌ [BINANCE-ERROR] {e}", file=sys.stderr)
                 print(f"{_TAG} ❌ Erro no Chase (create_order): {e}", file=sys.stderr)
                 continue
             try:
                 time.sleep(0.2)  # backoff curto para evitar spam de API em rejeições encadeadas
-                market = ex.market(simbolo)
-                tick = float(
-                    (((market.get("limits") or {}).get("price") or {}).get("min"))
-                    or 0.01
-                )
-                tick_steps = 2 if (rnd % 2 == 1) else 3
-                preco_aj = (
-                    max(tick, float(preco_limite) - (tick * tick_steps))
-                    if str(side).lower() == "buy"
-                    else float(preco_limite) + (tick * tick_steps)
-                )
+                tick = _obter_tick_size(ex, simbolo)
+                tick_steps = 1 if (rnd % 2 == 1) else 2
+                if str(side).lower() == "sell":
+                    tkr_rt = ex.fetch_ticker(simbolo)
+                    bid_rt = float(tkr_rt.get("bid") or 0.0)
+                    ask_rt = float(tkr_rt.get("ask") or tkr_rt.get("last") or tkr_rt.get("close") or 0.0)
+                    if bid_rt > 0 and ask_rt > 0:
+                        pass
+                    elif is_manual_force:
+                        ref_rt = float(force_reference_price or 0.0)
+                        last_rt = float(tkr_rt.get("last") or tkr_rt.get("close") or 0.0)
+                        used_synth_rt = False
+                        if ref_rt <= 0:
+                            ref_rt = last_rt
+                        if ref_rt <= 0:
+                            sm_rt = _synthetic_book_level3(ex, simbolo, ticker=tkr_rt, emit_log=True)
+                            if sm_rt is not None:
+                                bid_rt, ask_rt, _ = sm_rt
+                                used_synth_rt = True
+                            else:
+                                msg = (
+                                    "❌ [DATA-ERROR] Orderbook zerado. "
+                                    "Abortando entrada para evitar preço inválido."
+                                )
+                                print(msg, file=sys.stderr)
+                                last_price = float(last_rt)
+                                print(
+                                    f"[DEBUG] Abortado: bid={bid_rt}, ask={ask_rt}, last={last_price}"
+                                )
+                                raise RuntimeError(msg)
+                        if not used_synth_rt:
+                            bid_rt = max(0.0, ref_rt - 0.01)
+                            ask_rt = ref_rt + 0.01
+                        print(
+                            "⚠️ [FORCE-BYPASS] Orderbook zerado, usando Preço WS como referência "
+                            "para não travar a execução."
+                        )
+                    else:
+                        sm_ch = _synthetic_book_level3(ex, simbolo, ticker=tkr_rt, emit_log=True)
+                        if sm_ch is not None:
+                            bid_rt, ask_rt, _ = sm_ch
+                        else:
+                            healed_rt = _auto_heal_orderbook_via_rest(ex, simbolo)
+                            if healed_rt is None:
+                                msg = (
+                                    "❌ [CRITICAL] Dados indisponíveis em todos os canais. "
+                                    "Abortando IA."
+                                )
+                                print(msg, file=sys.stderr)
+                                raise RuntimeError(msg)
+                            bid_rt, ask_rt, _ = healed_rt
+                    off_rt = float(PRECO_ABERTURA_LIMITE_OFFSET)
+                    raw_calc_rt = ask_rt * (1.0 - off_rt)
+                    preco_aj = max(ask_rt + (tick * tick_steps), raw_calc_rt)
+                    print(f"🎯 [MAKER-SYNC] Ajustando preço para ficar acima do Bid: {preco_aj:.2f}")
+                    print(f"[DEBUG] Spread: {ask_rt - bid_rt:.4f} | Alvo Maker: {preco_aj:.4f}")
+                else:
+                    preco_aj = max(tick, float(preco_limite) - (tick * tick_steps))
                 preco_aj = float(ex.price_to_precision(simbolo, preco_aj))
                 print(
                     f"{_TAG} ⚠️ Rejeição Post-Only; retry com {tick_steps} ticks "
@@ -392,6 +838,7 @@ def _entrar_limite_com_chase_futuros(
                     params_order,
                 )
             except ccxt.BaseError as e2:
+                print(f"{_TAG} ❌ [BINANCE-ERROR] {e2}", file=sys.stderr)
                 print(f"{_TAG} ❌ Erro no retry GTX dinâmico: {e2}", file=sys.stderr)
                 if rnd >= cap:
                     msg = "OPORTUNIDADE PERDIDA - VOLATILIDADE ALTA"
@@ -469,13 +916,13 @@ def _log_liquidacao_estimada(
     if str(lado).upper() == "LONG":
         liq = preco_entrada * (1.0 - inv)
         print(
-            f"{_TAG} Liquidação estimada (≈): LONG — preço ~{liq:.4f} USDT "
+            f"{_TAG} Liquidação estimada (≈): LONG — preço ~{liq:.4f} USDC "
             f"| P_entrada×(1−1/L) = {preco_entrada:.4f}×(1−1/{alavancagem:.4f})"
         )
     else:
         liq = preco_entrada * (1.0 + inv)
         print(
-            f"{_TAG} Liquidação estimada (≈): SHORT — preço ~{liq:.4f} USDT "
+            f"{_TAG} Liquidação estimada (≈): SHORT — preço ~{liq:.4f} USDC "
             f"| P_entrada×(1+1/L) = {preco_entrada:.4f}×(1+1/{alavancagem:.4f})"
         )
 
@@ -551,7 +998,7 @@ def cancelar_todas_ordens_abertas(
     exchange: ccxt.binance | None = None,
 ) -> int:
     """
-    Cancela todas as ordens abertas no par (futures USDT-M).
+    Cancela todas as ordens abertas no par (futures linear).
     Chame ao fechar posição para evitar ordens reduce-only órfãs.
     """
     ex = exchange or criar_exchange_binance()
@@ -625,10 +1072,13 @@ def assegurar_brackets_apos_reconciliacao(
     *,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
+    source_tag: str | None = None,
+    sl_break_even: bool = False,
 ) -> None:
     """
     Após detetar posição na Binance sem estado completo no maestro: remove TP/SL reduce-only
-    antigos e recria SL fixo + TRAILING_STOP (modo vigia na bolsa).
+    antigos e recria SL dinâmico (N× trailing) + TRAILING_STOP (modo vigia na bolsa).
+    Se `sl_break_even=True`, o STOP_MARKET de protecção fica no preço de entrada (risco zero).
     """
     d = str(direcao).strip().upper()
     cancelar_ordens_reduce_only_abertas(simbolo, exchange)
@@ -645,6 +1095,7 @@ def assegurar_brackets_apos_reconciliacao(
             float(preco_entrada),
             trailing_callback_rate=trailing_callback_rate,
             trailing_activation_multiplier=trailing_activation_multiplier,
+            sl_break_even=sl_break_even,
         )
     elif d == "SHORT":
         _criar_bracket_short(
@@ -654,17 +1105,55 @@ def assegurar_brackets_apos_reconciliacao(
             float(preco_entrada),
             trailing_callback_rate=trailing_callback_rate,
             trailing_activation_multiplier=trailing_activation_multiplier,
+            sl_break_even=sl_break_even,
         )
     else:
         raise ValueError(f"{_TAG} direcao inválida: {d!r}")
+    if source_tag:
+        print(
+            f"{_TAG} [{source_tag}] Brackets reconciliados com callbackRate="
+            f"{float(trailing_callback_rate) if trailing_callback_rate is not None else float(TRAILING_CALLBACK_RATE):.3f}%."
+        )
 
 
 def _params_reduce_futures() -> dict[str, Any]:
-    """Parâmetros comuns em ordens de fecho na Binance USDT-M."""
+    """Parâmetros comuns em ordens de fecho na Binance Futures linear."""
     return {
         "reduceOnly": True,
         "workingType": "MARK_PRICE",
     }
+
+
+def _sl_frac_from_trailing_callback_pct(cb_rate_pct: float) -> float:
+    """Fração de preço do SL inicial = SL_DISTANCE_VS_TRAILING_MULT × (callbackRate%/100)."""
+    return max(1e-9, (float(cb_rate_pct) / 100.0) * float(SL_DISTANCE_VS_TRAILING_MULT))
+
+
+def _stop_price_break_even_exato(
+    exchange: ccxt.binance,
+    simbolo: str,
+    preco_entrada: float,
+    *,
+    direcao: str,
+) -> float:
+    """
+    Break-even estrito para STOP_MARKET:
+    - LONG (stop de venda): nunca abaixo da entrada (arredonda para cima no tick).
+    - SHORT (stop de compra): nunca acima da entrada (arredonda para baixo no tick).
+    """
+    pe = float(preco_entrada)
+    m = exchange.market(simbolo)
+    prec = m.get("precision", {}) if isinstance(m, dict) else {}
+    p_digits_raw = prec.get("price")
+    if isinstance(p_digits_raw, int) and p_digits_raw >= 0:
+        step = 10.0 ** (-p_digits_raw)
+        if str(direcao).upper() == "LONG":
+            px = math.ceil(pe / step) * step
+        else:
+            px = math.floor(pe / step) * step
+        return float(exchange.price_to_precision(simbolo, px))
+    # Fallback para símbolos sem precisão decimal explícita.
+    return float(exchange.price_to_precision(simbolo, pe))
 
 
 def _criar_bracket_long(
@@ -675,10 +1164,11 @@ def _criar_bracket_long(
     *,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
+    sl_break_even: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Bracket LONG na Binance USDT-M:
-    - STOP_MARKET (SL fixo de proteção inicial)
+    Bracket LONG na Binance Futures linear:
+    - STOP_MARKET (SL inicial = SL_DISTANCE_VS_TRAILING_MULT × trailing %, ou break-even)
     - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
     """
     q = float(exchange.amount_to_precision(simbolo, qty))
@@ -697,8 +1187,21 @@ def _criar_bracket_long(
     if act_mult <= 0:
         act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
 
-    tp_raw = preco_entrada * (1.0 + (LONG_TP * act_mult))  # activationPrice do trailing
-    sl_raw = preco_entrada * (1.0 - LONG_SL)
+    if sl_break_even:
+        tp_raw = float(preco_entrada)
+        sl_raw = _stop_price_break_even_exato(
+            exchange,
+            simbolo,
+            float(preco_entrada),
+            direcao="LONG",
+        )
+        sl_frac = 0.0
+        act_txt = "break-even (entrada)"
+    else:
+        tp_raw = preco_entrada * (1.0 + (LONG_TP * act_mult))  # activationPrice do trailing
+        sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
+        sl_raw = preco_entrada * (1.0 - sl_frac)
+        act_txt = f"+{(LONG_TP * act_mult):.1%}"
     tp_p = float(exchange.price_to_precision(simbolo, tp_raw))
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
@@ -723,11 +1226,19 @@ def _criar_bracket_long(
         None,
         {**p_ro, "stopPrice": sl_p},
     )
-    print(
-        f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (−{LONG_SL:.1%}) + "
-        f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / +{(LONG_TP * act_mult):.1%}, "
-        f"callbackRate={cb_rate:.1f}%), qty={q}"
-    )
+    if sl_break_even:
+        print(
+            f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (BREAK-EVEN entrada) + "
+            f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / {act_txt}, "
+            f"callbackRate={cb_rate:.1f}%), qty={q}"
+        )
+    else:
+        print(
+            f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (−{sl_frac:.3%} = "
+            f"{SL_DISTANCE_VS_TRAILING_MULT:g}× trailing {cb_rate:.3f}%) + "
+            f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / {act_txt}, "
+            f"callbackRate={cb_rate:.1f}%), qty={q}"
+        )
     return ord_trailing, ord_sl
 
 
@@ -739,10 +1250,11 @@ def _criar_bracket_short(
     *,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
+    sl_break_even: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Bracket SHORT na Binance USDT-M:
-    - STOP_MARKET (SL fixo de proteção inicial)
+    Bracket SHORT na Binance Futures linear:
+    - STOP_MARKET (SL inicial = SL_DISTANCE_VS_TRAILING_MULT × trailing %, ou break-even)
     - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
     """
     q = float(exchange.amount_to_precision(simbolo, qty))
@@ -761,8 +1273,21 @@ def _criar_bracket_short(
     if act_mult <= 0:
         act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
 
-    tp_raw = preco_entrada * (1.0 - (SHORT_TP * act_mult))  # activationPrice do trailing
-    sl_raw = preco_entrada * (1.0 + SHORT_SL)
+    if sl_break_even:
+        tp_raw = float(preco_entrada)
+        sl_raw = _stop_price_break_even_exato(
+            exchange,
+            simbolo,
+            float(preco_entrada),
+            direcao="SHORT",
+        )
+        sl_frac = 0.0
+        act_txt = "break-even (entrada)"
+    else:
+        tp_raw = preco_entrada * (1.0 - (SHORT_TP * act_mult))  # activationPrice do trailing
+        sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
+        sl_raw = preco_entrada * (1.0 + sl_frac)
+        act_txt = f"−{(SHORT_TP * act_mult):.1%}"
     tp_p = float(exchange.price_to_precision(simbolo, tp_raw))
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
@@ -787,11 +1312,19 @@ def _criar_bracket_short(
         None,
         {**p_ro, "stopPrice": sl_p},
     )
-    print(
-        f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (+{SHORT_SL:.1%}) + "
-        f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / −{(SHORT_TP * act_mult):.1%}, "
-        f"callbackRate={cb_rate:.1f}%), qty={q}"
-    )
+    if sl_break_even:
+        print(
+            f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (BREAK-EVEN entrada) + "
+            f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / {act_txt}, "
+            f"callbackRate={cb_rate:.1f}%), qty={q}"
+        )
+    else:
+        print(
+            f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (+{sl_frac:.3%} = "
+            f"{SL_DISTANCE_VS_TRAILING_MULT:g}× trailing {cb_rate:.3f}%) + "
+            f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / {act_txt}, "
+            f"callbackRate={cb_rate:.1f}%), qty={q}"
+        )
     return ord_trailing, ord_sl
 
 
@@ -824,7 +1357,7 @@ def obter_saldo_usdt_margem(exchange: ccxt.binance | None = None) -> float:
         bal = ex.fetch_balance(params={"type": "future"})
         return _quote_de_balance_unificado(bal)
     except ccxt.BaseError as e:
-        print(f"{_TAG} Erro ao obter saldo USDT (futures): {e}", file=sys.stderr)
+        print(f"{_TAG} Erro ao obter saldo USDC (futures): {e}", file=sys.stderr)
         raise
 
 
@@ -837,6 +1370,8 @@ def abrir_long_market(
     risk_fraction: float | None = None,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
+    force_reference_price: float | None = None,
+    is_manual_force: bool = False,
 ) -> dict[str, Any]:
     """
     Abre **long** com LIMIT **IOC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
@@ -858,18 +1393,18 @@ def abrir_long_market(
             rf_used = float(PERCENTUAL_BANCA)
     if quantidade_usd <= 0:
         raise ValueError(
-            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
+            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
         )
     amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
     saldo_m = obter_saldo_usdt_margem(ex)
     risk_txt = (
-        f"{rf_used * 100:.1f}% margem USDT"
+        f"{rf_used * 100:.1f}% margem USDC"
         if rf_used is not None
         else "notional override (risk N/A)"
     )
 
     print(
-        f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDT "
+        f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDC "
         f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
         f"chase até {CHASE_ENTRADA_MAX_ROUNDS}×/{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
     )
@@ -881,6 +1416,8 @@ def abrir_long_market(
             amt,
             nome_lado="LONG",
             max_rounds=CHASE_ENTRADA_MAX_ROUNDS,
+            force_reference_price=force_reference_price,
+            is_manual_force=is_manual_force,
         )
         print(f"{_TAG} Long aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
@@ -901,6 +1438,7 @@ def abrir_long_market(
         out["auric_entry_price"] = preco_ent
         return out
     except Exception as e:
+        print(f"{_TAG} ❌ [BINANCE-ERROR] {e}", file=sys.stderr)
         print(f"{_TAG} Erro ao abrir long / bracket: {e}", file=sys.stderr)
         raise
 
@@ -914,6 +1452,8 @@ def abrir_short_market(
     risk_fraction: float | None = None,
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
+    force_reference_price: float | None = None,
+    is_manual_force: bool = False,
 ) -> dict[str, Any]:
     """
     Abre **short** com LIMIT IOC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
@@ -934,18 +1474,18 @@ def abrir_short_market(
             rf_used = float(PERCENTUAL_BANCA)
     if quantidade_usd <= 0:
         raise ValueError(
-            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDT). Verifique saldo em margem."
+            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
         )
     amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
     saldo_m = obter_saldo_usdt_margem(ex)
     risk_txt = (
-        f"{rf_used * 100:.1f}% margem USDT"
+        f"{rf_used * 100:.1f}% margem USDC"
         if rf_used is not None
         else "notional override (risk N/A)"
     )
 
     print(
-        f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDT "
+        f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDC "
         f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
         f"chase SHORT {CHASE_SHORT_MAX_ROUNDS}×/{CHASE_SHORT_TIMEOUT_S:.0f}s "
         f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
@@ -959,6 +1499,8 @@ def abrir_short_market(
             nome_lado="SHORT",
             max_rounds=CHASE_SHORT_MAX_ROUNDS,
             timeout_s=CHASE_SHORT_TIMEOUT_S,
+            force_reference_price=force_reference_price,
+            is_manual_force=is_manual_force,
         )
         print(f"{_TAG} Short aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
@@ -979,6 +1521,7 @@ def abrir_short_market(
         out["auric_entry_price"] = preco_ent
         return out
     except Exception as e:
+        print(f"{_TAG} ❌ [BINANCE-ERROR] {e}", file=sys.stderr)
         print(f"{_TAG} Erro ao abrir short / bracket: {e}", file=sys.stderr)
         raise
 
@@ -1057,6 +1600,67 @@ def fechar_posicao_market(
     return ordem
 
 
+def preco_medio_execucao_ordem(ordem: dict[str, Any] | None, fallback: float) -> float:
+    """Preço médio de execução (ccxt) ou `fallback` (ex.: último tick do ciclo)."""
+    fb = float(fallback)
+    if not ordem:
+        return fb
+    for k in ("average", "price"):
+        v = ordem.get(k)
+        try:
+            fv = float(v)  # type: ignore[arg-type]
+            if fv > 0:
+                return fv
+        except (TypeError, ValueError):
+            continue
+    info = ordem.get("info")
+    if isinstance(info, dict):
+        for k in ("avgPrice", "price", "averagePrice"):
+            raw = info.get(k)
+            try:
+                fv = float(raw)  # type: ignore[arg-type]
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                continue
+    return fb
+
+
+def _roi_fechamento_percentual(direcao: str, preco_entrada: float, preco_saida: float) -> float:
+    """ROI % sobre o preço de entrada (LONG: sobe = +; SHORT: desce = +)."""
+    entry = float(preco_entrada)
+    if entry <= 0:
+        return 0.0
+    px = float(preco_saida)
+    d = str(direcao).strip().upper()
+    if d == "SHORT":
+        return (entry - px) / entry * 100.0
+    if d == "LONG":
+        return (px - entry) / entry * 100.0
+    return 0.0
+
+
+def registrar_trade_performance_fecho(
+    simbolo: str,
+    *,
+    preco_entrada: float,
+    preco_saida: float,
+    direcao: str,
+    exit_type: str,
+) -> None:
+    """Grava `final_roi` (% vs entrada) e `exit_type` na última linha `trades` do símbolo."""
+    try:
+        import logger
+
+        roi = _roi_fechamento_percentual(direcao, preco_entrada, preco_saida)
+        logger.atualizar_ultimo_trade_campos(
+            simbolo,
+            {"final_roi": float(roi), "exit_type": str(exit_type)},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"{_TAG} ⚠️ registrar_trade_performance_fecho (Supabase): {e}")
+
+
 def fechar_posicao_emergencia_market(
     simbolo: str,
     exchange: ccxt.binance | None = None,
@@ -1081,6 +1685,146 @@ def fechar_posicao_emergencia_market(
     return ordem
 
 
+def fechar_parcial_posicao_market(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+    *,
+    frac: float = 0.5,
+    execution: str | None = None,
+) -> dict[str, Any]:
+    """
+    Fecha uma fracção da posição (ex.: 50%) com **MARKET** reduce-only ou **LIMIT IOC**
+    (preço agressivo no livro) conforme `execution` / env `AURIC_PARTIAL_TP_EXEC`.
+    Não cancela ordens reduce-only existentes — o chamador deve recolocar brackets se necessário.
+    """
+    ex = exchange or criar_exchange_binance()
+    snap = consultar_posicao_futures(simbolo, ex)
+    if not snap.get("posicao_aberta"):
+        raise ccxt.InvalidOrder(f"{_TAG} Nenhuma posição aberta para fecho parcial.")
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    qty_full = abs(float(snap.get("contratos") or 0.0))
+    frac_f = max(0.0, min(1.0, float(frac)))
+    qty_close = qty_full * frac_f
+    qty_close = float(ex.amount_to_precision(sym, qty_close))
+    if qty_close <= 0:
+        raise ccxt.InvalidOrder(f"{_TAG} Qty parcial inválida após precisão: {qty_close!r}")
+    if qty_close >= qty_full * 0.99:
+        raise ccxt.InvalidOrder(
+            f"{_TAG} Fecho parcial ≈100% da posição (full={qty_full}, parcial={qty_close}); usar fecho total."
+        )
+    lado = str(snap.get("direcao_posicao") or "LONG").upper()
+    side = "sell" if lado == "LONG" else "buy"
+    mode = (execution or PARTIAL_TP_EXECUTION or "market").strip().lower()
+    p_ro = _params_reduce_futures()
+    if mode == "ioc":
+        try:
+            ob = ex.fetch_order_book(sym, limit=5)
+            bids = (ob or {}).get("bids") or []
+            asks = (ob or {}).get("asks") or []
+            if lado == "LONG":
+                ref = float(bids[0][0]) if bids else 0.0
+                if ref <= 0:
+                    t = ex.fetch_ticker(sym)
+                    ref = float(t.get("bid") or t.get("last") or 0.0)
+                px_raw = ref * 0.999
+            else:
+                ref = float(asks[0][0]) if asks else 0.0
+                if ref <= 0:
+                    t = ex.fetch_ticker(sym)
+                    ref = float(t.get("ask") or t.get("last") or 0.0)
+                px_raw = ref * 1.001
+            if px_raw <= 0:
+                raise ccxt.InvalidOrder(f"{_TAG} IOC parcial: preço de referência inválido.")
+            price = float(ex.price_to_precision(sym, px_raw))
+            return ex.create_order(
+                sym,
+                "limit",
+                side,
+                qty_close,
+                price,
+                {**p_ro, "timeInForce": "IOC"},
+            )
+        except Exception as e_ioc:  # noqa: BLE001
+            print(f"{_TAG} IOC parcial falhou ({e_ioc}); fallback MARKET.", file=sys.stderr)
+    return ex.create_order(sym, "market", side, qty_close, None, p_ro)
+
+
+def executar_saida_hibrida_roi_break_even_trailing(
+    simbolo: str,
+    exchange: ccxt.binance,
+    direcao: str,
+    preco_entrada: float,
+    *,
+    close_frac: float = 0.5,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
+) -> dict[str, Any]:
+    """
+    Saída híbrida (vigia): fecho **MARKET** de `close_frac` da posição; em seguida recoloca
+    brackets só sobre o restante — SL em **break-even** (preço de entrada) e **TRAILING_STOP_MARKET**
+    com `callbackRate` (ex.: 0,6 %) na metade restante.
+    """
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        raise ValueError(f"{_TAG} direcao inválida para saída híbrida: {d!r}")
+    pe = float(preco_entrada)
+    if pe <= 0:
+        raise ValueError(f"{_TAG} preco_entrada inválido para saída híbrida: {preco_entrada!r}")
+
+    cb = (
+        float(trailing_callback_rate)
+        if trailing_callback_rate is not None
+        else float(TRAILING_CALLBACK_RATE)
+    )
+    act_mult = (
+        float(trailing_activation_multiplier)
+        if trailing_activation_multiplier is not None
+        else float(TRAILING_ACTIVATION_MULTIPLIER)
+    )
+
+    ord_p = fechar_parcial_posicao_market(
+        simbolo,
+        exchange,
+        frac=float(close_frac),
+        execution="market",
+    )
+    snap_r = consultar_posicao_futures(simbolo, exchange)
+    qty_r = abs(float(snap_r.get("contratos") or 0.0))
+    if qty_r <= 0:
+        print(
+            f"{_TAG} ⚠️ [HYBRID-EXIT] Fecho parcial executado mas qty restante ≈ 0 — "
+            "sem recolocação de brackets."
+        )
+        return {
+            "ordem_parcial": ord_p,
+            "qty_remaining": 0.0,
+            "trailing_callback_rate": cb,
+        }
+
+    assegurar_brackets_apos_reconciliacao(
+        simbolo,
+        exchange,
+        d,
+        qty_r,
+        pe,
+        trailing_callback_rate=cb,
+        trailing_activation_multiplier=act_mult,
+        source_tag="HYBRID_EXIT",
+        sl_break_even=True,
+    )
+    try:
+        import logger
+
+        logger.atualizar_ultimo_trade_campos(simbolo, {"partial_roi": 0.7})
+    except Exception as e_pr:  # noqa: BLE001
+        print(f"{_TAG} ⚠️ partial_roi Supabase: {e_pr}")
+    return {
+        "ordem_parcial": ord_p,
+        "qty_remaining": float(qty_r),
+        "trailing_callback_rate": float(cb),
+    }
+
+
 def consultar_posicao_futures(
     simbolo: str,
     exchange: ccxt.binance | None = None,
@@ -1101,29 +1845,43 @@ def consultar_posicao_futures(
     lado = ""
     entry_price: float | None = None
     for p in posicoes:
-        c = float(p.get("contracts") or 0)
-        if abs(c) > 0:
-            contratos = c
-            lado = str(p.get("side") or "")
-            ep_raw = p.get("entryPrice")
-            if ep_raw is None or (isinstance(ep_raw, (int, float)) and float(ep_raw) == 0.0):
-                inf = p.get("info") or {}
-                ep_raw = inf.get("entryPrice") or inf.get("avgPrice")
-            if ep_raw is not None:
-                try:
-                    efv = float(ep_raw)
-                    if efv > 0:
-                        entry_price = efv
-                except (TypeError, ValueError):
-                    entry_price = None
-            break
+        info = p.get("info") or {}
+        signed = float(p.get("contracts") or 0.0)
+        pa_raw = info.get("positionAmt")
+        usou_native = False
+        if pa_raw is not None and str(pa_raw).strip() != "":
+            try:
+                pa_f = float(pa_raw)
+                if abs(pa_f) > 1e-18:
+                    signed = pa_f
+                    usou_native = True
+            except (TypeError, ValueError):
+                pass
+        if not usou_native:
+            side_l = str(p.get("side") or "").lower()
+            # CCXT por vezes devolve contracts>0 com side='short' — SHORT exige sinal negativo.
+            if signed > 0 and side_l == "short":
+                signed = -abs(signed)
+
+        if abs(signed) <= 0:
+            continue
+
+        contratos = signed
+        lado = str(p.get("side") or "")
+        ep_raw = p.get("entryPrice")
+        if ep_raw is None or (isinstance(ep_raw, (int, float)) and float(ep_raw) == 0.0):
+            ep_raw = info.get("entryPrice") or info.get("avgPrice")
+        if ep_raw is not None:
+            try:
+                efv = float(ep_raw)
+                if efv > 0:
+                    entry_price = efv
+            except (TypeError, ValueError):
+                entry_price = None
+        break
 
     aberta = abs(contratos) > 0 and abs(contratos) >= (min_amt * 0.5 if min_amt else 1e-12)
-    direcao_pos = (
-        "SHORT"
-        if (str(lado).lower() == "short" or contratos < 0)
-        else "LONG"
-    )
+    direcao_pos = "SHORT" if contratos < 0 else "LONG"
 
     return {
         "base": base,
@@ -1401,7 +2159,7 @@ def consultar_posicao_spot(
     simbolo: str,
     exchange: ccxt.binance | None = None,
 ) -> dict[str, Any]:
-    """Alias: usa posição em **Futures** USDT-M (nome histórico)."""
+    """Alias: usa posição em **Futures** linear (nome histórico)."""
     return consultar_posicao_futures(simbolo, exchange)
 
 
@@ -1412,7 +2170,7 @@ def executar_compra_spot_market(
     alavancagem: float | None = None,
     notional_usdt_override: float | None = None,
 ) -> dict[str, Any]:
-    """Alias: abre **long** a mercado em USDT-M (nome histórico 'Spot')."""
+    """Alias: abre **long** a mercado em Futures linear (nome histórico 'Spot')."""
     return abrir_long_market(
         simbolo,
         exchange,
@@ -1430,16 +2188,16 @@ def executar_venda_spot_total(
 
 
 def obter_saldo_usdt(exchange: ccxt.binance | None = None) -> float:
-    """Alias: saldo USDT na carteira de futuros."""
+    """Alias: saldo USDC na carteira de futuros."""
     return obter_saldo_usdt_margem(exchange)
 
 
 if __name__ == "__main__":
-    print(_TAG, "Verificação: saldo USDT (margem futuros) e mercados carregados.")
+    print(_TAG, "Verificação: saldo USDC (margem futuros) e mercados carregados.")
     try:
         ex = criar_exchange_binance()
         u = obter_saldo_usdt_margem(ex)
-        print(f"Saldo USDT (futures): {u:.8f}")
+        print(f"Saldo USDC (futures): {u:.8f}")
     except Exception as e:  # noqa: BLE001
         print(f"Falha: {e}", file=sys.stderr)
         sys.exit(1)

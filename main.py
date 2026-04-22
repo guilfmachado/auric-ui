@@ -34,13 +34,31 @@ import logger
 import ml_model
 import websockets
 
-SYMBOL_TRADE = "ETH/USDC"
-WS_FUTURES_KLINE_1M = "wss://fstream.binance.com/ws/ethusdc@kline_1m"
+def _normalizar_symbol_env_para_ccxt(raw: str) -> str:
+    s = str(raw or "").strip().upper()
+    if not s:
+        return "ETH/USDC"
+    if "/" in s:
+        return s
+    if s.endswith("USDC") and len(s) > 4:
+        return f"{s[:-4]}/USDC"
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}/USDT"
+    return s
+
+
+SYMBOL_TRADE = _normalizar_symbol_env_para_ccxt(os.getenv("SYMBOL", "ETHUSDC"))
+_SYMBOL_REST = SYMBOL_TRADE.replace("/", "").replace(":USDC", "")
+WS_FUTURES_STREAM = (
+    f"wss://fstream.binance.com/stream?streams={_SYMBOL_REST.lower()}@kline_1m/"
+    f"{_SYMBOL_REST.lower()}@bookTicker"
+)
 ALAVANCAGEM_PADRAO = 6
 RISK_FRACTION_PADRAO = 0.20
-TRAILING_CALLBACK_PADRAO = 0.7
+TRAILING_CALLBACK_PADRAO = 0.6
 TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
 TRIGGER_COOLDOWN_S = 15.0
+EMA_BUFFER_PCT = 0.0015  # 0.15% — no-trade zone para evitar whipsaw na EMA200 (15m)
 CLAUDE_RATE_LIMIT_MAX_CALLS = 1
 CLAUDE_RATE_LIMIT_WINDOW_S = 300.0
 METRICS_FLUSH_EVERY_TRIGGERS = 50
@@ -54,10 +72,10 @@ _main_event_loop: asyncio.AbstractEventLoop | None = None
 
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
-FATOR_STOP_LOSS = 0.99  # preço <= entrada × 0.99
-# SHORT (futures): lucro se preço cai; TP −2% / SL +1% sobre o preço de entrada.
+FATOR_STOP_LOSS = 0.985  # preço <= entrada × 0.985  (ROI -1,5%)
+# SHORT (futures): lucro se preço cai; TP −2% / SL +1,5% sobre o preço de entrada.
 FATOR_TAKE_PROFIT_SHORT = 0.98  # preço <= entrada × 0.98
-FATOR_STOP_LOSS_SHORT = 1.01  # preço >= entrada × 1.01
+FATOR_STOP_LOSS_SHORT = 1.015  # preço >= entrada × 1.015 (ROI -1,5%)
 
 # Zona ML que aciona Hub + Brain: P(alta) ≥ limiar long OU P(alta) ≤ limiar short.
 # Zona neutra (sessão teste HF): P ∈ [SHORT_MAX, LONG_MIN] → sem Hub/Claude.
@@ -67,12 +85,21 @@ WAKE_FILTER_LONG_MIN = 0.55
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
-TRAILING_CALLBACK_RATE_PADRAO = 0.7
+TRAILING_CALLBACK_RATE_PADRAO = 0.6
 TRAILING_ACTIVATION_MULTIPLIER_PADRAO = 1.0
 ROI_APERTO_SEGURANCA_ATIVACAO = 0.02  # +2%
 TRAILING_CALLBACK_APERTO_SEGURANCA = 0.4
 STALL_EXIT_VELAS_15M = 4
 TRAILING_CALLBACK_RSI_TIGHTEN = 0.3
+TRAILING_CALLBACK_GOD_MODE = 0.4
+ROI_GOD_MODE_ATIVACAO = 0.005  # +0.5%
+RSI_GOD_MODE_ATIVACAO = 70.0
+# ETH/USDC futures: realização parcial + spread guard (pausa refresh de trailing na bolsa).
+PARTIAL_TP_ROI_FRAC = 0.008  # 0,8% ROI — saída híbrida (50% market + BE + trailing 0,4%)
+PARTIAL_TP_CLOSE_FRAC = 0.5
+TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.4  # callbackRate Binance (%): 0.4 == 0,4%
+SPREAD_GUARD_MAX_FRAC = 0.001  # (ask−bid)/mid > 0,1%
+SPREAD_GUARD_PAUSE_S = 5.0
 
 # --- Estado do bot (memória do processo; reinício do script perde o estado) ---
 posicao_aberta: bool = False
@@ -89,8 +116,22 @@ _rsi_tighten_ativo: bool = False
 _short_stall_count_15m: int = 0
 _short_last_candle_ts_15m: int | None = None
 _short_last_low_15m: float | None = None
+_god_mode_auto_ativo: bool = False
+_ultimo_preco_ws: float = 0.0
+_best_bid_ws: float = 0.0
+_best_ask_ws: float = 0.0
+_ultimo_tick_ws_ts: float = 0.0
+_ws_force_restart_requested: bool = False
 _equity_inicio_dia: float | None = None
 _travado_ate_ts: float = 0.0
+_spread_trailing_pause_until: float = 0.0
+_partial_tp_pos_key: tuple[float, str] | None = None
+_partial_tp_locked: bool = False
+# Heartbeat Supabase em MODO VIGIA (não bloqueia TP/SL — envio em thread daemon).
+VIGIA_HEARTBEAT_INTERVAL_S = 30.0
+_vigia_heartbeat_last_monotonic: float = 0.0
+# Log único de confirmação de direção/gatilhos ao entrar numa chave (entrada, lado) de vigia.
+_vigia_gatilhos_confirm_key: tuple[float, str] | None = None
 _metrics_lock = threading.Lock()
 _metrics_counters: dict[str, int] = {
     "triggers_total": 0,
@@ -257,11 +298,11 @@ def verificar_permissao_operacao() -> bool:
 def obter_parametros_trailing_supabase() -> tuple[float, float]:
     """
     Lê parâmetros dinâmicos do trailing no Supabase (`config`, id=1):
-    - `trailing_callback_rate` (percentual; ex.: 0.7)
+    - `trailing_callback_rate` (percentual; ex.: 0.6)
     - `trailing_activation_multiplier` (multiplicador do antigo TP; ex.: 1.0)
 
     Fallback seguro:
-    - callback_rate = 0.7
+    - callback_rate = 0.6
     - activation_multiplier = 1.0 (mantém lógica atual de ativação)
     """
     callback = TRAILING_CALLBACK_RATE_PADRAO
@@ -302,7 +343,7 @@ def _obter_configuracoes_dinamicas_sync() -> dict[str, float]:
     Fallback seguro em falha:
     - risk_fraction=0.20
     - leverage=3.0
-    - trailing_callback_rate=0.7
+    - trailing_callback_rate=0.6
     - trailing_activation_multiplier=1.0
     """
     cfg = {
@@ -385,6 +426,93 @@ def atualizar_saldo_supabase() -> None:
         f"💰 [WALLET] Position sizing (futuros): {saldo:.4f} USDC (margem) × "
         f"risk={rf*100:.1f}% × lev={lev:g}x → notional_ref≈{notional_ref:.2f} USDC "
         "(qty base ≈ notional / preço ticker)."
+    )
+
+
+def _upsert_god_mode_trailing_sync(taxa_agressiva: float) -> None:
+    if logger.supabase is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": 1,
+        "trailing_callback_rate": float(taxa_agressiva),
+        "trailing_rate": float(taxa_agressiva),
+        "updated_at": now,
+    }
+    logger.supabase.table("bot_config").upsert(payload, on_conflict="id").execute()
+
+
+def _vigia_eth_usdc_futures(modo_label: str) -> bool:
+    u = SYMBOL_TRADE.upper()
+    return "FUTURES" in modo_label and "ETH" in u and "USDC" in u
+
+
+def _vigia_trailing_updates_allowed() -> bool:
+    return time.time() >= float(_spread_trailing_pause_until)
+
+
+def _reset_vigia_eth_usdc_guards() -> None:
+    global _spread_trailing_pause_until, _partial_tp_pos_key, _partial_tp_locked
+    global _vigia_heartbeat_last_monotonic, _vigia_gatilhos_confirm_key
+    _spread_trailing_pause_until = 0.0
+    _partial_tp_pos_key = None
+    _partial_tp_locked = False
+    _vigia_heartbeat_last_monotonic = 0.0
+    _vigia_gatilhos_confirm_key = None
+    executor_futures.reset_protective_order_guard_throttle()
+
+
+def _maybe_emit_vigia_heartbeat_supabase(
+    *,
+    preco: float,
+    roi_frac: float,
+    lado: str,
+    trailing_pct: float,
+    par_moeda: str,
+) -> None:
+    """
+    Log leve para o Supabase ~1×/30s enquanto em vigia, sem bloquear o ciclo (thread daemon).
+    """
+    global _vigia_heartbeat_last_monotonic
+    now = time.monotonic()
+    if now - _vigia_heartbeat_last_monotonic < float(VIGIA_HEARTBEAT_INTERVAL_S):
+        return
+    _vigia_heartbeat_last_monotonic = now
+
+    lado_u = str(lado).upper().strip() or "LONG"
+    roi_pct = float(roi_frac) * 100.0
+    trail_disp = float(trailing_pct)
+    px = float(preco)
+    texto = (
+        f"👀 [VIGIA] Gerindo posição {lado_u} | ROI: {roi_pct:.2f}% | "
+        f"Preço: {px:.4f} | Trailing: {trail_disp:.1f}%."
+    )
+
+    def _run() -> None:
+        try:
+            logger.registrar_log_trade(
+                par_moeda=par_moeda,
+                preco=px,
+                prob_ml=0.0,
+                sentimento="—",
+                acao="VIGIA_HEARTBEAT",
+                justificativa=texto,
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _exit_meta_contexto_json(*, partial_tp_50: bool, stop_hit: bool) -> str:
+    return json.dumps(
+        {
+            "auric_exit_meta": {
+                "partial_tp_50": bool(partial_tp_50),
+                "stop_hit": bool(stop_hit),
+                "sl_dynamic_vs_trailing": True,
+            }
+        }
     )
 
 
@@ -563,6 +691,25 @@ def _mark_manual_command_status_sync(row_id: int, status: str) -> None:
         print(f"⚠️ [MANUAL LISTENER] update status={status} id={row_id} falhou: {e}")
 
 
+def _limpar_comandos_manuais_pendentes_sync() -> None:
+    """Evita fila travada: marca pendências antigas como FAILED."""
+    if logger.supabase is None:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        logger.supabase.table("manual_commands").update(
+            {"status": "FAILED", "updated_at": now}
+        ).eq("status", "PENDING").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [MANUAL LISTENER] limpeza status=PENDING falhou: {e}")
+    try:
+        logger.supabase.table("manual_commands").update(
+            {"executed": True, "updated_at": now}
+        ).eq("executed", False).execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [MANUAL LISTENER] limpeza executed=false falhou: {e}")
+
+
 def _preco_entrada_fallback_de_ordem(ordem: dict[str, Any]) -> float:
     for k in ("auric_entry_price", "average", "price"):
         v = ordem.get(k)
@@ -626,7 +773,7 @@ def _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(
     just = (
         f"GOD MODE {direcao} via dashboard/Supabase; {ref_manual}. "
         f"Bracket Binance (SL STOP_MARKET + TRAILING_STOP_MARKET) já ativo. "
-        f"ordem_ref id={oid} | entry ref.={pe:.6f} USDT."
+        f"ordem_ref id={oid} | entry ref.={pe:.6f} USDC."
     )
 
     logger.registrar_log_trade(
@@ -646,7 +793,7 @@ def _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(
     direcao_posicao = direcao
     print(
         f"👑 [GOD MODE] Handoff Modo Vigia: posicao_aberta=True | {direcao_posicao} @ "
-        f"{preco_compra:.4f} USDT | log Supabase gravado ({acao})."
+        f"{preco_compra:.4f} USDC | log Supabase gravado ({acao})."
     )
 
 
@@ -668,36 +815,154 @@ def _executar_comando_manual_imediato_sync(
     """
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
     global posicao_aberta, preco_compra, direcao_posicao
+    global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws
 
     ex = executor_futures.criar_exchange_binance()
     c = _normalizar_comando_manual_god_mode(cmd)
+    if c in ("LONG", "SHORT"):
+        max_tentativas = 5
+        intervalo_s = 0.5
+        deadline = time.monotonic() + 3.0
+        tentativas = 0
+        preco_ws = float(_ultimo_preco_ws or 0.0)
+        best_bid = float(_best_bid_ws or 0.0)
+        best_ask = float(_best_ask_ws or 0.0)
+        rest_fallback_ok = False
+        while tentativas < max_tentativas and time.monotonic() < deadline:
+            best_bid = float(_best_bid_ws or best_bid or 0.0)
+            best_ask = float(_best_ask_ws or best_ask or 0.0)
+            if preco_ws > 0:
+                print("🎯 [WARM-UP] Sistema 100% pronto. Executando...")
+                break
+            if tentativas >= 2 and not rest_fallback_ok:
+                rest_symbol = executor_futures.MARKET_SYMBOL
+                rest_px = executor_futures.get_price_via_rest(rest_symbol)
+                rp = float(rest_px.get("price") or 0.0)
+                rb = float(rest_px.get("bid") or 0.0)
+                ra = float(rest_px.get("ask") or 0.0)
+                if rp > 0:
+                    _ultimo_preco_ws = rp
+                    preco_ws = rp
+                    if rb > 0:
+                        best_bid = rb
+                        _best_bid_ws = rb
+                    if ra > 0:
+                        best_ask = ra
+                        _best_ask_ws = ra
+                    rest_fallback_ok = True
+                    print(
+                        "⚠️ [REST-FALLBACK] WebSocket falhou, mas preço obtido via REST. "
+                        "Executando Force Command..."
+                    )
+                    print("🎯 [WARM-UP] Sistema 100% pronto. Executando...")
+                    break
+            print("⏳ [FORCE-WAIT] Aguardando Preço + Orderbook (L2)...")
+            time.sleep(intervalo_s)
+            tentativas += 1
+            preco_ws = float(_ultimo_preco_ws or 0.0)
+        if not (preco_ws > 0):
+            print(
+                f"[DEBUG-FAIL] Price: {preco_ws} | Bid: {best_bid} | Ask: {best_ask} | Symbol: {SYMBOL_TRADE}."
+            )
+            raise RuntimeError(
+                f"❌ [DATA-ERROR] Falha em: [bid: {best_bid}, ask: {best_ask}, price: {preco_ws}]."
+            )
+
     if c == "LONG":
-        ordem = executor_futures.abrir_long_market(
-            SYMBOL_TRADE,
-            ex,
-            alavancagem=float(_alavancagem_cfg),
-            risk_fraction=float(_risk_fraction_cfg),
-            trailing_callback_rate=float(_trailing_callback_cfg),
-            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
-        )
+        try:
+            ordem = executor_futures.abrir_long_market(
+                SYMBOL_TRADE,
+                ex,
+                alavancagem=float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                force_reference_price=float(_ultimo_preco_ws or 0.0),
+                is_manual_force=manual_row_id is not None,
+            )
+        except RuntimeError as e_long:
+            err_txt = str(e_long)
+            if "DATA-ERROR" not in err_txt or manual_row_id is None:
+                raise
+            ws_ref = float(_ultimo_preco_ws or 0.0)
+            if ws_ref <= 0:
+                ws_ref = float(_preco_via_ccxt_ticker(SYMBOL_TRADE, "FUTURES") or 0.0)
+            print(
+                f"⚠️ [FORCE-BYPASS] Aviso manual LONG id={manual_row_id}: {err_txt} "
+                f"| retry final com ref={ws_ref:.4f}"
+            )
+            if ws_ref <= 0:
+                return
+            ordem = executor_futures.abrir_long_market(
+                SYMBOL_TRADE,
+                ex,
+                alavancagem=float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                force_reference_price=ws_ref,
+                is_manual_force=manual_row_id is not None,
+            )
         _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
         return
     if c == "SHORT":
-        ordem = executor_futures.abrir_short_market(
-            SYMBOL_TRADE,
-            ex,
-            alavancagem=float(_alavancagem_cfg),
-            risk_fraction=float(_risk_fraction_cfg),
-            trailing_callback_rate=float(_trailing_callback_cfg),
-            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
-        )
+        try:
+            ordem = executor_futures.abrir_short_market(
+                SYMBOL_TRADE,
+                ex,
+                alavancagem=float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                force_reference_price=float(_ultimo_preco_ws or 0.0),
+                is_manual_force=manual_row_id is not None,
+            )
+        except RuntimeError as e_short:
+            err_txt = str(e_short)
+            if "DATA-ERROR" not in err_txt or manual_row_id is None:
+                raise
+            ws_ref = float(_ultimo_preco_ws or 0.0)
+            if ws_ref <= 0:
+                ws_ref = float(_preco_via_ccxt_ticker(SYMBOL_TRADE, "FUTURES") or 0.0)
+            print(
+                f"⚠️ [FORCE-BYPASS] Aviso manual SHORT id={manual_row_id}: {err_txt} "
+                f"| retry final com ref={ws_ref:.4f}"
+            )
+            if ws_ref <= 0:
+                return
+            ordem = executor_futures.abrir_short_market(
+                SYMBOL_TRADE,
+                ex,
+                alavancagem=float(_alavancagem_cfg),
+                risk_fraction=float(_risk_fraction_cfg),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                force_reference_price=ws_ref,
+                is_manual_force=manual_row_id is not None,
+            )
         _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
         return
     if c in ("CLOSE", "CLOSE_ALL"):
-        executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+        pe = float(preco_compra)
+        dr = str(direcao_posicao)
+        px_close = float(_ultimo_preco_ws or 0.0)
+        if px_close <= 0:
+            px_close = float(_preco_via_ccxt_ticker(SYMBOL_TRADE, "FUTURES") or 0.0)
+        ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+        try:
+            _gravar_performance_fecho_trade(
+                preco_entrada=pe,
+                preco_ref_ciclo=px_close,
+                direcao=dr,
+                ordem=ordem,
+                exit_type="FORCE_CLOSE",
+            )
+        except Exception as e_gc:  # noqa: BLE001
+            print(f"⚠️ [GOD MODE] CLOSE Supabase performance: {e_gc}")
         posicao_aberta = False
         preco_compra = 0.0
         direcao_posicao = "LONG"
+        _reset_vigia_eth_usdc_guards()
         print("👑 [GOD MODE] CLOSE: RAM resetada (sem posição).")
         return
     raise ValueError(f"Comando manual inválido: {c!r}")
@@ -712,6 +977,7 @@ async def _escutar_comandos_manuais() -> None:
     - executa instantaneamente com config dinâmica atual
     """
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+    global _ultimo_tick_ws_ts, _ws_force_restart_requested
 
     while True:
         await asyncio.sleep(1)
@@ -730,6 +996,9 @@ async def _escutar_comandos_manuais() -> None:
         print(
             f"👑 [GOD MODE] Comando MANUAL {cmd} intercetado e a ser executado INSTANTANEAMENTE! (id={rid})"
         )
+        if time.monotonic() - float(_ultimo_tick_ws_ts or 0.0) > 10.0:
+            _ws_force_restart_requested = True
+            print("⚠️ [WS-WATCHDOG] Sem ticks há >10s. Solicitando ws.restart() automático.")
 
         cfg_dyn = await _obter_configuracoes_dinamicas()
         _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
@@ -753,6 +1022,7 @@ async def _escutar_comandos_manuais() -> None:
         except Exception as e:  # noqa: BLE001
             print(f"❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
             await asyncio.to_thread(_mark_manual_command_status_sync, rid, "FAILED")
+            await asyncio.to_thread(_limpar_comandos_manuais_pendentes_sync)
             print(
                 f"⏳ [MANUAL LISTENER] Cooldown {ORDER_FAILURE_BACKOFF_S:.0f}s após falha "
                 "(anti-spam / rate limit exchange)."
@@ -831,6 +1101,71 @@ def obter_preco_referencia(simbolo: str = SYMBOL_TRADE, modo: str = "FUTURES") -
     return obter_preco_atual(simbolo, modo)
 
 
+def _detectar_tendencia_macro_ema200_15m(
+    ex: Any,
+    *,
+    simbolo: str,
+    modo: str,
+    preco_atual: float,
+) -> dict[str, Any]:
+    """
+    Tendência macro pelo filtro direcional EMA200 (15m).
+    Retorna `trend` em {"ALTA","BAIXA","INDEFINIDA"} e `allow_dir` em {"LONG","SHORT",None}.
+    """
+    px = float(preco_atual)
+    if px <= 0:
+        return {"trend": "INDEFINIDA", "allow_dir": None, "ema200": None}
+    try:
+        sym = simbolo
+        if modo == "FUTURES":
+            sym = executor_futures._resolver_simbolo_perp(ex, simbolo)
+        ohlcv = ex.fetch_ohlcv(sym, timeframe="15m", limit=260)
+        if not ohlcv or len(ohlcv) < 200:
+            raise RuntimeError(f"OHLCV insuficiente para EMA200 15m: {len(ohlcv) if ohlcv else 0}")
+        closes = [float(c[4]) for c in ohlcv if c and len(c) > 4]
+        if len(closes) < 200:
+            raise RuntimeError(f"Fechos insuficientes para EMA200 15m: {len(closes)}")
+        alpha = 2.0 / (200.0 + 1.0)
+        ema = closes[0]
+        for c in closes[1:]:
+            ema = (c * alpha) + (ema * (1.0 - alpha))
+        distancia = abs(px - ema) / ema
+        if distancia < float(EMA_BUFFER_PCT):
+            return {
+                "trend": "INDEFINIDA",
+                "allow_dir": None,
+                "ema200": float(ema),
+                "distance_pct": float(distancia),
+            }
+        if px > ema:
+            return {"trend": "ALTA", "allow_dir": "LONG", "ema200": float(ema)}
+        if px < ema:
+            return {"trend": "BAIXA", "allow_dir": "SHORT", "ema200": float(ema)}
+        return {"trend": "INDEFINIDA", "allow_dir": None, "ema200": float(ema), "distance_pct": 0.0}
+    except Exception as e_tm:  # noqa: BLE001
+        print(f"⚠️ [SINAL] Filtro EMA200 (15m) indisponível: {e_tm}")
+        return {"trend": "INDEFINIDA", "allow_dir": None, "ema200": None, "distance_pct": None}
+
+
+def _gravar_performance_fecho_trade(
+    *,
+    preco_entrada: float,
+    preco_ref_ciclo: float,
+    direcao: str,
+    ordem: dict[str, Any] | None,
+    exit_type: str,
+) -> None:
+    """Supabase `final_roi` + `exit_type` na última linha `trades` (antes de voltar à busca)."""
+    px_exit = executor_futures.preco_medio_execucao_ordem(ordem, float(preco_ref_ciclo))
+    executor_futures.registrar_trade_performance_fecho(
+        SYMBOL_TRADE,
+        preco_entrada=float(preco_entrada),
+        preco_saida=float(px_exit),
+        direcao=str(direcao),
+        exit_type=str(exit_type),
+    )
+
+
 def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
     """
     Evita divergência: se há posição (spot ou contratos) mas o estado em RAM foi perdido,
@@ -846,9 +1181,16 @@ def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
             posicao_aberta = True
             preco_compra = float(entrada)
             direcao_posicao = lado if lado in ("LONG", "SHORT") else "LONG"
+            lado_snap = str(snap.get("direcao_posicao") or "").upper()
+            if lado_snap in ("LONG", "SHORT") and direcao_posicao != lado_snap:
+                print(
+                    f"🔄 [Estado] Lado do log Supabase ({direcao_posicao}) ≠ carteira ({lado_snap}) — "
+                    "a usar direção da API (contracts/positionAmt)."
+                )
+                direcao_posicao = lado_snap
             print(
                 f"[Estado] Sincronizado: carteira com posição ({direcao_posicao}) — "
-                f"preco ref. entrada = {preco_compra:.4f} USDT"
+                f"preco ref. entrada = {preco_compra:.4f} USDC"
             )
         else:
             print(
@@ -857,10 +1199,26 @@ def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
             )
 
     if not snap["posicao_aberta"] and posicao_aberta:
+        pe = float(preco_compra)
+        dr = str(direcao_posicao)
+        exit_tp = "TRAILING_STOP" if _partial_tp_locked else "MANUAL"
+        try:
+            modo_p = "FUTURES" if ex_mod is executor_futures else "SPOT"
+            px = float(obter_preco_referencia(SYMBOL_TRADE, modo_p))
+            executor_futures.registrar_trade_performance_fecho(
+                SYMBOL_TRADE,
+                preco_entrada=pe,
+                preco_saida=px,
+                direcao=dr,
+                exit_type=exit_tp,
+            )
+        except Exception as e_pf:  # noqa: BLE001
+            print(f"⚠️ [Estado] Supabase fecho (carteira flat, RAM com posição): {e_pf}")
         print("[Estado] Carteira sem posição — resetando posicao_aberta / preco_compra.")
         posicao_aberta = False
         preco_compra = 0.0
         direcao_posicao = "LONG"
+        _reset_vigia_eth_usdc_guards()
 
 
 def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
@@ -882,9 +1240,6 @@ def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
     entrada_log, lado_log = logger.obter_preco_entrada_ultima_posicao(SYMBOL_TRADE)
     tem_log = entrada_log is not None and float(entrada_log) > 0
 
-    if tem_log and posicao_aberta:
-        return
-
     ep_raw = snap.get("entry_price")
     if ep_raw is not None and float(ep_raw) > 0:
         ep = float(ep_raw)
@@ -896,10 +1251,27 @@ def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
     if lado_bn not in ("LONG", "SHORT"):
         lado_bn = "LONG"
 
+    if tem_log and posicao_aberta:
+        if lado_bn != str(direcao_posicao).upper():
+            print(
+                f"🔄 [RECON] Direção RAM ({direcao_posicao}) ≠ Binance ({lado_bn}) — "
+                "a corrigir a partir de contracts/positionAmt."
+            )
+            direcao_posicao = lado_bn
+        return
+
     if tem_log and not posicao_aberta:
         posicao_aberta = True
         preco_compra = float(entrada_log)
-        direcao_posicao = lado_log if lado_log in ("LONG", "SHORT") else "LONG"
+        # Binance (contracts / positionAmt) é fonte de verdade para o lado; o log pode estar desatualizado.
+        direcao_posicao = lado_bn if lado_bn in ("LONG", "SHORT") else (
+            lado_log if lado_log in ("LONG", "SHORT") else "LONG"
+        )
+        if lado_log in ("LONG", "SHORT") and direcao_posicao != lado_log:
+            print(
+                f"🔄 [RECON] Log Supabase diz {lado_log}, mas carteira é {direcao_posicao} — "
+                "a usar lado da Binance."
+            )
         print(
             f"🔄 [RECON] Binance com posição + log Supabase: RAM atualizada "
             f"({direcao_posicao} @ {preco_compra:.4f}). A assegurar brackets na bolsa..."
@@ -967,6 +1339,13 @@ def _gerenciar_saida_modo_vigia(
     """
     global posicao_aberta, preco_compra, direcao_posicao, _aperto_seguranca_ativo
     global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
+    global _god_mode_auto_ativo, _trailing_callback_cfg
+    global _spread_trailing_pause_until, _partial_tp_pos_key, _partial_tp_locked
+    global _vigia_gatilhos_confirm_key
+
+    if float(preco) <= 0:
+        print("⚠️ [GOD MODE] Tick inválido (0.0000). Mantendo último stop seguro sem alterações.")
+        return
 
     roi = 0.0
     if direcao_posicao == "SHORT":
@@ -974,7 +1353,130 @@ def _gerenciar_saida_modo_vigia(
     else:
         roi = (preco - preco_compra) / preco_compra
 
+    if preco_compra > 0:
+        _pk = (round(float(preco_compra), 6), str(direcao_posicao))
+        if _partial_tp_pos_key != _pk:
+            _partial_tp_pos_key = _pk
+            _partial_tp_locked = False
+
+    if preco_compra > 0:
+        ck_v = (round(float(preco_compra), 6), str(direcao_posicao).upper())
+        if _vigia_gatilhos_confirm_key != ck_v:
+            _vigia_gatilhos_confirm_key = ck_v
+            print(
+                f"[VIGIA] Direção Confirmada: {direcao_posicao} | "
+                "Verificando integridade dos gatilhos..."
+            )
+
+    _maybe_emit_vigia_heartbeat_supabase(
+        preco=float(preco),
+        roi_frac=float(roi),
+        lado=str(direcao_posicao),
+        trailing_pct=float(_trailing_callback_cfg),
+        par_moeda=SYMBOL_TRADE,
+    )
+
+    if "FUTURES" in modo_label and float(preco_compra) > 0:
+        try:
+            executor_futures.check_and_verify_protective_orders(
+                SYMBOL_TRADE,
+                ex,
+                str(direcao_posicao),
+                float(preco_compra),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                sl_break_even=bool(_partial_tp_locked),
+            )
+        except Exception as e_og:  # noqa: BLE001
+            print(f"⚠️ [ORDER-GUARD] {e_og}")
+
+    if _vigia_eth_usdc_futures(modo_label):
+        bid_s = float(_best_bid_ws or 0.0)
+        ask_s = float(_best_ask_ws or 0.0)
+        if bid_s <= 0 or ask_s <= 0:
+            try:
+                sym_cc = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+                t_ob = ex.fetch_ticker(sym_cc)
+                bid_s = float(t_ob.get("bid") or 0.0)
+                ask_s = float(t_ob.get("ask") or 0.0)
+            except Exception:
+                pass
+        if bid_s > 0 and ask_s > 0:
+            mid = (bid_s + ask_s) / 2.0
+            sp = ask_s - bid_s
+            if mid > 0 and (sp / mid) > SPREAD_GUARD_MAX_FRAC:
+                was_paused = time.time() < _spread_trailing_pause_until
+                _spread_trailing_pause_until = time.time() + SPREAD_GUARD_PAUSE_S
+                if not was_paused:
+                    print(
+                        "⏸️ [SPREAD-GUARD] Spread >0.1% do mid — atualizações de trailing "
+                        f"na bolsa pausadas {SPREAD_GUARD_PAUSE_S:.0f}s (protecção USDC)."
+                    )
+
+    if (
+        _vigia_eth_usdc_futures(modo_label)
+        and not _partial_tp_locked
+        and roi >= PARTIAL_TP_ROI_FRAC
+    ):
+        try:
+            out_h = executor_futures.executar_saida_hibrida_roi_break_even_trailing(
+                SYMBOL_TRADE,
+                ex,
+                str(direcao_posicao),
+                float(preco_compra),
+                close_frac=float(PARTIAL_TP_CLOSE_FRAC),
+                trailing_callback_rate=float(TRAILING_CALLBACK_APOS_PARTIAL_TP),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+            )
+            print(
+                f"💰 [HYBRID-EXIT] {PARTIAL_TP_ROI_FRAC*100}% realizado. Protegendo o resto no Break-Even com Trailing {TRAILING_CALLBACK_APOS_PARTIAL_TP}%."
+            )
+            ord_p = out_h.get("ordem_parcial") or {}
+            qty_r = float(out_h.get("qty_remaining") or 0.0)
+            trailing_ap = float(out_h.get("trailing_callback_rate") or TRAILING_CALLBACK_APOS_PARTIAL_TP)
+            exec_mode = "MARKET"
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=0.0,
+                sentimento="—",
+                acao="PARTIAL_TP_50",
+                justificativa=(
+                    f"[HYBRID-EXIT] ROI {roi*100:.3f}% ≥ {PARTIAL_TP_ROI_FRAC*100:.2f}%; "
+                    f"fecho {PARTIAL_TP_CLOSE_FRAC*100:.0f}% MARKET; id={ord_p.get('id')}; "
+                    f"qty_left≈{qty_r:g}; SL break-even + trailing {trailing_ap:.2f}%."
+                ),
+                lado_ordem=direcao_posicao,
+                contexto_raw=json.dumps(
+                    {
+                        "auric_partial_tp": {
+                            "roi_frac": roi,
+                            "close_frac": PARTIAL_TP_CLOSE_FRAC,
+                            "qty_left": qty_r,
+                            "execution": exec_mode.lower(),
+                            "sl_break_even": True,
+                            "trailing_pct": float(trailing_ap),
+                            "hybrid_exit": True,
+                        }
+                    }
+                ),
+            )
+            if qty_r > 0:
+                logger.atualizar_qty_left_ultimo_trade(SYMBOL_TRADE, qty_r)
+            _partial_tp_locked = True
+            _trailing_callback_cfg = trailing_ap
+            _god_mode_auto_ativo = True
+            _upsert_god_mode_trailing_sync(trailing_ap)
+            print(
+                f"⚡️ [GOD MODE DE SAÍDA] Trailing {trailing_ap:.3f}% + SL break-even @ entrada "
+                f"{preco_compra:.4f} (qty restante ≈ {qty_r:g})."
+            )
+        except Exception as e_ptp:  # noqa: BLE001
+            print(f"⚠️ [HYBRID-EXIT] Falha no fecho parcial ou brackets: {e_ptp}")
+        return
+
     trailing_ativo = float(_trailing_callback_cfg)
+    rsi_15m_now: float | None = None
     if roi >= ROI_APERTO_SEGURANCA_ATIVACAO:
         trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_APERTO_SEGURANCA)
         if not _aperto_seguranca_ativo:
@@ -989,19 +1491,20 @@ def _gerenciar_saida_modo_vigia(
                     snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
                     qty = abs(float(snap.get("contratos") or 0.0))
                     if qty > 0:
-                        executor_futures.assegurar_brackets_apos_reconciliacao(
-                            SYMBOL_TRADE,
-                            ex,
-                            direcao_posicao,
-                            qty,
-                            preco_compra,
-                            trailing_callback_rate=trailing_ativo,
-                            trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
-                        )
-                        print(
-                            "🔒 [MODO VIGIA] Brackets Futures atualizados com "
-                            f"callbackRate={trailing_ativo:.3f}% (anti-devolução de lucro)."
-                        )
+                        if _vigia_trailing_updates_allowed():
+                            executor_futures.assegurar_brackets_apos_reconciliacao(
+                                SYMBOL_TRADE,
+                                ex,
+                                direcao_posicao,
+                                qty,
+                                preco_compra,
+                                trailing_callback_rate=trailing_ativo,
+                                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                            )
+                            print(
+                                "🔒 [MODO VIGIA] Brackets Futures atualizados com "
+                                f"callbackRate={trailing_ativo:.3f}% (anti-devolução de lucro)."
+                            )
                 except Exception as e_ap:  # noqa: BLE001
                     print(f"⚠️ [MODO VIGIA] Falha ao aplicar Aperto de Segurança: {e_ap}")
     else:
@@ -1011,6 +1514,85 @@ def _gerenciar_saida_modo_vigia(
                 f"(ROI={roi*100:.2f}% < {ROI_APERTO_SEGURANCA_ATIVACAO*100:.1f}%)."
             )
         _aperto_seguranca_ativo = False
+
+    if "FUTURES" in modo_label:
+        try:
+            sx_gm = executor_futures.obter_sinais_exaustao_short_15m(SYMBOL_TRADE, ex)
+            if sx_gm.get("ok"):
+                rv = sx_gm.get("rsi_14_15m")
+                if rv is not None:
+                    rsi_15m_now = float(rv)
+        except Exception:
+            rsi_15m_now = None
+
+    if (
+        "FUTURES" in modo_label
+        and (
+            roi >= ROI_GOD_MODE_ATIVACAO
+            or (rsi_15m_now is not None and rsi_15m_now >= RSI_GOD_MODE_ATIVACAO)
+        )
+    ):
+        try:
+            simbolos_recon = [SYMBOL_TRADE]
+            if "ETH/USDC:USDC" not in simbolos_recon:
+                simbolos_recon.append("ETH/USDC:USDC")
+            if "ETH/USDC" not in simbolos_recon:
+                simbolos_recon.append("ETH/USDC")
+
+            snap_bn = {"posicao_aberta": False, "contratos": 0.0, "entry_price": None}
+            for sym_recon in simbolos_recon:
+                try:
+                    snap_try = executor_futures.consultar_posicao_futures(sym_recon, ex)
+                except Exception:
+                    continue
+                qty_try = abs(float(snap_try.get("contratos") or 0.0))
+                if bool(snap_try.get("posicao_aberta")) and qty_try > 0:
+                    snap_bn = snap_try
+                    break
+
+            entrada_sb, _ = logger.obter_preco_entrada_ultima_posicao(SYMBOL_TRADE)
+            if entrada_sb is None or float(entrada_sb) <= 0:
+                ep_bn = float(snap_bn.get("entry_price") or 0.0)
+                if ep_bn > 0:
+                    entrada_sb = ep_bn
+            recon_ok = bool(
+                snap_bn.get("posicao_aberta")
+                and float(snap_bn.get("contratos") or 0.0) != 0.0
+                and entrada_sb is not None
+                and float(entrada_sb) > 0
+            )
+            if recon_ok and (not _god_mode_auto_ativo or trailing_ativo > TRAILING_CALLBACK_GOD_MODE):
+                trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_GOD_MODE)
+                _trailing_callback_cfg = trailing_ativo
+                _upsert_god_mode_trailing_sync(trailing_ativo)
+                _god_mode_auto_ativo = True
+                print(f"⚡️ [GOD MODE ACTIVATED] - Apertando trailing para {trailing_ativo:.3f}%.")
+                qty = abs(float(snap_bn.get("contratos") or 0.0))
+                if qty > 0:
+                    executor_futures.assegurar_brackets_apos_reconciliacao(
+                        SYMBOL_TRADE,
+                        ex,
+                        direcao_posicao,
+                        qty,
+                        preco_compra,
+                        trailing_callback_rate=trailing_ativo,
+                        trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                        source_tag="GOD_MODE_AUTO",
+                    )
+            elif not recon_ok:
+                bn_dbg = {
+                    "posicao_aberta": bool(snap_bn.get("posicao_aberta")),
+                    "contratos": float(snap_bn.get("contratos") or 0.0),
+                    "entry_price": float(snap_bn.get("entry_price") or 0.0),
+                }
+                sb_dbg = float(entrada_sb or 0.0)
+                print(f"[DEBUG-RECON] Binance Pos: {bn_dbg} | Supabase Pos: {sb_dbg}")
+                print(
+                    "⚠️ [GOD MODE] Recon Check falhou: posição não confirmada simultaneamente "
+                    "na Binance e no Supabase. Sem alteração de trailing."
+                )
+        except Exception as e_gm:
+            print(f"⚠️ [GOD MODE] Falha na ativação automática: {e_gm}")
 
     if direcao_posicao == "SHORT" and "FUTURES" in modo_label:
         try:
@@ -1029,27 +1611,33 @@ def _gerenciar_saida_modo_vigia(
                 rsi_prev = sx.get("rsi_14_15m_prev")
                 rsi_repique = bool(sx.get("rsi_repique_fundo"))
                 if rsi_repique:
-                    trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_RSI_TIGHTEN)
-                    if not _rsi_tighten_ativo:
-                        _rsi_tighten_ativo = True
+                    if _partial_tp_locked and _vigia_eth_usdc_futures(modo_label):
                         print(
-                            "⚡ [RSI TIGHTEN] RSI subindo no fundo. Apertando Trailing para 0.3%."
+                            "ℹ️ [RSI TIGHTEN] Ignorado — posição com TP parcial (trailing mín. "
+                            f"{TRAILING_CALLBACK_APOS_PARTIAL_TP:.1f}%)."
                         )
-                    try:
-                        snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
-                        qty = abs(float(snap.get("contratos") or 0.0))
-                        if qty > 0:
-                            executor_futures.assegurar_brackets_apos_reconciliacao(
-                                SYMBOL_TRADE,
-                                ex,
-                                "SHORT",
-                                qty,
-                                preco_compra,
-                                trailing_callback_rate=trailing_ativo,
-                                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                    else:
+                        trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_RSI_TIGHTEN)
+                        if not _rsi_tighten_ativo:
+                            _rsi_tighten_ativo = True
+                            print(
+                                "⚡ [RSI TIGHTEN] RSI subindo no fundo. Apertando Trailing para 0.3%."
                             )
-                    except Exception as e_tight:  # noqa: BLE001
-                        print(f"⚠️ [RSI TIGHTEN] Falha ao aplicar trailing apertado: {e_tight}")
+                        try:
+                            snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+                            qty = abs(float(snap.get("contratos") or 0.0))
+                            if qty > 0 and _vigia_trailing_updates_allowed():
+                                executor_futures.assegurar_brackets_apos_reconciliacao(
+                                    SYMBOL_TRADE,
+                                    ex,
+                                    "SHORT",
+                                    qty,
+                                    preco_compra,
+                                    trailing_callback_rate=trailing_ativo,
+                                    trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                                )
+                        except Exception as e_tight:  # noqa: BLE001
+                            print(f"⚠️ [RSI TIGHTEN] Falha ao aplicar trailing apertado: {e_tight}")
                 else:
                     _rsi_tighten_ativo = False
 
@@ -1087,6 +1675,13 @@ def _gerenciar_saida_modo_vigia(
                     ),
                     lado_ordem="SHORT",
                 )
+                _gravar_performance_fecho_trade(
+                    preco_entrada=float(preco_compra),
+                    preco_ref_ciclo=float(preco),
+                    direcao="SHORT",
+                    ordem=ordem,
+                    exit_type="STALL_EXIT",
+                )
                 posicao_aberta = False
                 preco_compra = 0.0
                 direcao_posicao = "LONG"
@@ -1094,16 +1689,21 @@ def _gerenciar_saida_modo_vigia(
                 _short_last_candle_ts_15m = None
                 _short_last_low_15m = None
                 _rsi_tighten_ativo = False
+                _reset_vigia_eth_usdc_guards()
                 print(f"  [Estado] posição encerrada por STALL EXIT. id={ordem.get('id')}")
             except Exception as e_stall:  # noqa: BLE001
                 print(f"  [ERRO] STALL EXIT SHORT: {e_stall}")
             return
 
-        limite_tp = preco_compra * FATOR_TAKE_PROFIT_SHORT
-        limite_sl = preco_compra * FATOR_STOP_LOSS_SHORT
+        # SHORT: TP = entrada × (1 − alvo); SL = entrada × (1 + stop) — alinhado a FATOR_*SHORT.
+        alvo_tp_frac = 1.0 - float(FATOR_TAKE_PROFIT_SHORT)
+        stop_sl_frac = float(FATOR_STOP_LOSS_SHORT) - 1.0
+        limite_tp = float(preco_compra) * (1.0 - alvo_tp_frac)
+        limite_sl = float(preco_compra) * (1.0 + stop_sl_frac)
         print(
-            f"\n  Posição SHORT | ref. entrada: {preco_compra:.4f} USDT | atual: {preco:.4f} ({modo_label})\n"
-            f"  TP (lucro se cair ~2%): <= {limite_tp:.4f}  |  SL (perda se subir ~1%): >= {limite_sl:.4f}"
+            f"\n  Posição SHORT | ref. entrada: {preco_compra:.4f} USDC | atual: {preco:.4f} ({modo_label})\n"
+            f"  TP (lucro se cair ~{alvo_tp_frac*100:.0f}%): <= {limite_tp:.4f}  |  "
+            f"SL (perda se subir ~{stop_sl_frac*100:.0f}%): >= {limite_sl:.4f}"
         )
         if preco <= limite_tp:
             print("\n  [Take Profit SHORT] Preço <= entrada × 0,98 — fechando posição...")
@@ -1124,10 +1724,21 @@ def _gerenciar_saida_modo_vigia(
                     acao="VENDA_PROFIT",
                     justificativa=just,
                     lado_ordem="SHORT",
+                    contexto_raw=_exit_meta_contexto_json(
+                        partial_tp_50=_partial_tp_locked, stop_hit=False
+                    ),
+                )
+                _gravar_performance_fecho_trade(
+                    preco_entrada=float(preco_compra),
+                    preco_ref_ciclo=float(preco),
+                    direcao="SHORT",
+                    ordem=ordem,
+                    exit_type="TAKE_PROFIT",
                 )
                 posicao_aberta = False
                 preco_compra = 0.0
                 direcao_posicao = "LONG"
+                _reset_vigia_eth_usdc_guards()
                 print("  [Estado] posição encerrada após TP (short).")
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída TP short: {e_v}")
@@ -1161,10 +1772,21 @@ def _gerenciar_saida_modo_vigia(
                     acao="VENDA_STOP",
                     justificativa=just,
                     lado_ordem="SHORT",
+                    contexto_raw=_exit_meta_contexto_json(
+                        partial_tp_50=_partial_tp_locked, stop_hit=True
+                    ),
+                )
+                _gravar_performance_fecho_trade(
+                    preco_entrada=float(preco_compra),
+                    preco_ref_ciclo=float(preco),
+                    direcao="SHORT",
+                    ordem=ordem,
+                    exit_type="STOP_LOSS",
                 )
                 posicao_aberta = False
                 preco_compra = 0.0
                 direcao_posicao = "LONG"
+                _reset_vigia_eth_usdc_guards()
                 print("  [Estado] posição encerrada após SL (short).")
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída SL short: {e_v}")
@@ -1188,7 +1810,7 @@ def _gerenciar_saida_modo_vigia(
     limite_tp = preco_compra * FATOR_TAKE_PROFIT
     limite_sl = preco_compra * FATOR_STOP_LOSS
     print(
-        f"\n  Referência entrada LONG: {preco_compra:.4f} USDT | atual: {preco:.4f} USDT ({modo_label})\n"
+        f"\n  Referência entrada LONG: {preco_compra:.4f} USDC | atual: {preco:.4f} USDC ({modo_label})\n"
         f"  Gatilho TP: >= {limite_tp:.4f}  |  Gatilho SL: <= {limite_sl:.4f}"
     )
 
@@ -1210,10 +1832,21 @@ def _gerenciar_saida_modo_vigia(
                 sentimento="—",
                 acao="VENDA_PROFIT",
                 justificativa=just,
+                contexto_raw=_exit_meta_contexto_json(
+                    partial_tp_50=_partial_tp_locked, stop_hit=False
+                ),
+            )
+            _gravar_performance_fecho_trade(
+                preco_entrada=float(preco_compra),
+                preco_ref_ciclo=float(preco),
+                direcao="LONG",
+                ordem=ordem,
+                exit_type="TAKE_PROFIT",
             )
             posicao_aberta = False
             preco_compra = 0.0
             direcao_posicao = "LONG"
+            _reset_vigia_eth_usdc_guards()
             print("  [Estado] posicao_aberta=False | preco_compra zerado após TP.")
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída TP: {e_v}")
@@ -1245,10 +1878,21 @@ def _gerenciar_saida_modo_vigia(
                 sentimento="—",
                 acao="VENDA_STOP",
                 justificativa=just,
+                contexto_raw=_exit_meta_contexto_json(
+                    partial_tp_50=_partial_tp_locked, stop_hit=True
+                ),
+            )
+            _gravar_performance_fecho_trade(
+                preco_entrada=float(preco_compra),
+                preco_ref_ciclo=float(preco),
+                direcao="LONG",
+                ordem=ordem,
+                exit_type="STOP_LOSS",
             )
             posicao_aberta = False
             preco_compra = 0.0
             direcao_posicao = "LONG"
+            _reset_vigia_eth_usdc_guards()
             print("  [Estado] posicao_aberta=False | preco_compra zerado após SL.")
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída SL: {e_v}")
@@ -1274,6 +1918,7 @@ def rodar_ciclo(modo: str) -> None:
     global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
     global _equity_inicio_dia, _travado_ate_ts
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+    global _ultimo_preco_ws
 
     if not logger.obter_bot_ativo():
         print("Bot em modo Standby via Dashboard")
@@ -1294,7 +1939,13 @@ def rodar_ciclo(modo: str) -> None:
             print(f"[Maestro] Aviso ao configurar alavancagem/margem: {e_cfg}")
     _last_modo_detectado = modo
 
-    preco = obter_preco_referencia(SYMBOL_TRADE, modo)
+    if modo == "FUTURES":
+        preco = float(_ultimo_preco_ws or 0.0)
+        if preco <= 0:
+            print("⚠️ [WS PRICE] Sem tick real válido. Ciclo ignorado para preservar stops.")
+            return
+    else:
+        preco = obter_preco_referencia(SYMBOL_TRADE, modo)
     ex = ex_mod.criar_exchange_binance()
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
@@ -1382,9 +2033,23 @@ def rodar_ciclo(modo: str) -> None:
             print(f"    ⚠️ Verificação volume spike: {e_vs}")
 
     print("\n" + "=" * 64)
-    print(f"[Ciclo] {SYMBOL_TRADE} | modo={modo_label} | preço ref. ≈ {preco:.4f} USDT")
+    print(f"[Ciclo] {SYMBOL_TRADE} | modo={modo_label} | preço ref. ≈ {preco:.4f} USDC")
     print(f"        Estado RAM: posicao_aberta={posicao_aberta} | preco_compra={preco_compra:.4f}")
     print("=" * 64)
+
+    if posicao_aberta and modo == "FUTURES":
+        try:
+            snap_align = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+            if snap_align.get("posicao_aberta"):
+                lado_api = str(snap_align.get("direcao_posicao") or "").upper()
+                if lado_api in ("LONG", "SHORT") and lado_api != str(direcao_posicao).upper():
+                    print(
+                        f"🔄 [VIGIA] Pré-ciclo: alinhar direção RAM {direcao_posicao} → {lado_api} "
+                        "(contracts/positionAmt)."
+                    )
+                    direcao_posicao = lado_api
+        except Exception as e_al:  # noqa: BLE001
+            print(f"⚠️ [VIGIA] Pré-ciclo: leitura de posição falhou: {e_al}")
 
     if posicao_aberta:
         print("\n>>> MODO VIGIA <<<")
@@ -1395,9 +2060,11 @@ def rodar_ciclo(modo: str) -> None:
         return
     _aperto_seguranca_ativo = False
     _rsi_tighten_ativo = False
+    _god_mode_auto_ativo = False
     _short_stall_count_15m = 0
     _short_last_candle_ts_15m = None
     _short_last_low_15m = None
+    _reset_vigia_eth_usdc_guards()
 
     # Busca de oportunidade (sem posição em RAM após sync+recon): limpar livro na Binance (margem livre).
     if modo == "FUTURES":
@@ -1417,6 +2084,25 @@ def rodar_ciclo(modo: str) -> None:
         f"    ML P(alta)≥{WAKE_FILTER_LONG_MIN:.2f} (LONG) ou P(alta)≤{WAKE_FILTER_SHORT_MAX:.2f} (SHORT) "
         "→ Hub → Brain → posicao_recomendada."
     )
+    macro = _detectar_tendencia_macro_ema200_15m(
+        ex,
+        simbolo=SYMBOL_TRADE,
+        modo=modo,
+        preco_atual=preco,
+    )
+    macro_trend = str(macro.get("trend") or "INDEFINIDA").upper()
+    macro_allow = macro.get("allow_dir")
+    ema200_v = macro.get("ema200")
+    if macro_trend == "ALTA":
+        print("📈 [SINAL] Tendência Macro: ALTA (Preço > EMA200). Procurando apenas LONGs.")
+    elif macro_trend == "BAIXA":
+        print("📉 [SINAL] Tendência Macro: BAIXA (Preço < EMA200). Procurando apenas SHORTs.")
+    else:
+        ema_txt = f"{float(ema200_v):.4f}" if ema200_v is not None else "N/A"
+        print(
+            f"⚖️ [SINAL] Tendência Macro: INDEFINIDA (Preço ~= EMA200={ema_txt}). "
+            "Sem bloqueio direcional adicional."
+        )
 
     print("\n--- [AURIC CYCLE START] ---")
 
@@ -1473,6 +2159,10 @@ def rodar_ciclo(modo: str) -> None:
             "vies_vwap": "INDEFINIDO",
             "mercado_lateral": True,
             "rsi_14": None,
+            "bb_squeeze_tight_002": False,
+            "bb_width_expanding": False,
+            "bb_breakout_long_ok": False,
+            "bb_breakout_short_ok": False,
         }
 
     adx_v = snap.get("adx_14")
@@ -1613,7 +2303,41 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
+    if macro_trend == "INDEFINIDA":
+        print("🚧 [SINAL] Preço na Chop Zone da EMA200 (Indefinida). Aguardando rompimento claro.")
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento="NEUTRAL",
+            acao="VETO_TENDENCIA_EMA200",
+            justificativa=(
+                "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
+                f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
+            ),
+        )
+        return
+
+    if macro_allow in ("LONG", "SHORT") and direcao_sugerida != macro_allow:
+        print(
+            f"🛑 [EMA200 FILTER] {direcao_sugerida} bloqueado pela tendência macro "
+            f"({macro_trend}). Permitido apenas {macro_allow}."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento="NEUTRAL",
+            acao="VETO_TENDENCIA_EMA200",
+            justificativa=(
+                f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+            ),
+        )
+        return
+
     print(f"    → direcao_sugerida={direcao_sugerida} (ML vs limiares long/short)")
+    pa_bundle: dict[str, Any] = {}
 
     # 2. Ativa os Olhos (Intelligence Hub)
     print("📡 [HUB] Ativando Intelligence Hub (Nitter + RSS)...")
@@ -1624,6 +2348,13 @@ def rodar_ciclo(modo: str) -> None:
     sym_ohlcv = SYMBOL_TRADE
     if modo == "FUTURES":
         sym_ohlcv = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+        try:
+            pa_bundle = indicators.reunir_sinais_price_action(ex, sym_ohlcv, snap)
+            rs = pa_bundle.get("resumo")
+            if rs not in (None, "", "—"):
+                print(f"    [Price Action] {rs}")
+        except Exception as e_pa:  # noqa: BLE001
+            print(f"    ⚠️ Price Action: {e_pa}")
 
     confluencia: dict[str, Any] | None = None
     try:
@@ -1637,7 +2368,7 @@ def rodar_ciclo(modo: str) -> None:
     except Exception as e_cf:  # noqa: BLE001
         print(f"    ⚠️ Indicadores confluência indisponíveis: {e_cf}")
 
-    snap_log = {**snap, "prob_ml": probabilidade}
+    snap_log = {**snap, "prob_ml": probabilidade, "auric_price_action": pa_bundle}
     if confluencia is not None:
         snap_log["confluencia"] = confluencia
 
@@ -1810,6 +2541,112 @@ def rodar_ciclo(modo: str) -> None:
 
     if (
         not manual_override_veredito
+        and modo == "FUTURES"
+        and _vigia_eth_usdc_futures(modo_label)
+    ):
+        tight = bool(snap.get("bb_squeeze_tight_002"))
+        if tight:
+            bloq_long = (
+                sent == "BULLISH"
+                and pos_rec == "LONG"
+                and not bool(snap.get("bb_breakout_long_ok"))
+            )
+            bloq_short = (
+                sent == "BEARISH"
+                and pos_rec == "SHORT"
+                and not bool(snap.get("bb_breakout_short_ok"))
+            )
+            if bloq_long or bloq_short:
+                msg_squeeze = (
+                    "💤 [SQUEEZE] Mercado lateral (volatilidade < 0.2%). Sniper em standby.'"
+                )
+                print(msg_squeeze)
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento=sent,
+                    acao="VETO_BB_SQUEEZE_ENTRADA",
+                    justificativa=(
+                        f"{msg_squeeze} | {just_ia} | BB σ=1.5: compressão <0,2% do preço "
+                        "sem setup válido (bandas a expandir + rompimento BBU/BBL + volume "
+                        "> média 10 velas)."
+                    ),
+                    lado_ordem="LONG" if bloq_long else "SHORT",
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia,
+                    noticias_agregadas=contexto,
+                )
+                return
+
+    if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("short_squeeze"):
+        if sent == "BEARISH" and pos_rec == "SHORT":
+            print(
+                "    📈 [SHORT SQUEEZE] Vela 1m forte + volume 2× média + RSI>70 — "
+                "evitar SHORT; preferir seguir fluxo (trend following / coberturas)."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_SHORT_SQUEEZE",
+                justificativa=(
+                    f"{just_ia} | Short squeeze em curso (1m: Δpreço>0,4%, vol≥2×média, RSI>70)."
+                ),
+                lado_ordem="SHORT",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
+
+    if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("double_top"):
+        if sent == "BULLISH" and pos_rec == "LONG":
+            print(
+                "    [Price Action] Double Top (dois topos locais + recuo) — viés baixa; LONG vetado."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_DOUBLE_TOP",
+                justificativa=(
+                    f"{just_ia} | Double Top: pivots 1m alinhados (±{indicators.DOUBLE_PIVOT_ZONE_FRAC*100:.3f}%) "
+                    "e recuo após teste de topo anterior."
+                ),
+                lado_ordem="LONG",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
+
+    if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("double_bottom"):
+        if sent == "BEARISH" and pos_rec == "SHORT":
+            print(
+                "    [Price Action] Double Bottom (dois fundos locais + repique) — viés alta; SHORT vetado."
+            )
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento=sent,
+                acao="VETO_DOUBLE_BOTTOM",
+                justificativa=(
+                    f"{just_ia} | Double Bottom: pivots 1m alinhados (±{indicators.DOUBLE_PIVOT_ZONE_FRAC*100:.3f}%) "
+                    "e repique após teste de fundo anterior."
+                ),
+                lado_ordem="SHORT",
+                contexto_raw=contexto_raw_supabase,
+                justificativa_ia=just_ia,
+                noticias_agregadas=contexto,
+            )
+            return
+
+    if (
+        not manual_override_veredito
         and snap.get("mercado_lateral")
         and not snap.get("bollinger_squeeze")
     ):
@@ -1960,14 +2797,14 @@ def rodar_ciclo(modo: str) -> None:
                 risk_fraction=float(_risk_fraction_cfg),
             )
             entrada_txt = (
-                f"COMPRA (Long) LIMIT (+0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
+                f"COMPRA (Long) LIMIT (+0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDC "
                 f"(risk {_risk_fraction_cfg*100:.1f}% × {_alavancagem_cfg:.2f}x, {modo_label}, mainnet)."
             )
         else:
             notional_alvo = executor_spot.obter_saldo_usdt(ex) * executor_spot.PERCENTUAL_BANCA
             pct_spot = executor_spot.PERCENTUAL_BANCA * 100.0
             entrada_txt = (
-                f"COMPRA (Long) LIMIT (+0,05%) — custo ≈ {notional_alvo:.2f} USDT "
+                f"COMPRA (Long) LIMIT (+0,05%) — custo ≈ {notional_alvo:.2f} USDC "
                 f"({pct_spot:.1f}% saldo spot, {modo_label}, mainnet)."
             )
         print(
@@ -2006,7 +2843,7 @@ def rodar_ciclo(modo: str) -> None:
             )
             just_final = (
                 f"{just_ia} | Ordem id={oid} status={st}; "
-                f"notional/custo alvo ≈ {notional_alvo:.2f} USDT.{bracket_note} "
+                f"notional/custo alvo ≈ {notional_alvo:.2f} USDC.{bracket_note} "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (LONG)."
             )
             if manual_override_veredito:
@@ -2028,7 +2865,7 @@ def rodar_ciclo(modo: str) -> None:
                 is_maker=is_maker,
             )
             print(
-                f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
+                f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
             )
             print(
                 "    Próximos ciclos: >>> MODO VIGIA <<< "
@@ -2064,7 +2901,7 @@ def rodar_ciclo(modo: str) -> None:
             risk_fraction=float(_risk_fraction_cfg),
         )
         entrada_txt = (
-            f"VENDA (Short) LIMIT (−0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDT "
+            f"VENDA (Short) LIMIT (−0,05% vs. último) — notional ≈ {notional_alvo:.2f} USDC "
             f"(risk {_risk_fraction_cfg*100:.1f}% × {_alavancagem_cfg:.2f}x, {modo_label})."
         )
         print(
@@ -2120,7 +2957,7 @@ def rodar_ciclo(modo: str) -> None:
             posicao_aberta = True
             direcao_posicao = "SHORT"
             just_final = (
-                f"{just_ia} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDT. "
+                f"{just_ia} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDC. "
                 " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
                 f"activation no antigo TP×{trailing_mult:.3f}, callback {trailing_cb:.3f}%). "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (SHORT)."
@@ -2144,7 +2981,7 @@ def rodar_ciclo(modo: str) -> None:
                 is_maker=is_maker,
             )
             print(
-                f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDT"
+                f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
             )
             print(
                 "    Próximos ciclos: >>> MODO VIGIA <<< "
@@ -2398,7 +3235,7 @@ async def _auditoria_outcome_engine_task() -> None:
                 pnl_txt = f"{pnl:+.2f}" if pnl is not None else "N/A"
                 print(
                     "[AUDITORIA] Ordem "
-                    f"{side} fechada. PnL Realizado: {pnl_txt} USDT. "
+                    f"{side} fechada. PnL Realizado: {pnl_txt} USDC. "
                     "Resultado guardado no Outcome Engine."
                 )
 
@@ -2411,7 +3248,7 @@ async def _auditoria_outcome_engine_task() -> None:
 async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     """
     Engine orientado por eventos:
-    - escuta WebSocket 1m Futures (ETHUSDC)
+    - escuta WebSocket 1m Futures + bookTicker (ETHUSDC)
     - dispara ciclo em fechamento da vela OU pico de volume intra-vela
     - mantém o socket vivo sem bloquear durante ML/Hub/Brain (to_thread)
     - `while True` + backoff: quedas de WS não derrubam o processo; durante o sleep
@@ -2424,24 +3261,50 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     last_trigger_time = 0.0
 
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+    global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws, _ultimo_tick_ws_ts, _ws_force_restart_requested
 
     while True:
         try:
-            print(f"🛰️ [WS] Ligando stream: {WS_FUTURES_KLINE_1M}")
-            async with websockets.connect(WS_FUTURES_KLINE_1M, ping_interval=20, ping_timeout=20) as ws:
-                print("✅ [WS] Conectado. Aguardando ticks 1m (ETHUSDC)...")
-
-                async for raw in ws:
+            print(f"🛰️ [WS] Ligando stream: {WS_FUTURES_STREAM}")
+            async with websockets.connect(WS_FUTURES_STREAM, ping_interval=20, ping_timeout=20) as ws:
+                print(f"✅ [WS] Conectado. Aguardando streams ({_SYMBOL_REST}: bookTicker + kline_1m)...")
+                _ultimo_tick_ws_ts = time.monotonic()
+                while True:
+                    if _ws_force_restart_requested:
+                        _ws_force_restart_requested = False
+                        raise RuntimeError("ws.restart solicitado pelo watchdog")
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except TimeoutError:
+                        if time.monotonic() - float(_ultimo_tick_ws_ts or 0.0) > 10.0:
+                            raise RuntimeError("ws.restart automático: stream sem dados >10s")
+                        continue
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
 
-                    k = msg.get("k") if isinstance(msg, dict) else None
+                    payload = msg.get("data") if isinstance(msg, dict) and isinstance(msg.get("data"), dict) else msg
+                    stream_name = str(msg.get("stream") or "").lower() if isinstance(msg, dict) else ""
+                    if "@bookticker" in stream_name:
+                        try:
+                            bid_bt = float(payload.get("b") or 0.0)
+                            ask_bt = float(payload.get("a") or 0.0)
+                            if bid_bt > 0:
+                                _best_bid_ws = bid_bt
+                            if ask_bt > 0:
+                                _best_ask_ws = ask_bt
+                        except Exception:
+                            pass
+                        _ultimo_tick_ws_ts = time.monotonic()
+                    k = payload.get("k") if isinstance(payload, dict) else None
                     if not isinstance(k, dict):
                         continue
 
                     preco = float(k.get("c") or 0.0)
+                    if preco > 0:
+                        _ultimo_preco_ws = preco
+                    _ultimo_tick_ws_ts = time.monotonic()
                     vol_atual = float(k.get("v") or 0.0)
                     is_kline_closed = bool(k.get("x"))
                     open_time = int(k.get("t") or 0)
@@ -2496,7 +3359,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                     )
                     print(
                         "[WS] Config dinâmica carregada: "
-                        f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDT (margem) por trade | "
+                        f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
                         f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
                         f"trail_cb={_trailing_callback_cfg:.3f}% | "
                         f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
@@ -2564,6 +3427,7 @@ async def main() -> None:
         "\n[Maestro] Bot quantitativo | MAINNET | modo SPOT/FUTURES via Supabase (config) | "
         "TP/SL 1.02 / 0.99.\n"
     )
+    print(f"🚀 [AURIC-USDC] Iniciando motor para mercado USDC-Margined: {_SYMBOL_REST}.")
     await asyncio.to_thread(_validar_preflight_futures_usdc)
 
     if args.once:
