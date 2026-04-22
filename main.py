@@ -1138,9 +1138,19 @@ def _detectar_tendencia_macro_ema200_15m(
                 "distance_pct": float(distancia),
             }
         if px > ema:
-            return {"trend": "ALTA", "allow_dir": "LONG", "ema200": float(ema)}
+            return {
+                "trend": "ALTA",
+                "allow_dir": "LONG",
+                "ema200": float(ema),
+                "distance_pct": float(distancia),
+            }
         if px < ema:
-            return {"trend": "BAIXA", "allow_dir": "SHORT", "ema200": float(ema)}
+            return {
+                "trend": "BAIXA",
+                "allow_dir": "SHORT",
+                "ema200": float(ema),
+                "distance_pct": float(distancia),
+            }
         return {"trend": "INDEFINIDA", "allow_dir": None, "ema200": float(ema), "distance_pct": 0.0}
     except Exception as e_tm:  # noqa: BLE001
         print(f"⚠️ [SINAL] Filtro EMA200 (15m) indisponível: {e_tm}")
@@ -1164,6 +1174,66 @@ def _gravar_performance_fecho_trade(
         direcao=str(direcao),
         exit_type=str(exit_type),
     )
+
+
+def _features_dataset_intraday(
+    *,
+    best_bid: float | None,
+    best_ask: float | None,
+    vol_bids: float | None,
+    vol_asks: float | None,
+) -> tuple[float | None, float | None]:
+    spread_atual: float | None = None
+    book_imbalance: float | None = None
+    try:
+        bb = float(best_bid) if best_bid is not None else None
+        ba = float(best_ask) if best_ask is not None else None
+        if bb is not None and ba is not None and bb > 0 and ba > 0 and ba >= bb:
+            spread_atual = float(ba - bb)
+    except Exception:  # noqa: BLE001
+        spread_atual = None
+    try:
+        vb = float(vol_bids) if vol_bids is not None else None
+        va = float(vol_asks) if vol_asks is not None else None
+        den = (vb + va) if (vb is not None and va is not None) else None
+        if den is not None and den > 0:
+            book_imbalance = float((vb - va) / den)
+    except Exception:  # noqa: BLE001
+        book_imbalance = None
+    return spread_atual, book_imbalance
+
+
+def _atr_14_15m(ex: Any, *, simbolo: str, modo: str) -> float | None:
+    """
+    ATR(14) sobre velas de 15m. Em falha/dados insuficientes devolve None.
+    """
+    try:
+        sym = simbolo
+        if modo == "FUTURES":
+            sym = executor_futures._resolver_simbolo_perp(ex, simbolo)
+        ohlcv = ex.fetch_ohlcv(sym, timeframe="15m", limit=80)
+        if not ohlcv or len(ohlcv) < 16:
+            return None
+        highs = [float(x[2]) for x in ohlcv if x and len(x) > 4]
+        lows = [float(x[3]) for x in ohlcv if x and len(x) > 4]
+        closes = [float(x[4]) for x in ohlcv if x and len(x) > 4]
+        if len(highs) < 16 or len(lows) < 16 or len(closes) < 16:
+            return None
+        trs: list[float] = []
+        for i in range(1, len(closes)):
+            h = highs[i]
+            l = lows[i]
+            pc = closes[i - 1]
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            trs.append(float(tr))
+        if len(trs) < 14:
+            return None
+        atr = sum(trs[:14]) / 14.0
+        for tr in trs[14:]:
+            atr = ((atr * 13.0) + float(tr)) / 14.0
+        return float(atr)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
@@ -1947,6 +2017,29 @@ def rodar_ciclo(modo: str) -> None:
     else:
         preco = obter_preco_referencia(SYMBOL_TRADE, modo)
     ex = ex_mod.criar_exchange_binance()
+    try:
+        atr_14 = _atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo)
+        spread_boot, _ = _features_dataset_intraday(
+            best_bid=float(_best_bid_ws or 0.0),
+            best_ask=float(_best_ask_ws or 0.0),
+            vol_bids=None,
+            vol_asks=None,
+        )
+        logger.configurar_features_log_ciclo(
+            dist_ema200_pct=None,
+            spread_atual=spread_boot,
+            book_imbalance=None,
+            hora_do_dia=int(datetime.now(timezone.utc).hour),
+            atr_14=atr_14,
+        )
+    except Exception:  # noqa: BLE001
+        logger.configurar_features_log_ciclo(
+            dist_ema200_pct=None,
+            spread_atual=None,
+            book_imbalance=None,
+            hora_do_dia=None,
+            atr_14=None,
+        )
 
     _sincronizar_estado_com_carteira(ex, ex_mod)
 
@@ -2093,6 +2186,7 @@ def rodar_ciclo(modo: str) -> None:
     macro_trend = str(macro.get("trend") or "INDEFINIDA").upper()
     macro_allow = macro.get("allow_dir")
     ema200_v = macro.get("ema200")
+    dist_ema200_pct = _safe_float(macro.get("distance_pct"))
     if macro_trend == "ALTA":
         print("📈 [SINAL] Tendência Macro: ALTA (Preço > EMA200). Procurando apenas LONGs.")
     elif macro_trend == "BAIXA":
@@ -2112,6 +2206,7 @@ def rodar_ciclo(modo: str) -> None:
     prob_ml_base = float(probabilidade)
     parede_venda_proxima_confirma_short = False
     parede_venda_preco_ref: float | None = None
+    obp: dict[str, Any] | None = None
     if modo == "FUTURES":
         try:
             obp = executor_futures.analisar_pressao_order_book(SYMBOL_TRADE, ex, depth_limit=100)
@@ -2133,6 +2228,28 @@ def rodar_ciclo(modo: str) -> None:
                         parede_venda_preco_ref = float(obp.get("preco_atual")) * (1.0 + float(dist))
         except Exception as e_ob:  # noqa: BLE001
             print(f"⚠️ [ORDER BOOK] Falha ao analisar depth Binance: {e_ob}")
+    try:
+        spread_atual, book_imbalance = _features_dataset_intraday(
+            best_bid=float(_best_bid_ws or 0.0),
+            best_ask=float(_best_ask_ws or 0.0),
+            vol_bids=_safe_float((obp or {}).get("bid_volume_1pct")),
+            vol_asks=_safe_float((obp or {}).get("ask_volume_1pct")),
+        )
+        logger.configurar_features_log_ciclo(
+            dist_ema200_pct=dist_ema200_pct,
+            spread_atual=spread_atual,
+            book_imbalance=book_imbalance,
+            hora_do_dia=int(datetime.now(timezone.utc).hour),
+            atr_14=_atr_14_15m(ex, simbolo=SYMBOL_TRADE, modo=modo),
+        )
+    except Exception:  # noqa: BLE001
+        logger.configurar_features_log_ciclo(
+            dist_ema200_pct=dist_ema200_pct,
+            spread_atual=None,
+            book_imbalance=None,
+            hora_do_dia=int(datetime.now(timezone.utc).hour),
+            atr_14=None,
+        )
 
     try:
         snap = ml_model.obter_snapshot_indicadores_eth(
@@ -2305,6 +2422,13 @@ def rodar_ciclo(modo: str) -> None:
 
     if macro_trend == "INDEFINIDA":
         print("🚧 [SINAL] Preço na Chop Zone da EMA200 (Indefinida). Aguardando rompimento claro.")
+        snap_veto = {
+            **snap,
+            "prob_ml": probabilidade,
+            "macro_trend": macro_trend,
+            "macro_allow_dir": macro_allow,
+            "macro_ema200": ema200_v,
+        }
         logger.registrar_log_trade(
             par_moeda=SYMBOL_TRADE,
             preco=preco,
@@ -2312,6 +2436,14 @@ def rodar_ciclo(modo: str) -> None:
             sentimento="NEUTRAL",
             acao="VETO_TENDENCIA_EMA200",
             justificativa=(
+                "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
+                f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
+            ),
+            contexto_raw=indicators.formatar_log_contexto_raw(
+                "VETO_TENDENCIA_EMA200 por Chop Zone (EMA200 15m).",
+                snap_veto,
+            ),
+            justificativa_ia=(
                 "No-Trade Zone EMA200 15m: tendência INDEFINIDA "
                 f"(buffer {EMA_BUFFER_PCT*100:.2f}%)."
             ),
@@ -2323,6 +2455,14 @@ def rodar_ciclo(modo: str) -> None:
             f"🛑 [EMA200 FILTER] {direcao_sugerida} bloqueado pela tendência macro "
             f"({macro_trend}). Permitido apenas {macro_allow}."
         )
+        snap_veto = {
+            **snap,
+            "prob_ml": probabilidade,
+            "macro_trend": macro_trend,
+            "macro_allow_dir": macro_allow,
+            "macro_ema200": ema200_v,
+            "direcao_sugerida": direcao_sugerida,
+        }
         logger.registrar_log_trade(
             par_moeda=SYMBOL_TRADE,
             preco=preco,
@@ -2330,6 +2470,14 @@ def rodar_ciclo(modo: str) -> None:
             sentimento="NEUTRAL",
             acao="VETO_TENDENCIA_EMA200",
             justificativa=(
+                f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+            ),
+            contexto_raw=indicators.formatar_log_contexto_raw(
+                "VETO_TENDENCIA_EMA200 por direção oposta ao filtro macro EMA200 15m.",
+                snap_veto,
+            ),
+            justificativa_ia=(
                 f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
                 f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
             ),

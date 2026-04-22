@@ -22,10 +22,39 @@ else:
 
 # Nomes canónicos Supabase (sincronia com migrações / dashboard).
 TABELA_LOGS = "logs"
+TABELA_TRADES = "trades"
 TABELA_WALLET_STATUS = "wallet_status"
 TABELA_CONFIG = "config"
 COLUNA_USDT_BALANCE = "usdt_balance"
 COLUNA_USDC_BALANCE = "usdc_balance"
+
+# Features auxiliares para treino (setadas por ciclo no main; fallback None).
+_FEATURES_LOG_DEFAULTS: dict[str, Any] = {
+    "dist_ema200_pct": None,
+    "spread_atual": None,
+    "book_imbalance": None,
+    "hora_do_dia": None,
+    "atr_14": None,
+}
+
+
+def configurar_features_log_ciclo(
+    *,
+    dist_ema200_pct: float | None = None,
+    spread_atual: float | None = None,
+    book_imbalance: float | None = None,
+    hora_do_dia: int | None = None,
+    atr_14: float | None = None,
+) -> None:
+    """Atualiza defaults de features para os próximos `registrar_log_trade`."""
+    global _FEATURES_LOG_DEFAULTS
+    _FEATURES_LOG_DEFAULTS = {
+        "dist_ema200_pct": dist_ema200_pct,
+        "spread_atual": spread_atual,
+        "book_imbalance": book_imbalance,
+        "hora_do_dia": hora_do_dia,
+        "atr_14": atr_14,
+    }
 
 
 def obter_bot_ativo() -> bool:
@@ -54,14 +83,14 @@ def obter_bot_ativo() -> bool:
         return True
 
 
-def obter_preco_entrada_ultima_compra(par_moeda: str = "ETH/USDT") -> Optional[float]:
+def obter_preco_entrada_ultima_compra(par_moeda: str = "ETH/USDC") -> Optional[float]:
     """Compat: última entrada Long (COMPRA_LONG_LIMIT / legacy COMPRA_LONG_MARKET, etc.)."""
     p, _ = obter_preco_entrada_ultima_posicao(par_moeda)
     return p
 
 
 def obter_preco_entrada_ultima_posicao(
-    par_moeda: str = "ETH/USDT",
+    par_moeda: str = "ETH/USDC",
 ) -> tuple[Optional[float], str]:
     """
     Último log de abertura (Long ou Short), por id desc.
@@ -111,10 +140,94 @@ def obter_preco_entrada_ultima_posicao(
         return None, "LONG"
 
 
+def _variants_symbolo_trade(par_moeda: str) -> list[str]:
+    p = (par_moeda or "").strip() or "ETH/USDC"
+    xs = {p, p.replace(":USDC", ""), p.replace("/", "").replace(":USDC", "")}
+    return [x for x in xs if x]
+
+
+def atualizar_qty_left_ultimo_trade(par_moeda: str, qty_left: float) -> None:
+    """
+    Atualiza `qty_left` na linha mais recente de `public.trades` para o símbolo
+    (abertura mais recente). Falha de schema/RLS apenas regista aviso.
+    """
+    if not supabase:
+        return
+    qv = float(qty_left)
+    if qv < 0:
+        return
+    payload: dict[str, Any] = {"qty_left": qv}
+    for sym in _variants_symbolo_trade(par_moeda):
+        try:
+            res = (
+                supabase.table(TABELA_TRADES)
+                .select("id")
+                .eq("symbol", sym)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            if not rows:
+                continue
+            tid = rows[0].get("id")
+            if tid is None:
+                continue
+            supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
+            print(
+                f"💾 [{TABELA_TRADES}] qty_left={qv:g} actualizado (id={tid}, symbol={sym})."
+            )
+            return
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ atualizar_qty_left_ultimo_trade ({sym}): {e}")
+    print(
+        f"⚠️ atualizar_qty_left_ultimo_trade: sem linha em {TABELA_TRADES} para {par_moeda!r} — "
+        "qty_left não actualizado (insira trade ou migre schema)."
+    )
+
+
+def atualizar_ultimo_trade_campos(par_moeda: str, campos: dict[str, Any]) -> None:
+    """
+    UPDATE na linha mais recente de `public.trades` para o símbolo (ex.: `partial_roi`,
+    `final_roi`, `exit_type`). Chaves com valor `None` são omitidas do payload.
+    """
+    if not supabase:
+        return
+    payload = {k: v for k, v in campos.items() if v is not None}
+    if not payload:
+        return
+    for sym in _variants_symbolo_trade(par_moeda):
+        try:
+            res = (
+                supabase.table(TABELA_TRADES)
+                .select("id")
+                .eq("symbol", sym)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            if not rows:
+                continue
+            tid = rows[0].get("id")
+            if tid is None:
+                continue
+            supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
+            keys = ", ".join(f"{k}={payload[k]!r}" for k in sorted(payload))
+            print(f"💾 [{TABELA_TRADES}] {keys} (id={tid}, symbol={sym}).")
+            return
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ atualizar_ultimo_trade_campos ({sym}): {e}")
+    print(
+        f"⚠️ atualizar_ultimo_trade_campos: sem linha em {TABELA_TRADES} para {par_moeda!r} — "
+        "campos não actualizados."
+    )
+
+
 def persistir_saldo_usdt(saldo: float, *, row_id: int = 1) -> None:
     """
-    Grava o saldo USDT **Futuros USDT-M** (o mesmo valor que
-    `exchange.fetch_balance(params={'type': 'future'})['total']['USDT']`).
+    Grava o saldo USDC de Futures (o mesmo valor de
+    `exchange.fetch_balance(params={'type': 'future'})['total']['USDC']`).
 
     1) **wallet_status** (`public.wallet_status`, linha `id=1`): **upsert** na coluna
        `usdt_balance` + `updated_at`. No PostgREST isto corresponde a
@@ -171,11 +284,16 @@ def registrar_log_trade(
     noticias_agregadas: str | None = None,
     commission: float | None = None,
     is_maker: bool | None = None,
+    dist_ema200_pct: float | None = None,
+    spread_atual: float | None = None,
+    book_imbalance: float | None = None,
+    hora_do_dia: int | None = None,
+    atr_14: float | None = None,
 ):
     """
     INSERT na tabela `logs` no Supabase.
 
-    Colunas enviadas: `par_moeda` (texto, ex. ETH/USDT), `preco_atual`, `probabilidade_ml`,
+    Colunas enviadas: `par_moeda` (texto, ex. ETH/USDC), `preco_atual`, `probabilidade_ml`,
     `sentimento_ia`, `veredito_ia` (espelho do veredito para o dashboard),
     `acao_tomada`, `justificativa`, `contexto_raw`,
     opcionais `justificativa_ia`, `noticias_agregadas` (dashboard).
@@ -198,6 +316,22 @@ def registrar_log_trade(
         "acao_tomada": acao,
         "justificativa": justificativa,
         "contexto_raw": contexto_raw,
+        # Colunas de features para dataset (enviar sempre; None quando indisponível).
+        "dist_ema200_pct": (
+            dist_ema200_pct if dist_ema200_pct is not None else _FEATURES_LOG_DEFAULTS["dist_ema200_pct"]
+        ),
+        "spread_atual": (
+            spread_atual if spread_atual is not None else _FEATURES_LOG_DEFAULTS["spread_atual"]
+        ),
+        "book_imbalance": (
+            book_imbalance if book_imbalance is not None else _FEATURES_LOG_DEFAULTS["book_imbalance"]
+        ),
+        "hora_do_dia": (
+            hora_do_dia if hora_do_dia is not None else _FEATURES_LOG_DEFAULTS["hora_do_dia"]
+        ),
+        "atr_14": (
+            atr_14 if atr_14 is not None else _FEATURES_LOG_DEFAULTS["atr_14"]
+        ),
     }
     if justificativa_ia is not None:
         dados_log["justificativa_ia"] = justificativa_ia
@@ -220,4 +354,4 @@ def registrar_log_trade(
 
 # Teste rápido se rodar o arquivo diretamente
 if __name__ == "__main__":
-    registrar_log_trade("ETH/USDT", 3000.0, 0.65, "BULLISH", "TESTE_CONEXAO", "Validando integração.")
+    registrar_log_trade("ETH/USDC", 3000.0, 0.65, "BULLISH", "TESTE_CONEXAO", "Validando integração.")
