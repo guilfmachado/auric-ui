@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { Toaster } from "react-hot-toast";
 
 import "./globals.css";
 
@@ -34,6 +35,12 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased bg-[#09090b]`}
       >
         {children}
+        <Toaster
+          position="top-center"
+          toastOptions={{
+            className: "!bg-zinc-900 !text-zinc-100 !border !border-zinc-700",
+          }}
+        />
       </body>
     </html>
   );

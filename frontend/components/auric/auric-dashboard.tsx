@@ -9,6 +9,7 @@ import { useEthTicker } from "@/hooks/use-eth-ticker";
 import { parseTelemetryFromLog } from "@/lib/auric/parse-telemetry";
 
 import { ProfitChart } from "@/components/ProfitChart";
+import AuricControl from "@/components/AuricControl";
 
 import { AuricHeader } from "./auric-header";
 import { AiAuditPanel } from "./ai-audit-panel";
@@ -298,6 +299,8 @@ export function AuricDashboard() {
           showSynced={showSynced}
           onPatch={updateBotConfigDebounced}
         />
+
+        <AuricControl />
 
         {isMotorLoading && (
           <>

@@ -201,6 +201,7 @@ def _montar_prompt_completo_claude(
     direcao_sugerida: str = "LONG",
     bloco_tecnico_prioritario: str | None = None,
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
+    user_market_observation: str | None = None,
 ) -> str:
     base = _prompt_sistema_claude(direcao_sugerida)
     if bloco_tecnico_prioritario and str(bloco_tecnico_prioritario).strip():
@@ -230,6 +231,14 @@ def _montar_prompt_completo_claude(
             "de um VETO ou procurar divergências para SHORT. Se os dados vierem como None, ignore "
             "esta métrica no ciclo atual."
         )
+    bloco += "\n\n=== [USER_SENTIMENT_CONTEXT] — Contexto Humano ===\n"
+    obs = (user_market_observation or "").strip()
+    if obs:
+        bloco += (
+            f"\nIntegra o bloco abaixo na decisão de risco (Supabase e/ou observação de sessão).\n\n{obs}\n"
+        )
+    else:
+        bloco += "\n(Nenhuma observação humana ativa para este ciclo.)\n"
     bloco += (
         "\n\nResponde agora somente com o objeto JSON pedido acima "
         "(cinco chaves, incluindo posicao_recomendada)."
@@ -290,6 +299,7 @@ def analisar_sentimento_mercado(
     bloco_indicadores: str | None = None,
     bloco_tecnico_prioritario: str | None = None,
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
+    user_market_observation: str | None = None,
 ) -> dict[str, Any]:
     """
     Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Replicate (Claude 4.5 por omissão).
@@ -338,6 +348,7 @@ def analisar_sentimento_mercado(
         direcao_sugerida=d,
         bloco_tecnico_prioritario=ta_block,
         micro_estrutura_posicionamento=micro_estrutura_posicionamento,
+        user_market_observation=user_market_observation,
     )
 
     model_slug = REPLICATE_MODEL

@@ -47,11 +47,13 @@ def _normalizar_symbol_env_para_ccxt(raw: str) -> str:
     return s
 
 
-SYMBOL_TRADE = _normalizar_symbol_env_para_ccxt(os.getenv("SYMBOL", "ETHUSDC"))
-_SYMBOL_REST = SYMBOL_TRADE.replace("/", "").replace(":USDC", "")
+# Motor + REST: sempre USDC-margined ETHUSDC (independente de SYMBOL no .env ou teste WS).
+SYMBOL_TRADE = "ETH/USDC"
+_SYMBOL_REST = "ETHUSDC"
+# WebSocket: stream multiplexado na URL (Binance Futures).
+_SYM_WS = _SYMBOL_REST.lower()
 WS_FUTURES_STREAM = (
-    f"wss://fstream.binance.com/stream?streams={_SYMBOL_REST.lower()}@kline_1m/"
-    f"{_SYMBOL_REST.lower()}@bookTicker"
+    f"wss://fstream.binance.com/stream?streams={_SYM_WS}@kline_1m/{_SYM_WS}@bookTicker"
 )
 ALAVANCAGEM_PADRAO = 6
 RISK_FRACTION_PADRAO = 0.20
@@ -101,6 +103,14 @@ PARTIAL_TP_CLOSE_FRAC = 0.5
 TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.6  # 0.6 == 0,6%
 SPREAD_GUARD_MAX_FRAC = 0.001  # (ask−bid)/mid > 0,1%
 SPREAD_GUARD_PAUSE_S = 5.0
+
+# --- Observação humana → prompt do Brain (Claude), secção [USER_SENTIMENT_CONTEXT] / Contexto Humano ---
+# Supabase: tabela `bot_commands`, key='market_observation', colunas active + value (ver migração).
+# RAM (opcional): atribui manualmente (ex. REPL): main.USER_MARKET_OBSERVATION = "Double bottom em 15m"
+USER_MARKET_OBSERVATION: str | None = None
+# True: apaga a observação logo após cada chamada bem-sucedida ao Brain neste ciclo.
+# False: mantém até mudares USER_MARKET_OBSERVATION (ou None) manualmente.
+USER_MARKET_OBSERVATION_CLEAR_AFTER_BRAIN_CALL = False
 
 # --- Estado do bot (memória do processo; reinício do script perde o estado) ---
 posicao_aberta: bool = False
@@ -183,31 +193,36 @@ def _registar_loop_principal_async() -> None:
     _main_event_loop = asyncio.get_running_loop()
 
 
+def _sleep_off_event_loop(sec: float, timeout_buf: float = 30.0) -> None:
+    """
+    Pausa chamada desde threads (ex.: `asyncio.to_thread(rodar_ciclo)` ou comando manual).
+    Agenda `asyncio.sleep` no loop principal; se não houver loop, usa `Event.wait`
+    (evita `time.sleep` e não bloqueia o asyncio na thread do motor WS).
+    """
+    loop = _main_event_loop
+    s = float(sec)
+    if loop is not None and loop.is_running():
+        try:
+            fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(s), loop)
+            fut.result(timeout=s + timeout_buf)
+            return
+        except Exception:
+            pass
+    threading.Event().wait(s)
+
+
 def _cooldown_apos_falha_ordem_desde_thread_ciclo() -> None:
     """
     Chamado desde `rodar_ciclo` (asyncio.to_thread): após falha de ordem ML,
     impõe pausa antes de novos HTTP — usa o loop principal para não parar
     o WebSocket, métricas ou listener manual durante o backoff.
     """
-    loop = _main_event_loop
     sec = float(ORDER_FAILURE_BACKOFF_S)
     print(
         f"⏳ [RATE LIMIT] Backoff {sec:.0f}s após falha de execução de ordem (anti-spam HTTP).",
         flush=True,
     )
-    if loop is not None and loop.is_running():
-        try:
-            fut = asyncio.run_coroutine_threadsafe(asyncio.sleep(sec), loop)
-            fut.result(timeout=sec + 15.0)
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"⚠️ [RATE LIMIT] asyncio.sleep no loop principal falhou ({e}); "
-                f"time.sleep({sec:.0f}s) neste worker.",
-                flush=True,
-            )
-            time.sleep(sec)
-    else:
-        time.sleep(sec)
+    _sleep_off_event_loop(sec)
 
 
 def _commission_and_maker_from_order(ordem: dict[str, Any]) -> tuple[float | None, bool]:
@@ -298,6 +313,90 @@ def verificar_permissao_operacao() -> bool:
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ [ERRO] Falha ao ler permissão: {e}")
         return False
+
+
+def _formatar_peso_conflito_humano_xgboost() -> str:
+    return (
+        "PESO EM CONFLITO (obrigatório): se a observação humana divergir do sinal numérico do "
+        "XGBoost ou da direção sugerida pelo orquestrador, atribui **peso relativo 2.0** à "
+        "observação humana face ao sinal técnico do XGBoost — ou seja, em empate material a "
+        "observação prevalece (podes responder VETO, CAUTIOUS ou alinhar só com confluência forte)."
+    )
+
+
+def _corpo_contexto_humano_por_texto(valor: str) -> str:
+    """Corpo narrativo para o Brain (sem linha de peso; combinação junta o peso uma vez)."""
+    v = (valor or "").strip()
+    if not v:
+        return ""
+    low = v.lower()
+    if "double bottom" in low or "fundo duplo" in low:
+        return (
+            f"Padrão reportado: {v}\n\n"
+            "Instrução extra: com Double Bottom / Fundo Duplo, se o RSI no bloco técnico estiver "
+            "**baixo** (sobrevenda / RSI que não confirma pressão de venda), **não** confirmes "
+            "SHORT apenas com base no XGBoost — favorece VETO, CAUTIOUS ou leitura de armadilha "
+            "para shorts em suporte."
+        )
+    if "double top" in low or "topo duplo" in low:
+        return (
+            f"Padrão reportado: {v}\n\n"
+            "Instrução extra: com Double Top / Topo Duplo, se houver **rejeição em resistência** "
+            "(falha de rompimento, pavios superiores, recuo após teste do topo), **não** confirmes "
+            "LONG apenas com base no XGBoost — favorece VETO, CAUTIOUS ou bull trap."
+        )
+    return f"OBSERVAÇÃO DO FOUNDER: {v}"
+
+
+def _combinar_contexto_humano_supabase_e_ram(
+    valor_supabase: str | None,
+    texto_ram: str | None,
+) -> str | None:
+    corpos: list[str] = []
+    if valor_supabase and str(valor_supabase).strip():
+        corpos.append(
+            "[Fonte: Supabase `bot_commands` key=market_observation, active]\n"
+            + _corpo_contexto_humano_por_texto(str(valor_supabase).strip())
+        )
+    if texto_ram and str(texto_ram).strip():
+        corpos.append(
+            "[Fonte: sessão RAM `USER_MARKET_OBSERVATION`]\n"
+            + _corpo_contexto_humano_por_texto(str(texto_ram).strip())
+        )
+    if not corpos:
+        return None
+    return "\n\n---\n\n".join(corpos) + "\n\n" + _formatar_peso_conflito_humano_xgboost()
+
+
+def obter_valor_market_observation_supabase() -> str | None:
+    """
+    Lê `bot_commands` onde key == 'market_observation'.
+    Se `active` for True, devolve o texto em `value` (trim); caso contrário None.
+    """
+    if logger.supabase is None:
+        return None
+    try:
+        res = (
+            logger.supabase.table("bot_commands")
+            .select("active", "value")
+            .eq("key", "market_observation")
+            .limit(1)
+            .execute()
+        )
+        rows = res.data if isinstance(res.data, list) else []
+        if not rows:
+            return None
+        row = rows[0]
+        if not bool(row.get("active")):
+            return None
+        raw = row.get("value")
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        return s or None
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ obter_valor_market_observation_supabase: {e}")
+        return None
 
 
 def obter_parametros_trailing_supabase() -> tuple[float, float]:
@@ -873,7 +972,7 @@ def _executar_comando_manual_imediato_sync(
                     print("🎯 [WARM-UP] Sistema 100% pronto. Executando...")
                     break
             print("⏳ [FORCE-WAIT] Aguardando Preço + Orderbook (L2)...")
-            time.sleep(intervalo_s)
+            _sleep_off_event_loop(intervalo_s)
             tentativas += 1
             preco_ws = float(_ultimo_preco_ws or 0.0)
         if not (preco_ws > 0):
@@ -1010,11 +1109,11 @@ async def _escutar_comandos_manuais() -> None:
             continue
 
         print(
-            f"👑 [GOD MODE] Comando MANUAL {cmd} intercetado e a ser executado INSTANTANEAMENTE! (id={rid})"
+            f"\n👑 [GOD MODE] Comando MANUAL {cmd} intercetado e a ser executado INSTANTANEAMENTE! (id={rid})"
         )
         if time.monotonic() - float(_ultimo_tick_ws_ts or 0.0) > 10.0:
             _ws_force_restart_requested = True
-            print("⚠️ [WS-WATCHDOG] Sem ticks há >10s. Solicitando ws.restart() automático.")
+            print("\n⚠️ [WS-WATCHDOG] Sem ticks há >10s. Solicitando ws.restart() automático.")
 
         cfg_dyn = await _obter_configuracoes_dinamicas()
         _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
@@ -1034,13 +1133,13 @@ async def _escutar_comandos_manuais() -> None:
 
         try:
             await asyncio.to_thread(_executar_comando_manual_imediato_sync, cmd, rid)
-            print(f"✅ [MANUAL LISTENER] Comando {cmd} (id={rid}) executado com sucesso.")
+            print(f"\n✅ [MANUAL LISTENER] Comando {cmd} (id={rid}) executado com sucesso.")
         except Exception as e:  # noqa: BLE001
-            print(f"❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
+            print(f"\n❌ [MANUAL LISTENER] Falha ao executar {cmd} (id={rid}): {e}")
             await asyncio.to_thread(_mark_manual_command_status_sync, rid, "FAILED")
             await asyncio.to_thread(_limpar_comandos_manuais_pendentes_sync)
             print(
-                f"⏳ [MANUAL LISTENER] Cooldown {ORDER_FAILURE_BACKOFF_S:.0f}s após falha "
+                f"\n⏳ [MANUAL LISTENER] Cooldown {ORDER_FAILURE_BACKOFF_S:.0f}s após falha "
                 "(anti-spam / rate limit exchange)."
             )
             await asyncio.sleep(ORDER_FAILURE_BACKOFF_S)
@@ -2033,12 +2132,16 @@ def rodar_ciclo(modo: str) -> None:
     global _equity_inicio_dia, _travado_ate_ts
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
     global _ultimo_preco_ws
+    global USER_MARKET_OBSERVATION
 
     if not logger.obter_bot_ativo():
         print("Bot em modo Standby via Dashboard")
         return
 
     atualizar_saldo_supabase()
+    # Human sentiment: leitura fresca do Supabase em **cada** ciclo (ex.: a cada ~1 min no gatilho WS)
+    # para que alterações via dashboard (Vercel /api/bot/command) entrem no próximo ciclo antes do Brain.
+    valor_obs_supabase = obter_valor_market_observation_supabase()
 
     ex_mod = executor_futures if modo == "FUTURES" else executor_spot
     modo_label = "FUTURES USDC" if modo == "FUTURES" else "SPOT"
@@ -2648,6 +2751,11 @@ def rodar_ciclo(modo: str) -> None:
     _ultimo_contexto_raw_supabase = contexto_raw_supabase
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
 
+    contexto_humano_brain = _combinar_contexto_humano_supabase_e_ram(
+        valor_obs_supabase,
+        USER_MARKET_OBSERVATION,
+    )
+
     # 3. Ativa o Cérebro (Claude) com rate limiter para proteger a API.
     pode_chamar_claude, n_chamadas, espera_s = _permitir_consulta_claude()
     if pode_chamar_claude:
@@ -2667,7 +2775,11 @@ def rodar_ciclo(modo: str) -> None:
                 "funding_rate": snap_log.get("funding_rate"),
                 "long_short_ratio": snap_log.get("long_short_ratio"),
             },
+            user_market_observation=contexto_humano_brain,
         )
+        if USER_MARKET_OBSERVATION_CLEAR_AFTER_BRAIN_CALL and USER_MARKET_OBSERVATION:
+            if str(veredito.get("sentimento", "")).upper() != "ERROR":
+                USER_MARKET_OBSERVATION = None
     else:
         _metric_inc("claude_rate_limited", 1)
         print(
@@ -2900,21 +3012,48 @@ def rodar_ciclo(modo: str) -> None:
             )
             return
 
-    if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("double_bottom"):
-        if sent == "BEARISH" and pos_rec == "SHORT":
-            print(
-                "    [Price Action] Double Bottom (dois fundos locais + repique) — viés alta; SHORT vetado."
-            )
+    if not manual_override_veredito and modo == "FUTURES" and sent == "BEARISH" and pos_rec == "SHORT":
+        db_pa = bool(pa_bundle.get("double_bottom"))
+        db_troughs = False
+        try:
+            sym_db = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+            ohlcv_db = ex.fetch_ohlcv(sym_db, "1m", limit=50)
+            db_troughs = indicators.detect_double_bottom(ohlcv_db, tolerance=0.001)
+        except Exception:
+            db_troughs = False
+        if db_pa or db_troughs:
+            if db_troughs and not db_pa:
+                print(
+                    "    [Filtro] Dois últimos mínimos locais (50×1m) alinhados + preço no nível — "
+                    "evitar SHORT em suporte duplo (VETO_DOUBLE_BOTTOM)."
+                )
+                j_db = (
+                    "Dois últimos troughs 1m (±0,1% nos lows e close no nível médio); "
+                    "risco de suporte / fundo duplo."
+                )
+            elif db_pa and not db_troughs:
+                print(
+                    "    [Price Action] Double Bottom (dois fundos locais + repique) — viés alta; SHORT vetado."
+                )
+                j_db = (
+                    f"Double Bottom (PA): pivots 1m alinhados (±{indicators.DOUBLE_PIVOT_ZONE_FRAC*100:.3f}%) "
+                    "e repique após teste de fundo anterior."
+                )
+            else:
+                print(
+                    "    [Price Action + Filtro] Double Bottom (PA e troughs 50×1m) — SHORT vetado."
+                )
+                j_db = (
+                    f"Double Bottom: PA (±{indicators.DOUBLE_PIVOT_ZONE_FRAC*100:.3f}%) e/ou "
+                    "dois últimos mínimos locais 1m com preço no nível (tolerance 0,1%)."
+                )
             logger.registrar_log_trade(
                 par_moeda=SYMBOL_TRADE,
                 preco=preco,
                 prob_ml=probabilidade,
                 sentimento=sent,
                 acao="VETO_DOUBLE_BOTTOM",
-                justificativa=(
-                    f"{just_ia} | Double Bottom: pivots 1m alinhados (±{indicators.DOUBLE_PIVOT_ZONE_FRAC*100:.3f}%) "
-                    "e repique após teste de fundo anterior."
-                ),
+                justificativa=f"{just_ia} | {j_db}",
                 lado_ordem="SHORT",
                 contexto_raw=contexto_raw_supabase,
                 justificativa_ia=just_ia,
@@ -3399,7 +3538,7 @@ def _buscar_logs_recentes_para_outcome(limit: int = 400) -> list[dict[str, Any]]
         data = res.data or []
         return data if isinstance(data, list) else []
     except Exception as e:  # noqa: BLE001
-        print(f"⚠️ [AUDITORIA] Falha ao ler logs recentes: {e}")
+        print(f"\n⚠️ [AUDITORIA] Falha ao ler logs recentes: {e}")
         return []
 
 
@@ -3516,23 +3655,49 @@ async def _auditoria_outcome_engine_task() -> None:
                         "closed_at": closed_at,
                     }
                 )
-                pnl_txt = f"{pnl:+.2f}" if pnl is not None else "N/A"
-                print(
-                    "[AUDITORIA] Ordem "
-                    f"{side} fechada. PnL Realizado: {pnl_txt} USDC. "
-                    "Resultado guardado no Outcome Engine."
-                )
+                # Silenciado: um print por ordem fechada inunda o terminal e compete com o WS.
+                # pnl_txt = f"{pnl:+.2f}" if pnl is not None else "N/A"
+                # print(
+                #     "[AUDITORIA] Ordem "
+                #     f"{side} fechada. PnL Realizado: {pnl_txt} USDC. "
+                #     "Resultado guardado no Outcome Engine."
+                # )
 
             if upserts:
+                print(
+                    f"\n[AUDITORIA] Reconciliação: {len(upserts)} ordem(ns) fechada(s) "
+                    f"→ trade_outcomes (sem print por ordem; evita flood)."
+                )
                 await asyncio.to_thread(_upsert_outcomes_sync, upserts)
         except Exception as e:  # noqa: BLE001
-            print(f"⚠️ [AUDITORIA] Falha no loop de reconciliação: {e}")
+            print(f"\n⚠️ [AUDITORIA] Falha no loop de reconciliação: {e}")
+
+
+def _sincronizar_rsi_adx_globais_de_snap_ws() -> None:
+    """
+    Atualiza `_ultimo_rsi_14` / `_ultimo_adx_14` a partir do snapshot OHLCV (mesma fonte que o ciclo ML).
+    Chamado desde o WS antes do print de vela fechada, para não mostrar 0.0 no primeiro tick.
+    """
+    global _ultimo_rsi_14, _ultimo_adx_14
+    try:
+        snap = ml_model.obter_snapshot_indicadores_eth(SYMBOL_TRADE, prob_ml=None)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n⚠️ [WS] Snapshot indicadores indisponível para log de vela: {e}")
+        return
+    try:
+        _ultimo_rsi_14 = float(snap.get("rsi_14")) if snap.get("rsi_14") is not None else 0.0
+    except (TypeError, ValueError):
+        _ultimo_rsi_14 = 0.0
+    try:
+        _ultimo_adx_14 = float(snap.get("adx_14")) if snap.get("adx_14") is not None else 0.0
+    except (TypeError, ValueError):
+        _ultimo_adx_14 = 0.0
 
 
 async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     """
     Engine orientado por eventos:
-    - escuta WebSocket 1m Futures + bookTicker (ETHUSDC)
+    - escuta WebSocket 1m Futures (multiplex na URL: ethusdc@kline_1m + ethusdc@bookTicker)
     - dispara ciclo em fechamento da vela OU pico de volume intra-vela
     - mantém o socket vivo sem bloquear durante ML/Hub/Brain (to_thread)
     - `while True` + backoff: quedas de WS não derrubam o processo; durante o sleep
@@ -3546,79 +3711,97 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
 
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
     global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws, _ultimo_tick_ws_ts, _ws_force_restart_requested
+    global _ultimo_rsi_14, _ultimo_adx_14
 
     while True:
         try:
-            print(f"🛰️ [WS] Ligando stream: {WS_FUTURES_STREAM}")
+            print(f"\n🛰️ [WS] Ligando stream: {WS_FUTURES_STREAM}")
             async with websockets.connect(WS_FUTURES_STREAM, ping_interval=20, ping_timeout=20) as ws:
-                print(f"✅ [WS] Conectado. Aguardando streams ({_SYMBOL_REST}: bookTicker + kline_1m)...")
+                print(
+                    f"\n✅ [WS] Conectado. Motor REST={_SYMBOL_REST} | multiplex na URL (produção)."
+                )
                 _ultimo_tick_ws_ts = time.monotonic()
+                _last_heartbeat_print = time.monotonic()
                 while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    except TimeoutError:
+                        if _ws_force_restart_requested:
+                            _ws_force_restart_requested = False
+                            raise RuntimeError("ws.restart solicitado pelo watchdog")
+                        now_hb = time.monotonic()
+                        if now_hb - _last_heartbeat_print >= 10.0:
+                            print("\n💓 Bot Operando...", flush=True)
+                            _last_heartbeat_print = now_hb
+                        sem_dados_s = now_hb - float(_ultimo_tick_ws_ts or 0.0)
+                        if sem_dados_s > 30.0:
+                            raise RuntimeError("ws.restart automático: stream sem dados >30s")
+                        continue
+                    now_loop = time.monotonic()
+                    if now_loop - _last_heartbeat_print >= 10.0:
+                        print("\n💓 Bot Operando...", flush=True)
+                        _last_heartbeat_print = now_loop
                     if _ws_force_restart_requested:
                         _ws_force_restart_requested = False
                         raise RuntimeError("ws.restart solicitado pelo watchdog")
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                    except TimeoutError:
-                        if time.monotonic() - float(_ultimo_tick_ws_ts or 0.0) > 10.0:
-                            raise RuntimeError("ws.restart automático: stream sem dados >10s")
-                        continue
-                    try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
-                    if isinstance(msg, dict):
-                        print(f"\n[WS-ROUTING] Stream recebida: {msg.get('stream')}")
+                    if isinstance(msg, dict) and "result" in msg:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
 
                     try:
-                        payload = (
-                            msg.get("data")
-                            if isinstance(msg, dict) and isinstance(msg.get("data"), dict)
-                            else msg
-                        )
-                        stream_name = str(msg.get("stream") or "") if isinstance(msg, dict) else ""
-                        stream_name_l = stream_name.lower()
-                        if stream_name and "@bookticker" in stream_name_l:
-                            # Pulso visual: confirma tráfego contínuo do bookTicker.
-                            print(".", end="", flush=True)
+                        data = msg.get("data", msg)
+                        if not isinstance(data, dict):
+                            continue
+                        e = data.get("e")
+                        if e == "bookTicker":
                             try:
-                                bid_bt = float(payload.get("b") or 0.0)
-                                ask_bt = float(payload.get("a") or 0.0)
+                                bid_bt = float(data.get("b") or 0.0)
+                                ask_bt = float(data.get("a") or 0.0)
                                 if bid_bt > 0:
                                     _best_bid_ws = bid_bt
                                 if ask_bt > 0:
                                     _best_ask_ws = ask_bt
                             except Exception:
                                 pass
+                            # Imprime apenas o preço atual na mesma linha para não gerar flood
+                            try:
+                                print(
+                                    f"\rPreço Atual: {data['b']} USDC | {time.strftime('%H:%M:%S')}",
+                                    end="",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
                             _ultimo_tick_ws_ts = time.monotonic()
-                        if not (stream_name and "@kline_1m" in stream_name_l):
                             continue
-                        k = payload.get("k") if isinstance(payload, dict) else None
+                        if e != "kline":
+                            _ultimo_tick_ws_ts = time.monotonic()
+                            continue
+                        if str(data.get("s") or "").upper() != "ETHUSDC":
+                            _ultimo_tick_ws_ts = time.monotonic()
+                            continue
+                        k = data.get("k")
                         if not isinstance(k, dict):
+                            _ultimo_tick_ws_ts = time.monotonic()
                             continue
-
-                        print("\n[WS] Vela de 1m recebida/atualizada")
+                        _ultimo_tick_ws_ts = time.monotonic()
                         preco = float(k.get("c") or 0.0)
                         if preco > 0:
                             _ultimo_preco_ws = preco
-                        _ultimo_tick_ws_ts = time.monotonic()
-                        vol_atual = float(k.get("v") or 0.0)
                         is_kline_closed = bool(k.get("x"))
+                        vol_atual = float(k.get("v") or 0.0)
                         open_time = int(k.get("t") or 0)
-                        print(
-                            f"[DEBUG KLINE] Preço atual: {k.get('c')} | "
-                            f"Fechada: {k.get('x')} | OpenTime: {open_time}"
-                        )
-                        estado_dbg = "MODO VIGIA" if posicao_aberta else "SEM POSIÇÃO"
-                        print(
-                            f"[VIGIA_HEARTBEAT] kline tick | estado={estado_dbg} | "
-                            f"RSI(14)={float(_ultimo_rsi_14):.2f} | ADX(14)={float(_ultimo_adx_14):.2f} | "
-                            f"preço={preco:.4f}"
-                        )
-
-                        print(
-                            f"[WS] Tick: Preço {preco:.2f} | Aguardando fecho de vela ou pico de volume..."
-                        )
+                        if is_kline_closed:
+                            await asyncio.to_thread(_sincronizar_rsi_adx_globais_de_snap_ws)
+                            print(
+                                f"\n✅ [VELA FECHADA] ETHUSDC | RSI: {_ultimo_rsi_14:.1f} | "
+                                f"ADX: {_ultimo_adx_14:.1f}"
+                            )
 
                         trigger = None
                         if is_kline_closed and open_time != ultima_vela_fechada_ts:
@@ -3639,7 +3822,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                             _metric_inc("ignored_cooldown", 1)
                             restante = TRIGGER_COOLDOWN_S - (now - last_trigger_time)
                             print(
-                                f"[WS] {trigger} detetado, mas bloqueado por cooldown de "
+                                f"\n[WS] {trigger} detetado, mas bloqueado por cooldown de "
                                 f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
                             )
                             continue
@@ -3647,7 +3830,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                         if execucao_lock.locked():
                             _metric_inc("triggers_ignored_lock", 1)
                             print(
-                                f"⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
+                                f"\n⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
                                 "(ciclo em andamento)."
                             )
                             continue
@@ -3665,7 +3848,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                             )
                         )
                         print(
-                            "[WS] Config dinâmica carregada: "
+                            "\n[WS] Config dinâmica carregada: "
                             f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
                             f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
                             f"trail_cb={_trailing_callback_cfg:.3f}% | "
@@ -3674,12 +3857,12 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
 
                         permitido = await asyncio.to_thread(verificar_permissao_operacao)
                         if not permitido:
-                            print("💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
+                            print("\n💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
                             continue
 
                         modo = await asyncio.to_thread(obter_modo_operacao)
                         print(
-                            f"🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
+                            f"\n🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
                         )
                         async with execucao_lock:
                             last_trigger_time = time.monotonic()
@@ -3687,15 +3870,15 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                                 await _executar_ciclo_assincrono(modo, trigger)
                             finally:
                                 estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
-                                print(f"✅ [WS] Ciclo concluído. Estado atual: {estado}")
+                                print(f"\n✅ [WS] Ciclo concluído. Estado atual: {estado}")
                     except Exception as e:
-                        print(f"[ERRO FATAL WS] Falha ao processar mensagem: {e}", flush=True)
+                        print(f"\n[ERRO FATAL WS] Falha ao processar mensagem: {e}", flush=True)
                         traceback.print_exc()
                         continue
         except Exception as e:  # noqa: BLE001
             # Auto-reconnect: não propaga — outras tasks (manual, métricas, auditoria) continuam.
             print(
-                f"⚠️ [WS] Stream Binance Futures caiu ou erro ({type(e).__name__}: {e}). "
+                f"\n⚠️ [WS] Stream Binance Futures caiu ou erro ({type(e).__name__}: {e}). "
                 f"Auto-reconnect após {WS_RECONNECT_DELAY_S:.0f}s...",
                 flush=True,
             )
@@ -3704,13 +3887,39 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
 
 
 def _validar_preflight_futures_usdc() -> None:
+    print("[DEBUG REST] Preflight: criar_exchange_binance()...", flush=True)
     ex = executor_futures.criar_exchange_binance()
+    print("[DEBUG REST] Preflight: criar_exchange_binance() concluído.", flush=True)
+
+    print("[DEBUG REST] Preflight: fetch_balance(params={type: future})...", flush=True)
     bal = ex.fetch_balance(params={"type": "future"})
+    print("[DEBUG REST] Preflight: fetch_balance concluído.", flush=True)
     free = bal.get("free") if isinstance(bal, dict) else {}
     usdc_free = float((free or {}).get("USDC") or 0.0)
     if usdc_free <= 0:
         raise RuntimeError("Preflight falhou: sem saldo USDC livre em Futures.")
-    executor_futures.configurar_alavancagem(SYMBOL_TRADE, 6, ex)
+
+    sym = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+    print(
+        f"[DEBUG REST] A solicitar alteração de margem (set_margin_mode ISOLATED) em {sym}...",
+        flush=True,
+    )
+    try:
+        ex.set_margin_mode("ISOLATED", sym)
+        print("[DEBUG REST] set_margin_mode concluído (sem exceção).", flush=True)
+    except ccxt.ExchangeError as e:
+        print(
+            f"[DEBUG REST] set_margin_mode retornou ExchangeError (pode ser esperado): {e}",
+            flush=True,
+        )
+    print(f"[DEBUG REST] A solicitar alteração de alavancagem (set_leverage 6x) em {sym}...", flush=True)
+    try:
+        ex.set_leverage(6, sym)
+        print("[DEBUG REST] set_leverage concluído (sem exceção).", flush=True)
+    except ccxt.BaseError as e:
+        print(f"[DEBUG REST] set_leverage falhou: {e}", flush=True)
+        raise
+
     print(f"✅ [PREFLIGHT] Futures USDC ok | saldo livre={usdc_free:.4f} | leverage=6x confirmado.")
 
 

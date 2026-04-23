@@ -395,6 +395,51 @@ def reunir_sinais_price_action(
     return out
 
 
+def detect_double_bottom(candles: list[list[Any]], tolerance: float = 0.001) -> bool:
+    """
+    Procura dois mínimos locais consecutivos no tempo (troughs) na janela das últimas 50 velas.
+
+    Um trough em `i` (1..n-2) satisfaz low[i] <= low[i-1] e low[i] <= low[i+1].
+    Compara os **dois últimos** troughs: se a diferença relativa entre os lows for < `tolerance`
+    (ex.: 0.001 = 0,1%) e o **close** da última vela estiver a menos de `tolerance` do nível
+    (média dos dois lows), retorna True — padrão compatível com fundo duplo / suporte duplo.
+    """
+    if not candles or len(candles) < 3:
+        return False
+    tail = candles[-50:] if len(candles) > 50 else candles
+    lows: list[float] = []
+    closes: list[float] = []
+    for c in tail:
+        try:
+            lows.append(float(c[3]))
+            closes.append(float(c[4]))
+        except (TypeError, ValueError, IndexError):
+            return False
+    n = len(lows)
+    if n < 3:
+        return False
+    trough_i: list[int] = []
+    for i in range(1, n - 1):
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+            trough_i.append(i)
+    if len(trough_i) < 2:
+        return False
+    i_a, i_b = trough_i[-2], trough_i[-1]
+    l_a, l_b = lows[i_a], lows[i_b]
+    mx = max(l_a, l_b)
+    if mx <= 0.0:
+        return False
+    if abs(l_a - l_b) / mx >= float(tolerance):
+        return False
+    level = (l_a + l_b) / 2.0
+    if level <= 0.0:
+        return False
+    px = closes[-1]
+    if abs(px - level) / level >= float(tolerance):
+        return False
+    return True
+
+
 def volume_compra_spike_1m(
     exchange: Any,
     simbolo: str,
