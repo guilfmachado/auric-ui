@@ -3567,6 +3567,8 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                         msg = json.loads(raw)
                     except Exception:
                         continue
+                    if isinstance(msg, dict):
+                        print(f"\n[WS-ROUTING] Stream recebida: {msg.get('stream')}")
 
                     try:
                         payload = (
@@ -3574,8 +3576,11 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                             if isinstance(msg, dict) and isinstance(msg.get("data"), dict)
                             else msg
                         )
-                        stream_name = str(msg.get("stream") or "").lower() if isinstance(msg, dict) else ""
-                        if "@bookticker" in stream_name:
+                        stream_name = str(msg.get("stream") or "") if isinstance(msg, dict) else ""
+                        stream_name_l = stream_name.lower()
+                        if stream_name and "@bookticker" in stream_name_l:
+                            # Pulso visual: confirma tráfego contínuo do bookTicker.
+                            print(".", end="", flush=True)
                             try:
                                 bid_bt = float(payload.get("b") or 0.0)
                                 ask_bt = float(payload.get("a") or 0.0)
@@ -3586,10 +3591,13 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                             except Exception:
                                 pass
                             _ultimo_tick_ws_ts = time.monotonic()
+                        if not (stream_name and "@kline_1m" in stream_name_l):
+                            continue
                         k = payload.get("k") if isinstance(payload, dict) else None
                         if not isinstance(k, dict):
                             continue
 
+                        print("\n[WS] Vela de 1m recebida/atualizada")
                         preco = float(k.get("c") or 0.0)
                         if preco > 0:
                             _ultimo_preco_ws = preco
@@ -3597,6 +3605,16 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                         vol_atual = float(k.get("v") or 0.0)
                         is_kline_closed = bool(k.get("x"))
                         open_time = int(k.get("t") or 0)
+                        print(
+                            f"[DEBUG KLINE] Preço atual: {k.get('c')} | "
+                            f"Fechada: {k.get('x')} | OpenTime: {open_time}"
+                        )
+                        estado_dbg = "MODO VIGIA" if posicao_aberta else "SEM POSIÇÃO"
+                        print(
+                            f"[VIGIA_HEARTBEAT] kline tick | estado={estado_dbg} | "
+                            f"RSI(14)={float(_ultimo_rsi_14):.2f} | ADX(14)={float(_ultimo_adx_14):.2f} | "
+                            f"preço={preco:.4f}"
+                        )
 
                         print(
                             f"[WS] Tick: Preço {preco:.2f} | Aguardando fecho de vela ou pico de volume..."
