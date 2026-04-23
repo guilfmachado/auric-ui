@@ -298,6 +298,8 @@ def registrar_log_trade(
     atr_14: float | None = None,
     funding_rate: float | None = None,
     long_short_ratio: float | None = None,
+    rsi_14: float | None = None,
+    adx_14: float | None = None,
 ):
     """
     INSERT na tabela `logs` no Supabase.
@@ -350,6 +352,10 @@ def registrar_log_trade(
             else _FEATURES_LOG_DEFAULTS["long_short_ratio"]
         ),
     }
+    if rsi_14 is not None:
+        dados_log["rsi_14"] = float(rsi_14)
+    if adx_14 is not None:
+        dados_log["adx_14"] = float(adx_14)
     if justificativa_ia is not None:
         dados_log["justificativa_ia"] = justificativa_ia
     if noticias_agregadas is not None:

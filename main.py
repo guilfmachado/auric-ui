@@ -128,6 +128,9 @@ _travado_ate_ts: float = 0.0
 _spread_trailing_pause_until: float = 0.0
 _partial_tp_pos_key: tuple[float, str] | None = None
 _partial_tp_locked: bool = False
+_ultimo_rsi_14: float | None = None
+_ultimo_adx_14: float | None = None
+_ultimo_contexto_raw_supabase: str | None = None
 # Heartbeat Supabase em MODO VIGIA (não bloqueia TP/SL — envio em thread daemon).
 VIGIA_HEARTBEAT_INTERVAL_S = 30.0
 _vigia_heartbeat_last_monotonic: float = 0.0
@@ -470,6 +473,9 @@ def _maybe_emit_vigia_heartbeat_supabase(
     lado: str,
     trailing_pct: float,
     par_moeda: str,
+    contexto_raw: str | None = None,
+    rsi_14: float | None = None,
+    adx_14: float | None = None,
 ) -> None:
     """
     Log leve para o Supabase ~1×/30s enquanto em vigia, sem bloquear o ciclo (thread daemon).
@@ -498,6 +504,14 @@ def _maybe_emit_vigia_heartbeat_supabase(
                 sentimento="—",
                 acao="VIGIA_HEARTBEAT",
                 justificativa=texto,
+                contexto_raw=contexto_raw,
+                justificativa_ia=(
+                    f"VIGIA_HEARTBEAT | RSI(14)={rsi_14:.2f} | ADX(14)={adx_14:.2f}"
+                    if rsi_14 is not None and adx_14 is not None
+                    else "VIGIA_HEARTBEAT | indicadores indisponíveis no ciclo"
+                ),
+                rsi_14=rsi_14,
+                adx_14=adx_14,
             )
         except Exception:
             pass
@@ -1445,6 +1459,9 @@ def _gerenciar_saida_modo_vigia(
         lado=str(direcao_posicao),
         trailing_pct=float(_trailing_callback_cfg),
         par_moeda=SYMBOL_TRADE,
+        contexto_raw=_ultimo_contexto_raw_supabase,
+        rsi_14=_ultimo_rsi_14,
+        adx_14=_ultimo_adx_14,
     )
 
     if "FUTURES" in modo_label and float(preco_compra) > 0:
@@ -2618,6 +2635,16 @@ def rodar_ciclo(modo: str) -> None:
     )
 
     contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
+    global _ultimo_rsi_14, _ultimo_adx_14, _ultimo_contexto_raw_supabase
+    try:
+        _ultimo_rsi_14 = float(snap.get("rsi_14")) if snap.get("rsi_14") is not None else None
+    except (TypeError, ValueError):
+        _ultimo_rsi_14 = None
+    try:
+        _ultimo_adx_14 = float(snap.get("adx_14")) if snap.get("adx_14") is not None else None
+    except (TypeError, ValueError):
+        _ultimo_adx_14 = None
+    _ultimo_contexto_raw_supabase = contexto_raw_supabase
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
 
     # 3. Ativa o Cérebro (Claude) com rate limiter para proteger a API.
@@ -2974,6 +3001,24 @@ def rodar_ciclo(modo: str) -> None:
     except (TypeError, ValueError):
         rsi_num = None
 
+    adx_num = _ultimo_adx_14
+    rsi_txt = f"{rsi_num:.2f}" if rsi_num is not None else "N/A"
+    adx_txt = f"{adx_num:.2f}" if adx_num is not None else "N/A"
+    if sent == "BULLISH":
+        just_ia_entry = (
+            str(just_ia).strip()
+            if str(just_ia).strip()
+            else f"Sinal LONG - Tendência de alta confirmada. RSI: {rsi_txt}, ADX: {adx_txt}"
+        )
+    elif sent == "BEARISH":
+        just_ia_entry = (
+            str(just_ia).strip()
+            if str(just_ia).strip()
+            else f"Sinal SHORT - Tendência de baixa confirmada. RSI: {rsi_txt}, ADX: {adx_txt}"
+        )
+    else:
+        just_ia_entry = str(just_ia).strip()
+
     short_adx_bypass = False
     if (
         not manual_override_veredito
@@ -3076,7 +3121,7 @@ def rodar_ciclo(modo: str) -> None:
                 else ""
             )
             just_final = (
-                f"{just_ia} | Ordem id={oid} status={st}; "
+                f"{just_ia_entry} | Ordem id={oid} status={st}; "
                 f"notional/custo alvo ≈ {notional_alvo:.2f} USDC.{bracket_note} "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (LONG)."
             )
@@ -3093,10 +3138,12 @@ def rodar_ciclo(modo: str) -> None:
                 justificativa=just_final,
                 lado_ordem="LONG",
                 contexto_raw=contexto_raw_supabase,
-                justificativa_ia=just_ia,
+                justificativa_ia=just_ia_entry,
                 noticias_agregadas=contexto,
                 commission=commission,
                 is_maker=is_maker,
+                rsi_14=rsi_num,
+                adx_14=adx_num,
             )
             print(
                 f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
@@ -3191,7 +3238,7 @@ def rodar_ciclo(modo: str) -> None:
             posicao_aberta = True
             direcao_posicao = "SHORT"
             just_final = (
-                f"{just_ia} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDC. "
+                f"{just_ia_entry} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDC. "
                 " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
                 f"activation no antigo TP×{trailing_mult:.3f}, callback {trailing_cb:.3f}%). "
                 f"preco ref. entrada={preco_compra:.4f} → Modo Vigia (SHORT)."
@@ -3209,10 +3256,12 @@ def rodar_ciclo(modo: str) -> None:
                 justificativa=just_final,
                 lado_ordem="SHORT",
                 contexto_raw=contexto_raw_supabase,
-                justificativa_ia=just_ia,
+                justificativa_ia=just_ia_entry,
                 noticias_agregadas=contexto,
                 commission=commission,
                 is_maker=is_maker,
+                rsi_14=rsi_num,
+                adx_14=adx_num,
             )
             print(
                 f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
