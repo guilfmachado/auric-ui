@@ -128,9 +128,10 @@ _travado_ate_ts: float = 0.0
 _spread_trailing_pause_until: float = 0.0
 _partial_tp_pos_key: tuple[float, str] | None = None
 _partial_tp_locked: bool = False
-_ultimo_rsi_14: float | None = None
-_ultimo_adx_14: float | None = None
-_ultimo_contexto_raw_supabase: str | None = None
+_ultimo_rsi_14: float = 0.0
+_ultimo_adx_14: float = 0.0
+_ultimo_contexto_raw_supabase: str = "{}"
+justificativa_ia: str = "Aguardando primeira leitura..."
 # Heartbeat Supabase em MODO VIGIA (não bloqueia TP/SL — envio em thread daemon).
 VIGIA_HEARTBEAT_INTERVAL_S = 30.0
 _vigia_heartbeat_last_monotonic: float = 0.0
@@ -2637,13 +2638,13 @@ def rodar_ciclo(modo: str) -> None:
     contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
     global _ultimo_rsi_14, _ultimo_adx_14, _ultimo_contexto_raw_supabase
     try:
-        _ultimo_rsi_14 = float(snap.get("rsi_14")) if snap.get("rsi_14") is not None else None
+        _ultimo_rsi_14 = float(snap.get("rsi_14")) if snap.get("rsi_14") is not None else 0.0
     except (TypeError, ValueError):
-        _ultimo_rsi_14 = None
+        _ultimo_rsi_14 = 0.0
     try:
-        _ultimo_adx_14 = float(snap.get("adx_14")) if snap.get("adx_14") is not None else None
+        _ultimo_adx_14 = float(snap.get("adx_14")) if snap.get("adx_14") is not None else 0.0
     except (TypeError, ValueError):
-        _ultimo_adx_14 = None
+        _ultimo_adx_14 = 0.0
     _ultimo_contexto_raw_supabase = contexto_raw_supabase
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
 
@@ -3567,103 +3568,112 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                     except Exception:
                         continue
 
-                    payload = msg.get("data") if isinstance(msg, dict) and isinstance(msg.get("data"), dict) else msg
-                    stream_name = str(msg.get("stream") or "").lower() if isinstance(msg, dict) else ""
-                    if "@bookticker" in stream_name:
-                        try:
-                            bid_bt = float(payload.get("b") or 0.0)
-                            ask_bt = float(payload.get("a") or 0.0)
-                            if bid_bt > 0:
-                                _best_bid_ws = bid_bt
-                            if ask_bt > 0:
-                                _best_ask_ws = ask_bt
-                        except Exception:
-                            pass
+                    try:
+                        payload = (
+                            msg.get("data")
+                            if isinstance(msg, dict) and isinstance(msg.get("data"), dict)
+                            else msg
+                        )
+                        stream_name = str(msg.get("stream") or "").lower() if isinstance(msg, dict) else ""
+                        if "@bookticker" in stream_name:
+                            try:
+                                bid_bt = float(payload.get("b") or 0.0)
+                                ask_bt = float(payload.get("a") or 0.0)
+                                if bid_bt > 0:
+                                    _best_bid_ws = bid_bt
+                                if ask_bt > 0:
+                                    _best_ask_ws = ask_bt
+                            except Exception:
+                                pass
+                            _ultimo_tick_ws_ts = time.monotonic()
+                        k = payload.get("k") if isinstance(payload, dict) else None
+                        if not isinstance(k, dict):
+                            continue
+
+                        preco = float(k.get("c") or 0.0)
+                        if preco > 0:
+                            _ultimo_preco_ws = preco
                         _ultimo_tick_ws_ts = time.monotonic()
-                    k = payload.get("k") if isinstance(payload, dict) else None
-                    if not isinstance(k, dict):
-                        continue
+                        vol_atual = float(k.get("v") or 0.0)
+                        is_kline_closed = bool(k.get("x"))
+                        open_time = int(k.get("t") or 0)
 
-                    preco = float(k.get("c") or 0.0)
-                    if preco > 0:
-                        _ultimo_preco_ws = preco
-                    _ultimo_tick_ws_ts = time.monotonic()
-                    vol_atual = float(k.get("v") or 0.0)
-                    is_kline_closed = bool(k.get("x"))
-                    open_time = int(k.get("t") or 0)
-
-                    print(
-                        f"[WS] Tick: Preço {preco:.2f} | Aguardando fecho de vela ou pico de volume..."
-                    )
-
-                    trigger = None
-                    if is_kline_closed and open_time != ultima_vela_fechada_ts:
-                        trigger = "CLOSE_1M"
-                        ultima_vela_fechada_ts = open_time
-                        volume_ultima_vela_fechada = vol_atual
-                    elif volume_ultima_vela_fechada and volume_ultima_vela_fechada > 0:
-                        fator = 1.0 + float(indicators.VOLUME_SPIKE_FRACAO_1M)
-                        if vol_atual >= fator * volume_ultima_vela_fechada:
-                            trigger = "VOLUME_SPIKE_INTRA_1M"
-
-                    if not trigger:
-                        continue
-
-                    _metric_inc("triggers_total", 1)
-                    now = time.monotonic()
-                    if now - last_trigger_time < TRIGGER_COOLDOWN_S:
-                        _metric_inc("ignored_cooldown", 1)
-                        restante = TRIGGER_COOLDOWN_S - (now - last_trigger_time)
                         print(
-                            f"[WS] {trigger} detetado, mas bloqueado por cooldown de "
-                            f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
+                            f"[WS] Tick: Preço {preco:.2f} | Aguardando fecho de vela ou pico de volume..."
                         )
-                        continue
 
-                    if execucao_lock.locked():
-                        _metric_inc("triggers_ignored_lock", 1)
+                        trigger = None
+                        if is_kline_closed and open_time != ultima_vela_fechada_ts:
+                            trigger = "CLOSE_1M"
+                            ultima_vela_fechada_ts = open_time
+                            volume_ultima_vela_fechada = vol_atual
+                        elif volume_ultima_vela_fechada and volume_ultima_vela_fechada > 0:
+                            fator = 1.0 + float(indicators.VOLUME_SPIKE_FRACAO_1M)
+                            if vol_atual >= fator * volume_ultima_vela_fechada:
+                                trigger = "VOLUME_SPIKE_INTRA_1M"
+
+                        if not trigger:
+                            continue
+
+                        _metric_inc("triggers_total", 1)
+                        now = time.monotonic()
+                        if now - last_trigger_time < TRIGGER_COOLDOWN_S:
+                            _metric_inc("ignored_cooldown", 1)
+                            restante = TRIGGER_COOLDOWN_S - (now - last_trigger_time)
+                            print(
+                                f"[WS] {trigger} detetado, mas bloqueado por cooldown de "
+                                f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
+                            )
+                            continue
+
+                        if execucao_lock.locked():
+                            _metric_inc("triggers_ignored_lock", 1)
+                            print(
+                                f"⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
+                                "(ciclo em andamento)."
+                            )
+                            continue
+
+                        cfg_dyn = await _obter_configuracoes_dinamicas()
+                        _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
+                        _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
+                        _trailing_callback_cfg = float(
+                            cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
+                        )
+                        _trailing_activation_mult_cfg = float(
+                            cfg_dyn.get(
+                                "trailing_activation_multiplier",
+                                TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+                            )
+                        )
                         print(
-                            f"⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
-                            "(ciclo em andamento)."
+                            "[WS] Config dinâmica carregada: "
+                            f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
+                            f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
+                            f"trail_cb={_trailing_callback_cfg:.3f}% | "
+                            f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
                         )
-                        continue
 
-                    cfg_dyn = await _obter_configuracoes_dinamicas()
-                    _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
-                    _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
-                    _trailing_callback_cfg = float(
-                        cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
-                    )
-                    _trailing_activation_mult_cfg = float(
-                        cfg_dyn.get(
-                            "trailing_activation_multiplier",
-                            TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+                        permitido = await asyncio.to_thread(verificar_permissao_operacao)
+                        if not permitido:
+                            print("💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
+                            continue
+
+                        modo = await asyncio.to_thread(obter_modo_operacao)
+                        print(
+                            f"🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
                         )
-                    )
-                    print(
-                        "[WS] Config dinâmica carregada: "
-                        f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
-                        f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
-                        f"trail_cb={_trailing_callback_cfg:.3f}% | "
-                        f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
-                    )
-
-                    permitido = await asyncio.to_thread(verificar_permissao_operacao)
-                    if not permitido:
-                        print("💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
+                        async with execucao_lock:
+                            last_trigger_time = time.monotonic()
+                            try:
+                                await _executar_ciclo_assincrono(modo, trigger)
+                            finally:
+                                estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
+                                print(f"✅ [WS] Ciclo concluído. Estado atual: {estado}")
+                    except Exception as e:
+                        print(f"[ERRO FATAL WS] Falha ao processar mensagem: {e}", flush=True)
+                        traceback.print_exc()
                         continue
-
-                    modo = await asyncio.to_thread(obter_modo_operacao)
-                    print(
-                        f"🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
-                    )
-                    async with execucao_lock:
-                        last_trigger_time = time.monotonic()
-                        try:
-                            await _executar_ciclo_assincrono(modo, trigger)
-                        finally:
-                            estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
-                            print(f"✅ [WS] Ciclo concluído. Estado atual: {estado}")
         except Exception as e:  # noqa: BLE001
             # Auto-reconnect: não propaga — outras tasks (manual, métricas, auditoria) continuam.
             print(
