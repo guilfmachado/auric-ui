@@ -69,6 +69,28 @@ export default function AuricControl() {
         >
           🛡️ Veto: Bottom
         </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            void sendCommand("TURBO LONG: Rompimento confirmado!", true)
+          }
+          disabled={loading}
+          className="rounded-lg border border-blue-500 bg-blue-500/20 p-3 font-bold text-blue-500 transition-all active:scale-95 disabled:opacity-50"
+        >
+          ⚡ TURBO: Long
+        </button>
+
+        <button
+          type="button"
+          onClick={() =>
+            void sendCommand("TURBO SHORT: Rejeição forte!", true)
+          }
+          disabled={loading}
+          className="rounded-lg border border-purple-500 bg-purple-500/20 p-3 font-bold text-purple-500 transition-all active:scale-95 disabled:opacity-50"
+        >
+          🔥 TURBO: Short
+        </button>
       </div>
 
       <textarea

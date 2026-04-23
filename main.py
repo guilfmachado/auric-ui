@@ -18,7 +18,7 @@ import re
 import time
 import threading
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.request
 from typing import Any
@@ -111,6 +111,8 @@ USER_MARKET_OBSERVATION: str | None = None
 # True: apaga a observação logo após cada chamada bem-sucedida ao Brain neste ciclo.
 # False: mantém até mudares USER_MARKET_OBSERVATION (ou None) manualmente.
 USER_MARKET_OBSERVATION_CLEAR_AFTER_BRAIN_CALL = False
+# Auto-expiração da linha `market_observation` no Supabase (idade desde `updated_at`).
+MARKET_OBSERVATION_EXPIRY_MINUTES = 30
 
 # --- Estado do bot (memória do processo; reinício do script perde o estado) ---
 posicao_aberta: bool = False
@@ -316,12 +318,40 @@ def verificar_permissao_operacao() -> bool:
 
 
 def _formatar_peso_conflito_humano_xgboost() -> str:
+    """Rodapé padrão: observação humana de *bloqueio* (Veto) vs XGBoost."""
     return (
-        "PESO EM CONFLITO (obrigatório): se a observação humana divergir do sinal numérico do "
-        "XGBoost ou da direção sugerida pelo orquestrador, atribui **peso relativo 2.0** à "
-        "observação humana face ao sinal técnico do XGBoost — ou seja, em empate material a "
-        "observação prevalece (podes responder VETO, CAUTIOUS ou alinhar só com confluência forte)."
+        "PESO VETO em conflito (obrigatório): observação humana de **bloqueio** (ex.: double top/bottom) — "
+        "atribui **peso relativo 2.0** para **não** confirmar a entrada alinhada só ao XGBoost quando isso "
+        "materialmente divergir; em empate, o veto humano prevalece (VETO ou CAUTIOUS)."
     )
+
+
+def _formatar_peso_turbo_long_vs_xgboost() -> str:
+    return (
+        "PESO TURBO — LONG (obrigatório): o operador activou **TURBO LONG**. Atribui **peso relativo 2.0** a "
+        "**forçar/reforçar** LONG / tese de compra **mesmo** com XGBoost neutro (ex.: P(alta) entre ~0,45 e ~0,55) — "
+        "procura motivos concretos no contexto agregado e técnico para comprar; só VETO se armadilha for óbvia. "
+        "Em `justificativa_curta` inclui obrigatoriamente o literal **[TURBO MODE ATIVO]**."
+    )
+
+
+def _formatar_peso_turbo_short_vs_xgboost() -> str:
+    return (
+        "PESO TURBO — SHORT (obrigatório): o operador activou **TURBO SHORT**. Atribui **peso relativo 2.0** a "
+        "**forçar/reforçar** SHORT; podes **desvalorizar** viés macro de alta se necessário e focar na execução "
+        "imediata da tese baixista com confluência operacional. Em `justificativa_curta` inclui obrigatoriamente "
+        "**[TURBO MODE ATIVO]**."
+    )
+
+
+def _footer_peso_contexto_humano(valores_fonte: list[str | None]) -> str:
+    """Turbo (forçar entrada) vs Veto (bloquear): um rodapé conforme o comando humano."""
+    blob = " ".join(str(v).lower() for v in valores_fonte if v and str(v).strip())
+    if "turbo long" in blob:
+        return _formatar_peso_turbo_long_vs_xgboost()
+    if "turbo short" in blob:
+        return _formatar_peso_turbo_short_vs_xgboost()
+    return _formatar_peso_conflito_humano_xgboost()
 
 
 def _corpo_contexto_humano_por_texto(valor: str) -> str:
@@ -330,6 +360,20 @@ def _corpo_contexto_humano_por_texto(valor: str) -> str:
     if not v:
         return ""
     low = v.lower()
+    if "turbo long" in low:
+        return (
+            f"Comando humano: {v}\n\n"
+            "Modo **TURBO LONG** (espelho oposto ao Veto): prioriza encontrar motivos para **comprar** e "
+            "alinhar BULLISH / `posicao_recomendada` LONG mesmo com ML **neutro** (P(alta) tipicamente ~0,45–0,55); "
+            "usa notícias e técnico como catalisador, não como desculpa para ficar neutro se a tese de compra for plausível."
+        )
+    if "turbo short" in low:
+        return (
+            f"Comando humano: {v}\n\n"
+            "Modo **TURBO SHORT**: prioriza tese **vendedora**; se o contexto macro empurrar alta mas a nota "
+            "técnica/operador pede SHORT, **podes ignorar** esse viés macro em favor da execução da venda com "
+            "confluência razoável (preço, resistências, catalisador de curto prazo)."
+        )
     if "double bottom" in low or "fundo duplo" in low:
         return (
             f"Padrão reportado: {v}\n\n"
@@ -365,20 +409,63 @@ def _combinar_contexto_humano_supabase_e_ram(
         )
     if not corpos:
         return None
-    return "\n\n---\n\n".join(corpos) + "\n\n" + _formatar_peso_conflito_humano_xgboost()
+    return (
+        "\n\n---\n\n".join(corpos)
+        + "\n\n"
+        + _footer_peso_contexto_humano([valor_supabase, texto_ram])
+    )
+
+
+def _contexto_tem_turbo(valor_supabase: str | None, texto_ram: str | None) -> bool:
+    blob = f"{valor_supabase or ''} {texto_ram or ''}".upper()
+    return "TURBO" in blob
+
+
+def _inferir_direcao_sugerida_turbo(valor_supabase: str | None, texto_ram: str | None) -> str:
+    blob = f"{valor_supabase or ''} {texto_ram or ''}".upper()
+    if "TURBO SHORT" in blob:
+        return "SHORT"
+    if "TURBO LONG" in blob:
+        return "LONG"
+    return "LONG"
+
+
+def _parse_supabase_updated_at(raw: Any) -> datetime | None:
+    """Converte `updated_at` do PostgREST para UTC; None se inválido."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def obter_valor_market_observation_supabase() -> str | None:
     """
     Lê `bot_commands` onde key == 'market_observation'.
     Se `active` for True, devolve o texto em `value` (trim); caso contrário None.
+    Se `updated_at` tiver mais de MARKET_OBSERVATION_EXPIRY_MINUTES, ignora o valor,
+    tenta desativar a linha no Supabase e devolve None.
     """
     if logger.supabase is None:
         return None
     try:
         res = (
             logger.supabase.table("bot_commands")
-            .select("active", "value")
+            .select("active", "value", "updated_at")
             .eq("key", "market_observation")
             .limit(1)
             .execute()
@@ -389,13 +476,34 @@ def obter_valor_market_observation_supabase() -> str | None:
         row = rows[0]
         if not bool(row.get("active")):
             return None
+
+        updated_dt = _parse_supabase_updated_at(row.get("updated_at"))
+        if updated_dt is not None:
+            age = datetime.now(timezone.utc) - updated_dt
+            if age > timedelta(minutes=MARKET_OBSERVATION_EXPIRY_MINUTES):
+                print(
+                    "[SUPABASE] ⏰ Sinal de mercado expirou por tempo (30min) e foi desativado."
+                )
+                try:
+                    logger.supabase.table("bot_commands").update(
+                        {
+                            "active": False,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ).eq("key", "market_observation").execute()
+                except Exception as e_exp:  # noqa: BLE001
+                    print(
+                        f"⚠️ [SUPABASE] Falha ao desativar observação expirada (bot continua): {e_exp}"
+                    )
+                return None
+
         raw = row.get("value")
         if raw is None:
             return None
         s = str(raw).strip()
         return s or None
     except Exception as e:  # noqa: BLE001
-        print(f"⚠️ obter_valor_market_observation_supabase: {e}")
+        print(f"⚠️ Erro ao ler observação do Supabase: {e}")
         return None
 
 
@@ -2141,7 +2249,9 @@ def rodar_ciclo(modo: str) -> None:
     atualizar_saldo_supabase()
     # Human sentiment: leitura fresca do Supabase em **cada** ciclo (ex.: a cada ~1 min no gatilho WS)
     # para que alterações via dashboard (Vercel /api/bot/command) entrem no próximo ciclo antes do Brain.
-    valor_obs_supabase = obter_valor_market_observation_supabase()
+    contexto_humano = obter_valor_market_observation_supabase()
+    if contexto_humano:
+        print(f"\n[SUPABASE] 🧠 Observação Humana Ativa: {contexto_humano}")
 
     ex_mod = executor_futures if modo == "FUTURES" else executor_spot
     modo_label = "FUTURES USDC" if modo == "FUTURES" else "SPOT"
@@ -2475,132 +2585,149 @@ def rodar_ciclo(modo: str) -> None:
 
     limiar_short = WAKE_FILTER_SHORT_MAX
     limiar_long = WAKE_FILTER_LONG_MIN
+    turbo_neutral_bypass = False
+    is_turbo_this_cycle = _contexto_tem_turbo(contexto_humano, USER_MARKET_OBSERVATION)
+
     if limiar_short <= probabilidade <= limiar_long:
-        reg_vol = snap
-        regime = str(reg_vol.get("regime") or "BAIXA").upper()
-        squeeze = bool(reg_vol.get("bollinger_squeeze"))
-
-        if squeeze:
-            linha_compressao = "Volatilidade em compressão (Bollinger Squeeze)."
-        else:
-            linha_compressao = (
-                "Bandas de Bollinger sem squeeze forte (faixa típica ou expansão)."
+        if is_turbo_this_cycle:
+            print(
+                "⚡ [TURBO MODE] Forçando análise do Brain e ignorando filtros de neutralidade."
             )
-        if regime == "BAIXA":
-            linha_regime = (
-                "Regime ATR/BB: volatilidade baixa vs. mediana recente (possível acumulação)."
+            direcao_sugerida = _inferir_direcao_sugerida_turbo(
+                contexto_humano, USER_MARKET_OBSERVATION
+            )
+            turbo_neutral_bypass = True
+            print(
+                f"    → [TURBO] direcao_sugerida={direcao_sugerida} "
+                f"(ML P(alta)={probabilidade:.4f} na zona neutra; Hub+Brain activados)."
             )
         else:
-            linha_regime = (
-                "Regime ATR/BB: volatilidade elevada (mercado errático / chicote)."
-            )
-        linha_decay = (
-            "Camada social (ex.: @VitalikButerin / feeds Alpha): notícias com mais de 2h "
-            "são ignoradas pelo filtro SENTIMENT DECAY (notícias velhas = ruído)."
-        )
-        linha_adx_vwap = (
-            f"ADX(14)={adx_v if adx_v is not None else 'N/A'} "
-            f"({'lateral' if snap.get('mercado_lateral') else 'tendência'}) — "
-            f"preço vs VWAP diário: {vies}."
-        )
-        contexto_dashboard = f"{linha_compressao} {linha_regime} {linha_adx_vwap} {linha_decay}"
+            reg_vol = snap
+            regime = str(reg_vol.get("regime") or "BAIXA").upper()
+            squeeze = bool(reg_vol.get("bollinger_squeeze"))
 
-        atr_p = reg_vol.get("atr_pct")
-        med_a = reg_vol.get("atr_pct_median")
-        bw = reg_vol.get("bb_width_pct")
-        med_b = reg_vol.get("bb_width_median")
-        partes_metricas: list[str] = []
-        if atr_p is not None and med_a is not None:
-            partes_metricas.append(f"ATR%={float(atr_p):.5f} (mediana ref. {float(med_a):.5f})")
-        if bw is not None and med_b is not None:
-            partes_metricas.append(
-                f"BB width={float(bw):.5f} (mediana ref. {float(med_b):.5f})"
+            if squeeze:
+                linha_compressao = "Volatilidade em compressão (Bollinger Squeeze)."
+            else:
+                linha_compressao = (
+                    "Bandas de Bollinger sem squeeze forte (faixa típica ou expansão)."
+                )
+            if regime == "BAIXA":
+                linha_regime = (
+                    "Regime ATR/BB: volatilidade baixa vs. mediana recente (possível acumulação)."
+                )
+            else:
+                linha_regime = (
+                    "Regime ATR/BB: volatilidade elevada (mercado errático / chicote)."
+                )
+            linha_decay = (
+                "Camada social (ex.: @VitalikButerin / feeds Alpha): notícias com mais de 2h "
+                "são ignoradas pelo filtro SENTIMENT DECAY (notícias velhas = ruído)."
             )
-        metricas_txt = (
-            "; ".join(partes_metricas)
-            if partes_metricas
-            else str(reg_vol.get("detalhe") or "—")
-        )
+            linha_adx_vwap = (
+                f"ADX(14)={adx_v if adx_v is not None else 'N/A'} "
+                f"({'lateral' if snap.get('mercado_lateral') else 'tendência'}) — "
+                f"preço vs VWAP diário: {vies}."
+            )
+            contexto_dashboard = f"{linha_compressao} {linha_regime} {linha_adx_vwap} {linha_decay}"
 
-        adx_txt = (
-            f"{float(adx_v):.0f}"
-            if adx_v is not None
-            else "—"
-        )
-        rsi_txt = (
-            f"{float(rsi_v):.0f}"
-            if rsi_v is not None
-            else "—"
-        )
-        rot_adx = indicators.rotulo_regime_adx(
-            float(adx_v) if adx_v is not None else None
-        )
-        rot_rsi = indicators.rotulo_regime_rsi(
-            float(rsi_v) if rsi_v is not None else None
-        )
-        if squeeze:
-            linha_decisao = (
-                "Mercado sem tendência definida. Protegendo capital e aguardando expansão "
-                "de volume (Bollinger Squeeze detectado)."
-            )
-        else:
-            linha_decisao = (
-                "Mercado sem tendência definida. Protegendo capital e aguardando "
-                "clarificação de volatilidade ou sinal ML fora da zona neutra."
+            atr_p = reg_vol.get("atr_pct")
+            med_a = reg_vol.get("atr_pct_median")
+            bw = reg_vol.get("bb_width_pct")
+            med_b = reg_vol.get("bb_width_median")
+            partes_metricas: list[str] = []
+            if atr_p is not None and med_a is not None:
+                partes_metricas.append(f"ATR%={float(atr_p):.5f} (mediana ref. {float(med_a):.5f})")
+            if bw is not None and med_b is not None:
+                partes_metricas.append(
+                    f"BB width={float(bw):.5f} (mediana ref. {float(med_b):.5f})"
+                )
+            metricas_txt = (
+                "; ".join(partes_metricas)
+                if partes_metricas
+                else str(reg_vol.get("detalhe") or "—")
             )
 
-        just_dashboard = (
-            f"STATUS: MONITORANDO\n"
-            f"ML: {probabilidade * 100:.1f}% (Neutro)\n"
-            f"ADX: {adx_txt} ({rot_adx})\n"
-            f"RSI: {rsi_txt} ({rot_rsi})\n"
-            f"DECISÃO: {linha_decisao}\n"
-            f"---\n"
-            f"CONTEXTO: {contexto_dashboard}\n"
-            f"{metricas_txt} | P(alta)={probabilidade:.4f} ∈ "
-            f"[{limiar_short:.2f},{limiar_long:.2f}] — Claude poupado (filtro de despertar ativo)."
-        )
+            adx_txt = (
+                f"{float(adx_v):.0f}"
+                if adx_v is not None
+                else "—"
+            )
+            rsi_txt = (
+                f"{float(rsi_v):.0f}"
+                if rsi_v is not None
+                else "—"
+            )
+            rot_adx = indicators.rotulo_regime_adx(
+                float(adx_v) if adx_v is not None else None
+            )
+            rot_rsi = indicators.rotulo_regime_rsi(
+                float(rsi_v) if rsi_v is not None else None
+            )
+            if squeeze:
+                linha_decisao = (
+                    "Mercado sem tendência definida. Protegendo capital e aguardando expansão "
+                    "de volume (Bollinger Squeeze detectado)."
+                )
+            else:
+                linha_decisao = (
+                    "Mercado sem tendência definida. Protegendo capital e aguardando "
+                    "clarificação de volatilidade ou sinal ML fora da zona neutra."
+                )
 
-        print("\n    [Painel de mercado — zona neutra / heatmap]")
-        for ln in just_dashboard.split("\n"):
-            if ln.strip() and not ln.startswith("---"):
-                print(f"    {ln}")
-        print(f"    [Métricas técnicas] {metricas_txt}")
+            just_dashboard = (
+                f"STATUS: MONITORANDO\n"
+                f"ML: {probabilidade * 100:.1f}% (Neutro)\n"
+                f"ADX: {adx_txt} ({rot_adx})\n"
+                f"RSI: {rsi_txt} ({rot_rsi})\n"
+                f"DECISÃO: {linha_decisao}\n"
+                f"---\n"
+                f"CONTEXTO: {contexto_dashboard}\n"
+                f"{metricas_txt} | P(alta)={probabilidade:.4f} ∈ "
+                f"[{limiar_short:.2f},{limiar_long:.2f}] — Claude poupado (filtro de despertar ativo)."
+            )
 
-        logger.registrar_log_trade(
-            par_moeda=SYMBOL_TRADE,
-            preco=preco,
-            prob_ml=probabilidade,
-            sentimento="NEUTRAL",
-            acao="MONITORANDO",
-            justificativa=(
-                "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
-            ),
-            contexto_raw=indicators.formatar_log_contexto_raw(
-                "(Intelligence Hub/Claude não consultados — filtro de despertar ML na zona neutra.)",
-                {**snap, "prob_ml": probabilidade},
-            ),
-            justificativa_ia=(
-                "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
-            ),
-        )
-        print(
-            f"💤 [WAKE FILTER] XGBoost em zona neutra "
-            f"[{limiar_short:.2f}, {limiar_long:.2f}] — Claude NÃO chamado. "
-            'Mock: {"sentimento":"NEUTRAL","posicao_recomendada":"VETO","justificativa_curta":"Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."}'
-        )
-        return
+            print("\n    [Painel de mercado — zona neutra / heatmap]")
+            for ln in just_dashboard.split("\n"):
+                if ln.strip() and not ln.startswith("---"):
+                    print(f"    {ln}")
+            print(f"    [Métricas técnicas] {metricas_txt}")
+
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=probabilidade,
+                sentimento="NEUTRAL",
+                acao="MONITORANDO",
+                justificativa=(
+                    "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
+                ),
+                contexto_raw=indicators.formatar_log_contexto_raw(
+                    "(Intelligence Hub/Claude não consultados — filtro de despertar ML na zona neutra.)",
+                    {**snap, "prob_ml": probabilidade},
+                ),
+                justificativa_ia=(
+                    "Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."
+                ),
+            )
+            print(
+                f"💤 [WAKE FILTER] XGBoost em zona neutra "
+                f"[{limiar_short:.2f}, {limiar_long:.2f}] — Claude NÃO chamado. "
+                'Mock: {"sentimento":"NEUTRAL","posicao_recomendada":"VETO","justificativa_curta":"Mercado lateral (XGBoost Neutro). IA poupada para reduzir custos de API."}'
+            )
+            return
 
     if probabilidade > limiar_long:
         direcao_sugerida = "LONG"
     elif probabilidade < limiar_short:
         direcao_sugerida = "SHORT"
     else:
-        print(
-            "⚠️ [WAKE FILTER] Probabilidade neutra detetada em ramo de segurança; "
-            "sem consulta ao Claude."
-        )
-        return
+        if not turbo_neutral_bypass:
+            print(
+                "⚠️ [WAKE FILTER] Probabilidade neutra detetada em ramo de segurança; "
+                "sem consulta ao Claude."
+            )
+            return
 
     if macro_trend == "INDEFINIDA":
         print("🚧 [SINAL] Preço na Chop Zone da EMA200 (Indefinida). Aguardando rompimento claro.")
@@ -2752,7 +2879,7 @@ def rodar_ciclo(modo: str) -> None:
     bloco_ta = brain.montar_bloco_tecnico_final_boss(snap_log)
 
     contexto_humano_brain = _combinar_contexto_humano_supabase_e_ram(
-        valor_obs_supabase,
+        contexto_humano,
         USER_MARKET_OBSERVATION,
     )
 
@@ -2776,6 +2903,7 @@ def rodar_ciclo(modo: str) -> None:
                 "long_short_ratio": snap_log.get("long_short_ratio"),
             },
             user_market_observation=contexto_humano_brain,
+            is_turbo=is_turbo_this_cycle,
         )
         if USER_MARKET_OBSERVATION_CLEAR_AFTER_BRAIN_CALL and USER_MARKET_OBSERVATION:
             if str(veredito.get("sentimento", "")).upper() != "ERROR":
@@ -3245,6 +3373,7 @@ def rodar_ciclo(modo: str) -> None:
                     risk_fraction=float(_risk_fraction_cfg),
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
+                    turbo_chase=is_turbo_this_cycle,
                 )
             else:
                 ordem = ex_mod.executar_compra_spot_market(SYMBOL_TRADE, exchange=ex)
@@ -3370,6 +3499,7 @@ def rodar_ciclo(modo: str) -> None:
                 risk_fraction=float(_risk_fraction_cfg),
                 trailing_callback_rate=trailing_cb,
                 trailing_activation_multiplier=trailing_mult,
+                turbo_chase=is_turbo_this_cycle,
             )
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")

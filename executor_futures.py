@@ -61,6 +61,10 @@ CHASE_ENTRADA_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_MAX_ROUNDS", "3"))
 # Chase agressivo só para abertura SHORT (ETH a «despencar» — ordem não fica pendurada acima do mercado).
 CHASE_SHORT_TIMEOUT_S = float(os.getenv("AURIC_CHASE_SHORT_TIMEOUT_S", "8"))
 CHASE_SHORT_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_SHORT_MAX_ROUNDS", "6"))
+# Entrada com comando TURBO (main.py): chase mais curto + offset mais apertado.
+TURBO_CHASE_TIMEOUT_S = float(os.getenv("AURIC_TURBO_CHASE_TIMEOUT_S", "6"))
+TURBO_CHASE_MAX_ROUNDS = int(os.getenv("AURIC_TURBO_CHASE_MAX_ROUNDS", "6"))
+TURBO_CHASE_OFFSET_FRAC = float(os.getenv("AURIC_TURBO_CHASE_OFFSET", "0.00025"))  # 0,025%
 # Realização parcial: `market` (default) ou `ioc` (LIMIT IOC agressivo).
 PARTIAL_TP_EXECUTION = os.getenv("AURIC_PARTIAL_TP_EXEC", "market").strip().lower()
 # Alinhado ao `PARTIAL_TP_ROI_FRAC` do main (fracção → % no Supabase `trades.partial_roi`).
@@ -794,11 +798,15 @@ def _entrar_limite_com_chase_futuros(
     reduce_only: bool = False,
     force_reference_price: float | None = None,
     is_manual_force: bool = False,
+    offset_frac: float | None = None,
 ) -> dict[str, Any]:
     """
     LIMIT + offset (bid/ask ±0,05%) com protocolo maker-only (GTX / Post-Only).
     Se rejeitar por Post-Only, reenvia com ajuste de 1 tick no preço.
     """
+    off_effective = (
+        float(offset_frac) if offset_frac is not None else float(PRECO_ABERTURA_LIMITE_OFFSET)
+    )
     cap = max_rounds if max_rounds is not None else CHASE_ENTRADA_MAX_ROUNDS
     wait = float(timeout_s) if timeout_s is not None else CHASE_ENTRADA_TIMEOUT_S
     tif = "GTX"
@@ -818,7 +826,7 @@ def _entrar_limite_com_chase_futuros(
             ex,
             simbolo,
             side,
-            offset_frac=PRECO_ABERTURA_LIMITE_OFFSET,
+            offset_frac=off_effective,
             force_reference_price=force_reference_price,
             is_manual_force=is_manual_force,
         )
@@ -899,7 +907,7 @@ def _entrar_limite_com_chase_futuros(
                                 print(msg, file=sys.stderr)
                                 raise RuntimeError(msg)
                             bid_rt, ask_rt, _ = healed_rt
-                    off_rt = float(PRECO_ABERTURA_LIMITE_OFFSET)
+                    off_rt = off_effective
                     raw_calc_rt = ask_rt * (1.0 - off_rt)
                     preco_aj = max(ask_rt + (tick * tick_steps), raw_calc_rt)
                     print(f"🎯 [MAKER-SYNC] Ajustando preço para ficar acima do Bid: {preco_aj:.2f}")
@@ -1531,6 +1539,7 @@ def abrir_long_market(
     trailing_activation_multiplier: float | None = None,
     force_reference_price: float | None = None,
     is_manual_force: bool = False,
+    turbo_chase: bool = False,
 ) -> dict[str, Any]:
     """
     Abre **long** com LIMIT **IOC** + **chase**: preço = bid × (1 + offset 0,05%), `price_to_precision`;
@@ -1572,7 +1581,9 @@ def abrir_long_market(
     print(
         f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDC "
         f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
-        f"chase até {CHASE_ENTRADA_MAX_ROUNDS}×/{CHASE_ENTRADA_TIMEOUT_S:.0f}s..."
+        f"chase até "
+        f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_ENTRADA_MAX_ROUNDS)}×/"
+        f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_ENTRADA_TIMEOUT_S):.0f}s..."
     )
     try:
         ordem = _entrar_limite_com_chase_futuros(
@@ -1581,7 +1592,9 @@ def abrir_long_market(
             "buy",
             amt,
             nome_lado="LONG",
-            max_rounds=CHASE_ENTRADA_MAX_ROUNDS,
+            max_rounds=TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_ENTRADA_MAX_ROUNDS,
+            timeout_s=TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_ENTRADA_TIMEOUT_S,
+            offset_frac=TURBO_CHASE_OFFSET_FRAC if turbo_chase else None,
             force_reference_price=force_reference_price,
             is_manual_force=is_manual_force,
         )
@@ -1620,6 +1633,7 @@ def abrir_short_market(
     trailing_activation_multiplier: float | None = None,
     force_reference_price: float | None = None,
     is_manual_force: bool = False,
+    turbo_chase: bool = False,
 ) -> dict[str, Any]:
     """
     Abre **short** com LIMIT IOC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
@@ -1660,7 +1674,9 @@ def abrir_short_market(
     print(
         f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDC "
         f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
-        f"chase SHORT {CHASE_SHORT_MAX_ROUNDS}×/{CHASE_SHORT_TIMEOUT_S:.0f}s "
+        f"chase SHORT "
+        f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_SHORT_MAX_ROUNDS)}×/"
+        f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_SHORT_TIMEOUT_S):.0f}s "
         f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
     )
     try:
@@ -1670,8 +1686,9 @@ def abrir_short_market(
             "sell",
             amt,
             nome_lado="SHORT",
-            max_rounds=CHASE_SHORT_MAX_ROUNDS,
-            timeout_s=CHASE_SHORT_TIMEOUT_S,
+            max_rounds=TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_SHORT_MAX_ROUNDS,
+            timeout_s=TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_SHORT_TIMEOUT_S,
+            offset_frac=TURBO_CHASE_OFFSET_FRAC if turbo_chase else None,
             force_reference_price=force_reference_price,
             is_manual_force=is_manual_force,
         )

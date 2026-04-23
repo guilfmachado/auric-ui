@@ -181,12 +181,14 @@ Regra de Ouro (Divergência de ADX): O XGBoost pode dar 80% de chance de alta, m
 
 Institucional vs. Varejo: Se o Nitter/Twitter mostrar apenas ruído de retalho e contas pequenas, desvalorize. Procure catalisadores institucionais ou de infraestrutura (Vitalik, Hacks, Atualizações de Rede).
 
+TURBO vs VETO (contexto humano na secção «Contexto Humano»): **Veto** = peso 2.0 para **bloquear** uma entrada em conflito com o XGBoost. **Turbo** (TURBO LONG / TURBO SHORT) = peso 2.0 para **forçar/reforçar** uma entrada **mesmo** com ML neutro (zona ~45–55% P(alta)), desde que não haja armadilha material — segue as instruções do rodapé dessa secção. Se activaste Turbo, em `justificativa_curta` inclui obrigatoriamente **[TURBO MODE ATIVO]**.
+
 Responde APENAS com UM objeto JSON válido (sem markdown, sem ```, sem texto antes ou depois).
 Chaves OBRIGATÓRIAS e APENAS estas:
 {{
   "sentimento": "BULLISH" | "BEARISH" | "NEUTRAL" | "CAUTIOUS",
   "confianca": <inteiro 0 a 100>,
-  "justificativa_curta": "<uma frase; foco na correlação com o sinal {d}; se houver VETO, explique explicitamente a armadilha (Bull Trap/Bear Trap, ADX lateral ou divergência de baleias)>",
+  "justificativa_curta": "<uma frase; foco na correlação com o sinal {d}; se houver VETO, explique explicitamente a armadilha (Bull Trap/Bear Trap, ADX lateral ou divergência de baleias); se o contexto humano for TURBO, inclui **[TURBO MODE ATIVO]** nesta frase>",
   "alerta_macro": "<síntese de risco geopolítico, infra ou baleias; ou nenhum se marginal>",
   "posicao_recomendada": "LONG" | "SHORT" | "VETO"
 }}
@@ -202,6 +204,7 @@ def _montar_prompt_completo_claude(
     bloco_tecnico_prioritario: str | None = None,
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
     user_market_observation: str | None = None,
+    is_turbo: bool = False,
 ) -> str:
     base = _prompt_sistema_claude(direcao_sugerida)
     if bloco_tecnico_prioritario and str(bloco_tecnico_prioritario).strip():
@@ -239,6 +242,12 @@ def _montar_prompt_completo_claude(
         )
     else:
         bloco += "\n(Nenhuma observação humana ativa para este ciclo.)\n"
+    if is_turbo:
+        bloco += (
+            "\n**MODO TURBO (ciclo actual):** o orquestrador **forçou** esta chamada mesmo com XGBoost "
+            "na zona neutra (se aplicável). Prioriza o comando **TURBO** na secção acima com peso 2.0 "
+            "para **forçar/reforçar** entrada alinhada; em `justificativa_curta` inclui **[TURBO MODE ATIVO]**.\n"
+        )
     bloco += (
         "\n\nResponde agora somente com o objeto JSON pedido acima "
         "(cinco chaves, incluindo posicao_recomendada)."
@@ -300,6 +309,7 @@ def analisar_sentimento_mercado(
     bloco_tecnico_prioritario: str | None = None,
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
     user_market_observation: str | None = None,
+    is_turbo: bool = False,
 ) -> dict[str, Any]:
     """
     Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Replicate (Claude 4.5 por omissão).
@@ -349,6 +359,7 @@ def analisar_sentimento_mercado(
         bloco_tecnico_prioritario=ta_block,
         micro_estrutura_posicionamento=micro_estrutura_posicionamento,
         user_market_observation=user_market_observation,
+        is_turbo=is_turbo,
     )
 
     model_slug = REPLICATE_MODEL
@@ -364,6 +375,11 @@ def analisar_sentimento_mercado(
             "VETO.\n"
             f"Resumo do sinal numérico deste ciclo (repetido no XGBoost no final): P(alta) = {_pct_br_ml(float(prob_ml))}.\n"
         )
+        if is_turbo:
+            instrucao_duplo += (
+                "**MODO TURBO:** se P(alta) estiver na zona neutra (~45–55%), **não** uses isso sozinho para "
+                "VETO — o operador forçou análise; prioriza confluência com o comando TURBO na secção Contexto Humano.\n"
+            )
     else:
         instrucao_duplo = (
             "Atua como analista de risco institucional: factual, conservador, sem optimismo nem criatividade literária.\n"
