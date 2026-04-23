@@ -64,7 +64,7 @@ CHASE_SHORT_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_SHORT_MAX_ROUNDS", "6"))
 # Realização parcial: `market` (default) ou `ioc` (LIMIT IOC agressivo).
 PARTIAL_TP_EXECUTION = os.getenv("AURIC_PARTIAL_TP_EXEC", "market").strip().lower()
 # Alinhado ao `PARTIAL_TP_ROI_FRAC` do main (fracção → % no Supabase `trades.partial_roi`).
-PARTIAL_TP_ROI_PCT_SUPABASE = float(os.getenv("AURIC_PARTIAL_TP_ROI_PCT", "0.5"))
+PARTIAL_TP_ROI_PCT_SUPABASE = float(os.getenv("AURIC_PARTIAL_TP_ROI_PCT", "0.6"))
 
 # ORDER-GUARD (vigia): verificar SL + TP na bolsa no máximo 1×/30s por ciclo agregado.
 ORDER_GUARD_INTERVAL_S = 30.0

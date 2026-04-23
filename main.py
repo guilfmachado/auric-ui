@@ -95,7 +95,7 @@ TRAILING_CALLBACK_GOD_MODE = 0.4
 ROI_GOD_MODE_ATIVACAO = 0.005  # +0.5%
 RSI_GOD_MODE_ATIVACAO = 70.0
 # ETH/USDC futures: realização parcial + spread guard (pausa refresh de trailing na bolsa).
-PARTIAL_TP_ROI_FRAC = 0.005  # 0,5% ROI — saída híbrida (50% + SL break-even + trailing na «moon bag»)
+PARTIAL_TP_ROI_FRAC = 0.006  # 0,6% ROI — saída híbrida (50% + SL break-even + trailing na «moon bag»)
 PARTIAL_TP_CLOSE_FRAC = 0.5
 # Trailing só sobre a metade restante após o parcial (callbackRate Binance em %).
 TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.6  # 0.6 == 0,6%
