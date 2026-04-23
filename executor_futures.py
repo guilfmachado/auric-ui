@@ -218,6 +218,7 @@ def criar_exchange_binance() -> ccxt.binance:
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
+            "timeout": 30000,
             "options": {
                 "defaultType": "future",
                 "defaultSubType": "linear",

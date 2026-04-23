@@ -1059,14 +1059,14 @@ def _preco_via_ccxt_ticker(simbolo: str, modo: str) -> float:
     """Fallback: pedido ao mercado via ccxt (também rede ao vivo; sem cache no nosso código)."""
     if modo == "FUTURES":
         ex = ccxt.binance(
-            {"enableRateLimit": True, "options": {"defaultType": "future"}}
+            {"enableRateLimit": True, "timeout": 30000, "options": {"defaultType": "future"}}
         )
         sym = simbolo
         if ":USDC" not in simbolo and "/USDC" in simbolo:
             sym = f"{simbolo.split('/')[0]}/USDC:USDC"
         t = ex.fetch_ticker(sym)
     else:
-        ex = ccxt.binance({"enableRateLimit": True})
+        ex = ccxt.binance({"enableRateLimit": True, "timeout": 30000})
         t = ex.fetch_ticker(simbolo)
     last = t.get("last") or t.get("close")
     return float(last) if last is not None else 0.0
