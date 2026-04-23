@@ -33,8 +33,8 @@ SHORT_TP = 0.015
 SHORT_SL = 0.008
 TRAILING_CALLBACK_RATE = 0.6  # % de recuo da máxima/mínima após ativação (sweet spot ETH/USDC)
 TRAILING_ACTIVATION_MULTIPLIER = 1.0  # 1.0 = mantém gatilho igual ao antigo TP
-# SL inicial na bolsa = N × (trailing em % expresso como fração de preço). Com trailing 0,6% e N=1,333... → SL ~0,8%.
-SL_DISTANCE_VS_TRAILING_MULT = float(os.getenv("AURIC_SL_VS_TRAILING_MULT", "1.3333333333"))
+# SL inicial na bolsa = N × (trailing em % expresso como fração de preço). Com trailing 0,6% e N=1,0 → SL ~0,6%.
+SL_DISTANCE_VS_TRAILING_MULT = float(os.getenv("AURIC_SL_VS_TRAILING_MULT", "1.0"))
 
 # Alavancagem usada só no log de liquidação aproximada (ajuste em configurar_alavancagem / main).
 ALAVANCAGEM_REF_LOG_PADRAO = 3
@@ -64,13 +64,11 @@ CHASE_SHORT_MAX_ROUNDS = int(os.getenv("AURIC_CHASE_SHORT_MAX_ROUNDS", "6"))
 # Realização parcial: `market` (default) ou `ioc` (LIMIT IOC agressivo).
 PARTIAL_TP_EXECUTION = os.getenv("AURIC_PARTIAL_TP_EXEC", "market").strip().lower()
 # Alinhado ao `PARTIAL_TP_ROI_FRAC` do main (fracção → % no Supabase `trades.partial_roi`).
-PARTIAL_TP_ROI_PCT_SUPABASE = float(os.getenv("AURIC_PARTIAL_TP_ROI_PCT", "0.6"))
+PARTIAL_TP_ROI_PCT_SUPABASE = float(os.getenv("AURIC_PARTIAL_TP_ROI_PCT", "0.5"))
 
 # ORDER-GUARD (vigia): verificar SL + TP na bolsa no máximo 1×/30s por ciclo agregado.
 ORDER_GUARD_INTERVAL_S = 30.0
 _order_guard_last_monotonic: float = 0.0
-# Reconciliação de preço para evitar "cancel/replace" por ruído de ticks.
-ORDER_GUARD_REPRICE_THRESHOLD_FRAC = float(os.getenv("AURIC_ORDER_GUARD_REPRICE_FRAC", "0.002"))  # 0.2%
 
 
 def reset_protective_order_guard_throttle() -> None:
@@ -94,112 +92,6 @@ def _order_type_norm(o: dict[str, Any]) -> str:
     info = o.get("info") or {}
     raw = info.get("type") or info.get("origType") or info.get("orderType") or ""
     return str(raw).upper().replace("-", "_")
-
-
-def _to_float_or_none(v: Any) -> float | None:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _order_field_float(o: dict[str, Any], *keys: str) -> float | None:
-    info = o.get("info") or {}
-    for k in keys:
-        v = _to_float_or_none(o.get(k))
-        if v is not None:
-            return v
-        v_info = _to_float_or_none(info.get(k))
-        if v_info is not None:
-            return v_info
-    return None
-
-
-def _relative_price_diff_frac(atual: float, teorico: float) -> float:
-    base = max(abs(float(teorico)), 1e-12)
-    return abs(float(atual) - float(teorico)) / base
-
-
-def _calcular_niveis_bracket_teoricos(
-    exchange: ccxt.binance,
-    simbolo: str,
-    direcao: str,
-    preco_entrada: float,
-    *,
-    trailing_callback_rate: float,
-    trailing_activation_multiplier: float,
-    sl_break_even: bool,
-) -> tuple[float, float, float]:
-    d = str(direcao).strip().upper()
-    cb_rate = float(trailing_callback_rate)
-    act_mult = float(trailing_activation_multiplier)
-    if cb_rate <= 0:
-        cb_rate = float(TRAILING_CALLBACK_RATE)
-    if act_mult <= 0:
-        act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
-
-    if d == "LONG":
-        if sl_break_even:
-            tp_raw = float(preco_entrada)
-            sl_raw = _stop_price_break_even_exato(
-                exchange,
-                simbolo,
-                float(preco_entrada),
-                direcao="LONG",
-            )
-        else:
-            tp_raw = float(preco_entrada) * (1.0 + (LONG_TP * act_mult))
-            sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
-            sl_raw = float(preco_entrada) * (1.0 - sl_frac)
-    elif d == "SHORT":
-        if sl_break_even:
-            tp_raw = float(preco_entrada)
-            sl_raw = _stop_price_break_even_exato(
-                exchange,
-                simbolo,
-                float(preco_entrada),
-                direcao="SHORT",
-            )
-        else:
-            tp_raw = float(preco_entrada) * (1.0 - (SHORT_TP * act_mult))
-            sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
-            sl_raw = float(preco_entrada) * (1.0 + sl_frac)
-    else:
-        raise ValueError(f"{_TAG} direcao inválida: {d!r}")
-
-    tp_p = float(exchange.price_to_precision(simbolo, tp_raw))
-    sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
-    return sl_p, tp_p, cb_rate
-
-
-def _ordens_protecao_atuais(
-    exchange: ccxt.binance,
-    simbolo: str,
-    direcao: str,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    d = str(direcao).strip().upper()
-    if d not in ("LONG", "SHORT"):
-        return None, None
-    need_side = "sell" if d == "LONG" else "buy"
-    ordem_sl = None
-    ordem_tp = None
-    try:
-        rows = exchange.fetch_open_orders(simbolo)
-    except ccxt.BaseError:
-        return None, None
-    for o in rows:
-        if not _order_reduce_only_flag(o):
-            continue
-        if str(o.get("side") or "").lower() != need_side:
-            continue
-        typ = _order_type_norm(o)
-        if typ == "STOP_MARKET" and ordem_sl is None:
-            ordem_sl = o
-        elif typ == "TRAILING_STOP_MARKET" and ordem_tp is None:
-            ordem_tp = o
-    return ordem_sl, ordem_tp
 
 
 def _protective_stop_and_tp_present(
@@ -1252,6 +1144,45 @@ def cancelar_ordens_reduce_only_abertas(
     return n
 
 
+def _count_reduce_only_open_orders(
+    exchange: ccxt.binance,
+    simbolo: str,
+) -> int:
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    try:
+        abertas = exchange.fetch_open_orders(sym)
+    except ccxt.BaseError as e:
+        print(f"{_TAG} fetch_open_orders (count reduce-only): {e}", file=sys.stderr)
+        return -1
+    n = 0
+    for o in abertas:
+        if _order_reduce_only_flag(o):
+            n += 1
+    return n
+
+
+def _aguardar_limpeza_reduce_only(
+    exchange: ccxt.binance,
+    simbolo: str,
+    *,
+    max_tentativas: int = 8,
+    intervalo_s: float = 0.25,
+) -> None:
+    """Confirma que não há ordens reduce-only pendentes antes de recriar brackets."""
+    for _ in range(max_tentativas):
+        n_ro = _count_reduce_only_open_orders(exchange, simbolo)
+        if n_ro == 0:
+            return
+        if n_ro < 0:
+            time.sleep(intervalo_s)
+            continue
+        time.sleep(intervalo_s)
+    n_final = _count_reduce_only_open_orders(exchange, simbolo)
+    raise RuntimeError(
+        f"{_TAG} Limpeza reduce-only não confirmou zero ordens em {simbolo} (restantes={n_final})."
+    )
+
+
 def assegurar_brackets_apos_reconciliacao(
     simbolo: str,
     exchange: ccxt.binance,
@@ -1285,36 +1216,11 @@ def assegurar_brackets_apos_reconciliacao(
         if trailing_activation_multiplier is not None
         else float(TRAILING_ACTIVATION_MULTIPLIER)
     )
-    force_update = bool(sl_break_even)
 
-    if not force_update:
-        ordem_sl, ordem_tp = _ordens_protecao_atuais(exchange, sym, d)
-        if ordem_sl is not None and ordem_tp is not None:
-            sl_teorico, tp_teorico, cb_teorico = _calcular_niveis_bracket_teoricos(
-                exchange,
-                sym,
-                d,
-                float(preco_entrada),
-                trailing_callback_rate=cb_rate,
-                trailing_activation_multiplier=act_mult,
-                sl_break_even=False,
-            )
-            sl_atual = _order_field_float(ordem_sl, "stopPrice", "triggerPrice")
-            tp_atual = _order_field_float(ordem_tp, "activationPrice", "activatePrice", "stopPrice")
-            cb_atual = _order_field_float(ordem_tp, "callbackRate")
-            if sl_atual is not None and tp_atual is not None and cb_atual is not None:
-                sl_diff = _relative_price_diff_frac(sl_atual, sl_teorico)
-                tp_diff = _relative_price_diff_frac(tp_atual, tp_teorico)
-                cb_diff = abs(float(cb_atual) - float(cb_teorico))
-                thr = float(ORDER_GUARD_REPRICE_THRESHOLD_FRAC)
-                if sl_diff <= thr and tp_diff <= thr and cb_diff <= 1e-9:
-                    if source_tag:
-                        print(
-                            f"{_TAG} [{source_tag}] Brackets mantidos (sem cancel/replace): "
-                            f"ΔSL={sl_diff*100:.4f}%, ΔTP={tp_diff*100:.4f}% <= {thr*100:.3f}%."
-                        )
-                    return
+    # Limpeza radical: remove sempre toda proteção reduce-only antes de recriar brackets.
+    # Só recria após confirmação explícita de mesa limpa (zero reduce-only abertas).
     cancelar_ordens_reduce_only_abertas(simbolo, exchange)
+    _aguardar_limpeza_reduce_only(exchange, simbolo)
     if d == "LONG":
         _criar_bracket_long(
             exchange,
@@ -1608,6 +1514,13 @@ def abrir_long_market(
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
+    snap_pre = consultar_posicao_futures(simbolo, ex)
+    if bool(snap_pre.get("posicao_aberta")):
+        qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
+        side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
+        raise RuntimeError(
+            f"{_TAG} Entrada LONG abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+        )
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)
@@ -1689,6 +1602,13 @@ def abrir_short_market(
     """
     ex = exchange or criar_exchange_binance()
     sym = _resolver_simbolo_perp(ex, simbolo)
+    snap_pre = consultar_posicao_futures(simbolo, ex)
+    if bool(snap_pre.get("posicao_aberta")):
+        qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
+        side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
+        raise RuntimeError(
+            f"{_TAG} Entrada SHORT abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+        )
     lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
     if notional_usdt_override is not None:
         quantidade_usd = float(notional_usdt_override)

@@ -72,10 +72,10 @@ _main_event_loop: asyncio.AbstractEventLoop | None = None
 
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
-FATOR_STOP_LOSS = 0.992  # preço <= entrada × 0.992  (ROI -0,8%)
-# SHORT (futures): lucro se preço cai; TP −2% / SL +0,8% sobre o preço de entrada.
+FATOR_STOP_LOSS = 0.994  # preço <= entrada × 0.994  (ROI -0,6%)
+# SHORT (futures): lucro se preço cai; TP −2% / SL +0,6% sobre o preço de entrada.
 FATOR_TAKE_PROFIT_SHORT = 0.98  # preço <= entrada × 0.98
-FATOR_STOP_LOSS_SHORT = 1.008  # preço >= entrada × 1.008 (ROI -0,8%)
+FATOR_STOP_LOSS_SHORT = 1.006  # preço >= entrada × 1.006 (ROI -0,6%)
 
 # Zona ML que aciona Hub + Brain: P(alta) ≥ limiar long OU P(alta) ≤ limiar short.
 # Zona neutra (sessão teste HF): P ∈ [SHORT_MAX, LONG_MIN] → sem Hub/Claude.
@@ -95,7 +95,7 @@ TRAILING_CALLBACK_GOD_MODE = 0.4
 ROI_GOD_MODE_ATIVACAO = 0.005  # +0.5%
 RSI_GOD_MODE_ATIVACAO = 70.0
 # ETH/USDC futures: realização parcial + spread guard (pausa refresh de trailing na bolsa).
-PARTIAL_TP_ROI_FRAC = 0.006  # 0,6% ROI — saída híbrida (50% + SL break-even + trailing na «moon bag»)
+PARTIAL_TP_ROI_FRAC = 0.005  # 0,5% ROI — saída híbrida (50% + SL break-even + trailing na «moon bag»)
 PARTIAL_TP_CLOSE_FRAC = 0.5
 # Trailing só sobre a metade restante após o parcial (callbackRate Binance em %).
 TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.6  # 0.6 == 0,6%
@@ -1850,14 +1850,14 @@ def _gerenciar_saida_modo_vigia(
             return
 
         if preco >= limite_sl:
-            print("\n  [Stop Loss SHORT] Preço >= entrada × 1,008 — fechando posição...")
+            print("\n  [Stop Loss SHORT] Preço >= entrada × 1,006 — fechando posição...")
             try:
                 if "FUTURES" in modo_label:
                     ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
                 else:
                     ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
                 just = (
-                    f"SL short +0.8%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
+                    f"SL short +0.6%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
                     f"id={ordem.get('id')}."
                 )
                 logger.registrar_log_trade(
@@ -1957,14 +1957,14 @@ def _gerenciar_saida_modo_vigia(
         return
 
     if preco <= limite_sl:
-        print("\n  [Stop Loss] Preço atual <= entrada × 0,992 — executando saída total...")
+        print("\n  [Stop Loss] Preço atual <= entrada × 0,994 — executando saída total...")
         try:
             if "FUTURES" in modo_label:
                 ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
             else:
                 ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
             just = (
-                f"SL -0.8%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
+                f"SL -0.6%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
                 f"ordem id={ordem.get('id')}."
             )
             logger.registrar_log_trade(
@@ -2187,7 +2187,7 @@ def rodar_ciclo(modo: str) -> None:
     if posicao_aberta:
         print("\n>>> MODO VIGIA <<<")
         print(
-            "    Posição aberta: TP/SL — LONG +2% / −0,8% | SHORT (fut.) −2% / +0,8% no preço de entrada."
+            "    Posição aberta: TP/SL — LONG +2% / −0,6% | SHORT (fut.) −2% / +0,6% no preço de entrada."
         )
         _gerenciar_saida_modo_vigia(preco, ex, ex_mod, modo_label)
         return
@@ -2968,12 +2968,7 @@ def rodar_ciclo(modo: str) -> None:
         )
         return
 
-    adx_raw = snap.get("adx_14")
     rsi_raw = snap.get("rsi_14")
-    try:
-        adx_num = float(adx_raw) if adx_raw is not None else None
-    except (TypeError, ValueError):
-        adx_num = None
     try:
         rsi_num = float(rsi_raw) if rsi_raw is not None else None
     except (TypeError, ValueError):
@@ -2983,70 +2978,52 @@ def rodar_ciclo(modo: str) -> None:
     if (
         not manual_override_veredito
         and sent == "BEARISH"
-        and indicators.rsi_proibe_entrada_short(rsi_num)
+        and rsi_num is not None
+        and rsi_num < 35.0
     ):
-        if adx_num is not None and adx_num > 30.0:
-            short_adx_bypass = True
-            print(
-                "    [ADX BYPASS] RSI sobrevendido para SHORT, mas ADX(14)>30 "
-                f"(ADX={adx_num:.2f}) — tendência forte confirmada; veto ignorado."
-            )
-        else:
-            print(
-                f"    [Risco] RSI sobrevendido (RSI(14)={rsi_num}) — SHORT proibido "
-                "(sem ADX BYPASS, exigido ADX>30)."
-            )
-            logger.registrar_log_trade(
-                par_moeda=SYMBOL_TRADE,
-                preco=preco,
-                prob_ml=probabilidade,
-                sentimento=sent,
-                acao="VETO_RSI_OVERSOLD",
-                justificativa=(
-                    f"{just_ia} | RSI(14)={rsi_num} < {indicators.RSI_LIMIAR_OVERSOLD_SHORT} "
-                    f"e ADX(14)={adx_num} <= 30 (abrir SHORT vetado)"
-                ),
-                lado_ordem="SHORT",
-                contexto_raw=contexto_raw_supabase,
-                justificativa_ia=just_ia,
-                noticias_agregadas=contexto,
-            )
-            return
+        print(
+            f"    [Risco] RSI sobrevendido extremo (RSI(14)={rsi_num:.2f} < 35) — SHORT proibido."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento=sent,
+            acao="VETO_RSI_OVERSOLD",
+            justificativa=(
+                f"{just_ia} | RSI(14)={rsi_num:.2f} < 35 (abrir SHORT vetado para evitar vender fundo)"
+            ),
+            lado_ordem="SHORT",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
+        )
+        return
 
-    long_adx_bypass = False
     if (
         not manual_override_veredito
         and sent == "BULLISH"
         and rsi_num is not None
-        and rsi_num > 70.0
+        and rsi_num > 65.0
     ):
-        if adx_num is not None and adx_num > 30.0:
-            long_adx_bypass = True
-            print(
-                "    [ADX BYPASS] RSI sobrecomprado para LONG, mas ADX(14)>30 "
-                f"(ADX={adx_num:.2f}) — tendência forte confirmada; veto ignorado."
-            )
-        else:
-            print(
-                f"    [Risco] RSI sobrecomprado (RSI(14)={rsi_num:.2f}) — LONG proibido "
-                "(sem ADX BYPASS, exigido ADX>30)."
-            )
-            logger.registrar_log_trade(
-                par_moeda=SYMBOL_TRADE,
-                preco=preco,
-                prob_ml=probabilidade,
-                sentimento=sent,
-                acao="VETO_RSI_OVERBOUGHT",
-                justificativa=(
-                    f"{just_ia} | RSI(14)={rsi_num:.2f} > 70 e ADX(14)={adx_num} <= 30 "
-                    "(abrir LONG vetado)"
-                ),
-                lado_ordem="LONG",
-                contexto_raw=contexto_raw_supabase,
-                justificativa_ia=just_ia,
-                noticias_agregadas=contexto,
-            )
-            return
+        print(
+            f"    [VETO_RSI_EXAUSTAO] Sinal de LONG bloqueado (RSI muito alto: {rsi_num:.2f})."
+        )
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento=sent,
+            acao="VETO_RSI_EXAUSTAO",
+            justificativa=(
+                f"{just_ia} | RSI(14)={rsi_num:.2f} > 65 (abrir LONG vetado para evitar comprar topo)"
+            ),
+            lado_ordem="LONG",
+            contexto_raw=contexto_raw_supabase,
+            justificativa_ia=just_ia,
+            noticias_agregadas=contexto,
+        )
+        return
 
     if sent == "BULLISH":
         if modo == "FUTURES":
@@ -3072,8 +3049,6 @@ def rodar_ciclo(modo: str) -> None:
         )
         if manual_override_veredito:
             print("    👑 [GOD MODE] Execução LONG forçada por veredito MANUAL.")
-        elif long_adx_bypass:
-            print("    🚀 [ADX BYPASS] LONG autorizado apesar de RSI extremo (ADX > 30).")
         try:
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             if modo == "FUTURES":
@@ -3132,7 +3107,7 @@ def rodar_ciclo(modo: str) -> None:
                     "(FUTURES: SL fixo + trailing stop já na bolsa; "
                     "o maestro ainda monitora como rede de segurança)"
                     if modo == "FUTURES"
-                    else "(TP +2% / SL -0.8%)."
+                    else "(TP +2% / SL -0.6%)."
                 )
             )
         except Exception as e_ord:  # noqa: BLE001
@@ -3684,7 +3659,7 @@ async def main() -> None:
 
     print(
         "\n[Maestro] Bot quantitativo | MAINNET | modo SPOT/FUTURES via Supabase (config) | "
-        "TP/SL 1.02 / 0.992.\n"
+        "TP/SL 1.02 / 0.994.\n"
     )
     print(f"🚀 [AURIC-USDC] Iniciando motor para mercado USDC-Margined: {_SYMBOL_REST}.")
     await asyncio.to_thread(_validar_preflight_futures_usdc)
