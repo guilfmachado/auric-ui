@@ -93,7 +93,9 @@ def add_technical_features(df: pd.DataFrame) -> pd.DataFrame:
     if macd_df is not None and not macd_df.empty:
         out = pd.concat([out, macd_df], axis=1)
 
-    bb = ta.bbands(out["close"], length=20, std=2.0)
+    from indicators import BBANDS_LENGTH, BBANDS_STD
+
+    bb = ta.bbands(out["close"], length=BBANDS_LENGTH, std=BBANDS_STD)
     if bb is not None and not bb.empty:
         out = pd.concat([out, bb], axis=1)
 
@@ -294,6 +296,7 @@ def obter_snapshot_indicadores_eth(
     Um único download OHLCV por ciclo quando usado em vez de chamadas separadas.
     """
     from indicators import (
+        analisar_bb_entrada_squeeze_breakout,
         extrair_bollinger_pct_b_ultima,
         mercado_lateral_por_adx,
         regime_adx_semantico,
@@ -305,6 +308,7 @@ def obter_snapshot_indicadores_eth(
     reg = _regime_volatilidade_de_feat(feat)
     last = feat.iloc[-1]
     bb_extra = extrair_bollinger_pct_b_ultima(feat)
+    bb_entrada = analisar_bb_entrada_squeeze_breakout(feat)
 
     def _to_f(x: Any) -> float | None:
         try:
@@ -328,6 +332,7 @@ def obter_snapshot_indicadores_eth(
     out: dict[str, Any] = {
         **reg,
         **bb_extra,
+        **bb_entrada,
         **macd,
         "adx_14": adx,
         "adx_regime": adx_regime,

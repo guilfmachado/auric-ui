@@ -30,6 +30,20 @@ RSI_LIMIAR_OVERSOLD_SHORT = 30.0
 # Volume do último minuto fechado vs minuto anterior: aumento relativo ≥ isto ⇒ spike (+300% → 3.0).
 VOLUME_SPIKE_FRACAO_1M = 3.0
 
+# Bollinger (ML + entrada ETH/USDC): σ mais apertado para USDC; squeeze = largura/preço < 0,2%.
+BBANDS_LENGTH = 20
+BBANDS_STD = 1.5
+ENTRY_SQUEEZE_MAX_WIDTH_FRAC = 0.002  # (BBU−BBL)/close < 0,2%
+
+# --- Price Action (Auric) — pivots 1m, squeeze «real», short squeeze ---
+DOUBLE_PIVOT_ZONE_FRAC = 0.0005  # ±0,05% vs topo/fundo anterior
+SQUEEZE_REAL_BB_FRAC = ENTRY_SQUEEZE_MAX_WIDTH_FRAC  # alinhado ao filtro de entrada
+SHORT_SQUEEZE_MOVE_FRAC = 0.004  # vela 1m fechada: variação (close−open)/open
+SHORT_SQUEEZE_VOL_MULT = 2.0  # volume da vela ≥ N× média das velas anteriores
+SHORT_SQUEEZE_RSI_MIN = 70.0
+PIVOT_FRACTAL_LEFT = 2
+PIVOT_FRACTAL_RIGHT = 2
+
 
 def obter_indicadores_confluencia(
     exchange: Any,
@@ -40,7 +54,7 @@ def obter_indicadores_confluencia(
 ) -> dict[str, Any]:
     """
     VWAP aproximado por (preço típico × volume) / volume acumulado na janela;
-    ADX(14); Bollinger(20, 2); squeeze se (BBU − BBL) / preço < 2%.
+    ADX(14); Bollinger(20, 1.5σ); squeeze se (BBU − BBL) / preço < 2%.
 
     `exchange`: instância ccxt com `fetch_ohlcv`.
     """
@@ -79,7 +93,7 @@ def obter_indicadores_confluencia(
 
     upper = float("nan")
     lower = float("nan")
-    bb_df = ta.bbands(df["close"], length=20, std=2.0)
+    bb_df = ta.bbands(df["close"], length=BBANDS_LENGTH, std=BBANDS_STD)
     if bb_df is not None and not bb_df.empty:
         bbu = next((c for c in bb_df.columns if str(c).startswith("BBU_")), None)
         bbl = next((c for c in bb_df.columns if str(c).startswith("BBL_")), None)
@@ -119,6 +133,266 @@ def rsi_proibe_entrada_short(rsi: float | None) -> bool:
         return r < RSI_LIMIAR_OVERSOLD_SHORT
     except (TypeError, ValueError):
         return False
+
+
+def extrair_pivots_fractais(
+    df: pd.DataFrame,
+    *,
+    left: int = PIVOT_FRACTAL_LEFT,
+    right: int = PIVOT_FRACTAL_RIGHT,
+) -> list[dict[str, Any]]:
+    """
+    Máximos/mínimos locais (fractais): pivô em i se high[i] (resp. low[i]) é estritamente
+    maior (resp. menor) que todos os highs (resp. lows) em [i−left, i+right] exceto i.
+    """
+    out: list[dict[str, Any]] = []
+    if df is None or len(df) < left + right + 5:
+        return out
+    highs = df["high"].to_numpy(dtype=float)
+    lows = df["low"].to_numpy(dtype=float)
+    ts = df["timestamp"].to_numpy()
+    n = len(df)
+    for i in range(left, n - right):
+        lmx = float(np.max(highs[i - left : i]))
+        rmx = float(np.max(highs[i + 1 : i + right + 1]))
+        if highs[i] > lmx and highs[i] > rmx:
+            out.append({"i": i, "ts": int(ts[i]), "kind": "H", "price": float(highs[i])})
+        lmn = float(np.min(lows[i - left : i]))
+        rmn = float(np.min(lows[i + 1 : i + right + 1]))
+        if lows[i] < lmn and lows[i] < rmn:
+            out.append({"i": i, "ts": int(ts[i]), "kind": "L", "price": float(lows[i])})
+    return out
+
+
+def sinal_double_top_ultima_vela(
+    pivots_ultimos: list[dict[str, Any]],
+    close: float,
+    high: float,
+) -> bool:
+    """Dois topos consecutivos na janela de pivots alinhados (≤0,05%) e recuo do fecho."""
+    z = DOUBLE_PIVOT_ZONE_FRAC
+    if len(pivots_ultimos) < 2:
+        return False
+    hs = [float(p["price"]) for p in pivots_ultimos if p.get("kind") == "H"]
+    if len(hs) < 2:
+        return False
+    h1, h2 = hs[-2], hs[-1]
+    if abs(h2 - h1) / max(h1, 1e-12) > z:
+        return False
+    peak_ref = max(h1, h2)
+    if peak_ref <= 0:
+        return False
+    touched = high >= peak_ref * (1.0 - z)
+    recuo = close < peak_ref * (1.0 - z)
+    return bool(touched and recuo)
+
+
+def sinal_double_bottom_ultima_vela(
+    pivots_ultimos: list[dict[str, Any]],
+    close: float,
+    low: float,
+) -> bool:
+    """Dois fundos consecutivos alinhados (≤0,05%) e repique do fecho."""
+    z = DOUBLE_PIVOT_ZONE_FRAC
+    if len(pivots_ultimos) < 2:
+        return False
+    ls = [float(p["price"]) for p in pivots_ultimos if p.get("kind") == "L"]
+    if len(ls) < 2:
+        return False
+    l1, l2 = ls[-2], ls[-1]
+    if abs(l2 - l1) / max(l1, 1e-12) > z:
+        return False
+    trough_ref = min(l1, l2)
+    if trough_ref <= 0:
+        return False
+    touched = low <= trough_ref * (1.0 + z)
+    bounce = close > trough_ref * (1.0 + z)
+    return bool(touched and bounce)
+
+
+def detectar_short_squeeze_1m(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Vela 1m **fechada** (penúltima linha do OHLCV): (C−O)/O > 0,4%, volume ≥ 2× média
+    das 20 velas anteriores, RSI(14) > 70 → possível short squeeze / coberturas.
+    """
+    out: dict[str, Any] = {
+        "ativo": False,
+        "move_frac": None,
+        "vol_ratio": None,
+        "rsi": None,
+    }
+    if df is None or len(df) < 25:
+        return out
+    d = df.iloc[-2]
+    o = float(d["open"])
+    c = float(d["close"])
+    v = float(d["volume"])
+    if o <= 0:
+        return out
+    move = (c - o) / o
+    win = df["volume"].iloc[-22:-2]
+    vma = float(win.mean()) if len(win) else 0.0
+    rsi_s = ta.rsi(df["close"], length=14)
+    rsi_last: float | None = None
+    if rsi_s is not None and len(rsi_s) >= 2:
+        rv = float(rsi_s.iloc[-2])
+        rsi_last = None if (isinstance(rv, float) and np.isnan(rv)) else rv
+    out["move_frac"] = float(move)
+    out["vol_ratio"] = (v / vma) if vma > 1e-12 else None
+    out["rsi"] = rsi_last
+    out["ativo"] = bool(
+        move >= SHORT_SQUEEZE_MOVE_FRAC
+        and vma > 1e-12
+        and v >= SHORT_SQUEEZE_VOL_MULT * vma
+        and rsi_last is not None
+        and rsi_last > SHORT_SQUEEZE_RSI_MIN
+    )
+    return out
+
+
+def analisar_bb_entrada_squeeze_breakout(feat: pd.DataFrame) -> dict[str, Any]:
+    """
+    Entrada «sniper» ETH/USDC:
+    - `bb_squeeze_tight_002`: (BBU−BBL)/close < 0,2% — mercado em compressão.
+    - Rompimento válido: largura das bandas a **expandir** vs vela anterior, preço a romper
+      BBU (long) ou BBL (short), volume da última vela > média das **10** anteriores.
+    """
+    out: dict[str, Any] = {
+        "bb_squeeze_tight_002": False,
+        "bb_width_frac_now": None,
+        "bb_width_frac_prev": None,
+        "bb_width_expanding": False,
+        "bb_breakout_long_ok": False,
+        "bb_breakout_short_ok": False,
+    }
+    if feat is None or len(feat) < 2:
+        return out
+    cols = list(feat.columns)
+    bbu = next((c for c in cols if str(c).startswith("BBU_")), None)
+    bbl = next((c for c in cols if str(c).startswith("BBL_")), None)
+    if not bbu or not bbl or "close" not in feat.columns or "volume" not in feat.columns:
+        return out
+
+    def width_frac_at(j: int) -> float | None:
+        try:
+            u = float(feat[bbu].iloc[j])
+            ell = float(feat[bbl].iloc[j])
+            c = float(feat["close"].iloc[j])
+            if c <= 0 or np.isnan(u) or np.isnan(ell) or np.isnan(c):
+                return None
+            return (u - ell) / c
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    wn = width_frac_at(-1)
+    wp = width_frac_at(-2)
+    out["bb_width_frac_now"] = wn
+    out["bb_width_frac_prev"] = wp
+    if wn is not None:
+        out["bb_squeeze_tight_002"] = bool(wn < float(ENTRY_SQUEEZE_MAX_WIDTH_FRAC))
+    if wn is not None and wp is not None:
+        out["bb_width_expanding"] = bool(wn > wp)
+
+    try:
+        c_last = float(feat["close"].iloc[-1])
+        u_last = float(feat[bbu].iloc[-1])
+        l_last = float(feat[bbl].iloc[-1])
+        v_last = float(feat["volume"].iloc[-1])
+    except (TypeError, ValueError, IndexError):
+        return out
+
+    vol_mean_10: float | None = None
+    if len(feat) >= 12:
+        seg = feat["volume"].iloc[-11:-1]
+        vol_mean_10 = float(seg.mean()) if len(seg) else None
+    vol_ok = (
+        vol_mean_10 is not None
+        and vol_mean_10 > 1e-12
+        and not np.isnan(v_last)
+        and v_last > vol_mean_10
+    )
+    exp = bool(out["bb_width_expanding"])
+    if not (np.isnan(c_last) or np.isnan(u_last)):
+        out["bb_breakout_long_ok"] = bool(exp and c_last > u_last and vol_ok)
+    if not (np.isnan(c_last) or np.isnan(l_last)):
+        out["bb_breakout_short_ok"] = bool(exp and c_last < l_last and vol_ok)
+    return out
+
+
+def reunir_sinais_price_action(
+    exchange: Any,
+    simbolo: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Double Top/Bottom (últimos 3 pivots em 1m), Short Squeeze (vela 1m fechada),
+    Bollinger «Squeeze Real» (largura bandas vs preço no snapshot, tipicamente 1h).
+    """
+    out: dict[str, Any] = {
+        "double_top": False,
+        "double_bottom": False,
+        "short_squeeze": False,
+        "squeeze_real": False,
+        "squeeze_real_block": False,
+        "bb_breakout_up": False,
+        "bb_breakout_down": False,
+        "resumo": "—",
+    }
+    bu = snapshot.get("bb_upper")
+    bl = snapshot.get("bb_lower")
+    pc = snapshot.get("preco_close")
+    pct_b = snapshot.get("bb_pct_b")
+    try:
+        if bu is not None and bl is not None and pc is not None and float(pc) > 0:
+            fu, fl, fp = float(bu), float(bl), float(pc)
+            bw_abs = (fu - fl) / fp
+            out["squeeze_real"] = bool(bw_abs < float(ENTRY_SQUEEZE_MAX_WIDTH_FRAC))
+            if pct_b is not None:
+                pb = float(pct_b)
+                out["bb_breakout_up"] = pb >= 1.0
+                out["bb_breakout_down"] = pb <= 0.0
+            out["squeeze_real_block"] = bool(out["squeeze_real"]) and not (
+                out["bb_breakout_up"] or out["bb_breakout_down"]
+            )
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        raw = exchange.fetch_ohlcv(simbolo, "1m", limit=120)
+    except Exception:
+        raw = []
+    if raw and len(raw) >= 25:
+        df1 = pd.DataFrame(
+            raw,
+            columns=["timestamp", "open", "high", "low", "close", "volume"],
+        )
+        pivots_all = extrair_pivots_fractais(df1)
+        last3 = pivots_all[-3:] if len(pivots_all) >= 3 else pivots_all
+        lc = float(df1["close"].iloc[-2])
+        lh = float(df1["high"].iloc[-2])
+        ll = float(df1["low"].iloc[-2])
+        out["double_top"] = bool(sinal_double_top_ultima_vela(last3, lc, lh))
+        out["double_bottom"] = bool(sinal_double_bottom_ultima_vela(last3, lc, ll))
+        ss = detectar_short_squeeze_1m(df1)
+        out["short_squeeze"] = bool(ss.get("ativo"))
+        out["short_squeeze_detail"] = {
+            "move_frac": ss.get("move_frac"),
+            "vol_ratio": ss.get("vol_ratio"),
+            "rsi": ss.get("rsi"),
+        }
+    parts: list[str] = []
+    if out["double_top"]:
+        parts.append("Double Top (viés SHORT)")
+    if out["double_bottom"]:
+        parts.append("Double Bottom (viés LONG)")
+    if out["short_squeeze"]:
+        parts.append("Short squeeze em curso (evitar SHORT)")
+    if out["squeeze_real_block"]:
+        parts.append("Squeeze Real BB — aguardar rompimento")
+    elif out["squeeze_real"] and (out["bb_breakout_up"] or out["bb_breakout_down"]):
+        parts.append("Squeeze Real com rompimento de banda")
+    out["resumo"] = "; ".join(parts) if parts else "—"
+    return out
 
 
 def volume_compra_spike_1m(
@@ -356,6 +630,13 @@ def snapshot_para_contexto_raw_json(snapshot: dict[str, Any]) -> dict[str, Any]:
         "regime",
         "atr_pct",
         "bb_width_pct",
+        "auric_price_action",
+        "bb_squeeze_tight_002",
+        "bb_width_expanding",
+        "bb_breakout_long_ok",
+        "bb_breakout_short_ok",
+        "bb_width_frac_now",
+        "bb_width_frac_prev",
     )
     out: dict[str, Any] = {}
     for k in keys:
@@ -459,7 +740,7 @@ def formatar_bloco_indicadores_para_llm(snapshot: dict[str, Any]) -> str:
         f"VWAP (diário): preço fechamento vs VWAP → viés = {bias} "
         f"({texto_preco_vs_vwap(bias)}). "
         "Acima do VWAP favorece leitura altista de curto prazo; abaixo, baixista.",
-        f"Bollinger (20, 2σ): %B = {pct_txt} — {descrever_status_bollinger_para_prompt(snapshot)}",
+        f"Bollinger (20, 1.5σ): %B = {pct_txt} — {descrever_status_bollinger_para_prompt(snapshot)}",
         f"Compressão squeeze (BB vs histórico) = {'SIM — possível expansão de volatilidade iminente' if sq else 'NÃO'}.",
     ]
     if lateral and not sq:
@@ -474,4 +755,10 @@ def formatar_bloco_indicadores_para_llm(snapshot: dict[str, Any]) -> str:
                 f"P(ML)={p:.1%} com squeeze: tratar como setup de alta convicção potencial "
                 f"(alvo de confiança operacional ≥ {CONFIANCA_BOOST_SQUEEZE}% se resto alinhado)."
             )
+    pa = snapshot.get("auric_price_action")
+    if isinstance(pa, dict) and pa.get("resumo") not in (None, "", "—"):
+        import json
+
+        lines.append("=== PRICE ACTION (Auric) ===")
+        lines.append(json.dumps(pa, ensure_ascii=False, indent=2))
     return "\n".join(lines)

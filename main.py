@@ -72,10 +72,10 @@ _main_event_loop: asyncio.AbstractEventLoop | None = None
 
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
-FATOR_STOP_LOSS = 0.985  # preço <= entrada × 0.985  (ROI -1,5%)
-# SHORT (futures): lucro se preço cai; TP −2% / SL +1,5% sobre o preço de entrada.
+FATOR_STOP_LOSS = 0.992  # preço <= entrada × 0.992  (ROI -0,8%)
+# SHORT (futures): lucro se preço cai; TP −2% / SL +0,8% sobre o preço de entrada.
 FATOR_TAKE_PROFIT_SHORT = 0.98  # preço <= entrada × 0.98
-FATOR_STOP_LOSS_SHORT = 1.015  # preço >= entrada × 1.015 (ROI -1,5%)
+FATOR_STOP_LOSS_SHORT = 1.008  # preço >= entrada × 1.008 (ROI -0,8%)
 
 # Zona ML que aciona Hub + Brain: P(alta) ≥ limiar long OU P(alta) ≤ limiar short.
 # Zona neutra (sessão teste HF): P ∈ [SHORT_MAX, LONG_MIN] → sem Hub/Claude.
@@ -95,9 +95,10 @@ TRAILING_CALLBACK_GOD_MODE = 0.4
 ROI_GOD_MODE_ATIVACAO = 0.005  # +0.5%
 RSI_GOD_MODE_ATIVACAO = 70.0
 # ETH/USDC futures: realização parcial + spread guard (pausa refresh de trailing na bolsa).
-PARTIAL_TP_ROI_FRAC = 0.008  # 0,8% ROI — saída híbrida (50% market + BE + trailing 0,4%)
+PARTIAL_TP_ROI_FRAC = 0.006  # 0,6% ROI — saída híbrida (50% + SL break-even + trailing na «moon bag»)
 PARTIAL_TP_CLOSE_FRAC = 0.5
-TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.4  # callbackRate Binance (%): 0.4 == 0,4%
+# Trailing só sobre a metade restante após o parcial (callbackRate Binance em %).
+TRAILING_CALLBACK_APOS_PARTIAL_TP = 0.6  # 0.6 == 0,6%
 SPREAD_GUARD_MAX_FRAC = 0.001  # (ask−bid)/mid > 0,1%
 SPREAD_GUARD_PAUSE_S = 5.0
 
@@ -1514,7 +1515,7 @@ def _gerenciar_saida_modo_vigia(
                 justificativa=(
                     f"[HYBRID-EXIT] ROI {roi*100:.3f}% ≥ {PARTIAL_TP_ROI_FRAC*100:.2f}%; "
                     f"fecho {PARTIAL_TP_CLOSE_FRAC*100:.0f}% MARKET; id={ord_p.get('id')}; "
-                    f"qty_left≈{qty_r:g}; SL break-even + trailing {trailing_ap:.2f}%."
+                    f"qty_left≈{qty_r:g}."
                 ),
                 lado_ordem=direcao_posicao,
                 contexto_raw=json.dumps(
@@ -1524,8 +1525,6 @@ def _gerenciar_saida_modo_vigia(
                             "close_frac": PARTIAL_TP_CLOSE_FRAC,
                             "qty_left": qty_r,
                             "execution": exec_mode.lower(),
-                            "sl_break_even": True,
-                            "trailing_pct": float(trailing_ap),
                             "hybrid_exit": True,
                         }
                     }
@@ -1533,6 +1532,33 @@ def _gerenciar_saida_modo_vigia(
             )
             if qty_r > 0:
                 logger.atualizar_qty_left_ultimo_trade(SYMBOL_TRADE, qty_r)
+                try:
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco,
+                        prob_ml=0.0,
+                        sentimento="—",
+                        acao="HYBRID_BE_TRAILING",
+                        justificativa=(
+                            f"[HYBRID-EXIT] SL break-even @ entrada {preco_compra:.4f} + "
+                            f"TRAILING_STOP_MARKET callbackRate={trailing_ap:.2f}% "
+                            f"(qty restante ≈ {qty_r:g})."
+                        ),
+                        lado_ordem=direcao_posicao,
+                        contexto_raw=json.dumps(
+                            {
+                                "auric_hybrid_brackets": {
+                                    "sl_break_even": True,
+                                    "entry_price": float(preco_compra),
+                                    "qty_remaining": float(qty_r),
+                                    "trailing_callback_pct": float(trailing_ap),
+                                    "activation_mult": float(_trailing_activation_mult_cfg),
+                                }
+                            }
+                        ),
+                    )
+                except Exception as e_be:  # noqa: BLE001
+                    print(f"⚠️ [HYBRID-EXIT] Falha ao logar HYBRID_BE_TRAILING: {e_be}")
             _partial_tp_locked = True
             _trailing_callback_cfg = trailing_ap
             _god_mode_auto_ativo = True
@@ -1541,9 +1567,9 @@ def _gerenciar_saida_modo_vigia(
                 f"⚡️ [GOD MODE DE SAÍDA] Trailing {trailing_ap:.3f}% + SL break-even @ entrada "
                 f"{preco_compra:.4f} (qty restante ≈ {qty_r:g})."
             )
+            return
         except Exception as e_ptp:  # noqa: BLE001
             print(f"⚠️ [HYBRID-EXIT] Falha no fecho parcial ou brackets: {e_ptp}")
-        return
 
     trailing_ativo = float(_trailing_callback_cfg)
     rsi_15m_now: float | None = None
@@ -1824,14 +1850,14 @@ def _gerenciar_saida_modo_vigia(
             return
 
         if preco >= limite_sl:
-            print("\n  [Stop Loss SHORT] Preço >= entrada × 1,01 — fechando posição...")
+            print("\n  [Stop Loss SHORT] Preço >= entrada × 1,008 — fechando posição...")
             try:
                 if "FUTURES" in modo_label:
                     ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
                 else:
                     ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
                 just = (
-                    f"SL short +1%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
+                    f"SL short +0.8%: entrada {preco_compra:.4f}, ref. {preco:.4f}, "
                     f"id={ordem.get('id')}."
                 )
                 logger.registrar_log_trade(
@@ -1931,14 +1957,14 @@ def _gerenciar_saida_modo_vigia(
         return
 
     if preco <= limite_sl:
-        print("\n  [Stop Loss] Preço atual <= entrada × 0,99 — executando saída total...")
+        print("\n  [Stop Loss] Preço atual <= entrada × 0,992 — executando saída total...")
         try:
             if "FUTURES" in modo_label:
                 ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
             else:
                 ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
             just = (
-                f"SL -1%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
+                f"SL -0.8%: entrada {preco_compra:.4f}, saída ref. {preco:.4f}, "
                 f"ordem id={ordem.get('id')}."
             )
             logger.registrar_log_trade(
@@ -2161,7 +2187,7 @@ def rodar_ciclo(modo: str) -> None:
     if posicao_aberta:
         print("\n>>> MODO VIGIA <<<")
         print(
-            "    Posição aberta: TP/SL — LONG +2% / −1% | SHORT (fut.) −2% / +1% no preço de entrada."
+            "    Posição aberta: TP/SL — LONG +2% / −0,8% | SHORT (fut.) −2% / +0,8% no preço de entrada."
         )
         _gerenciar_saida_modo_vigia(preco, ex, ex_mod, modo_label)
         return
@@ -3106,7 +3132,7 @@ def rodar_ciclo(modo: str) -> None:
                     "(FUTURES: SL fixo + trailing stop já na bolsa; "
                     "o maestro ainda monitora como rede de segurança)"
                     if modo == "FUTURES"
-                    else "(TP +2% / SL -1%)."
+                    else "(TP +2% / SL -0.8%)."
                 )
             )
         except Exception as e_ord:  # noqa: BLE001
@@ -3658,7 +3684,7 @@ async def main() -> None:
 
     print(
         "\n[Maestro] Bot quantitativo | MAINNET | modo SPOT/FUTURES via Supabase (config) | "
-        "TP/SL 1.02 / 0.99.\n"
+        "TP/SL 1.02 / 0.992.\n"
     )
     print(f"🚀 [AURIC-USDC] Iniciando motor para mercado USDC-Margined: {_SYMBOL_REST}.")
     await asyncio.to_thread(_validar_preflight_futures_usdc)
