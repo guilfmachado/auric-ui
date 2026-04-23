@@ -1144,43 +1144,62 @@ def cancelar_ordens_reduce_only_abertas(
     return n
 
 
-def _count_reduce_only_open_orders(
-    exchange: ccxt.binance,
-    simbolo: str,
-) -> int:
+def _futures_symbol_id(exchange: ccxt.binance, simbolo: str) -> str:
+    """Símbolo no formato nativo da API Binance Futures (ex.: ETHUSDC)."""
     sym = _resolver_simbolo_perp(exchange, simbolo)
-    try:
-        abertas = exchange.fetch_open_orders(sym)
-    except ccxt.BaseError as e:
-        print(f"{_TAG} fetch_open_orders (count reduce-only): {e}", file=sys.stderr)
-        return -1
-    n = 0
-    for o in abertas:
-        if _order_reduce_only_flag(o):
-            n += 1
-    return n
+    m = exchange.market(sym)
+    sid = str(m.get("id") or "").strip().upper()
+    return sid if sid else str(simbolo).replace("/", "").replace(":USDC", "").upper()
 
 
-def _aguardar_limpeza_reduce_only(
-    exchange: ccxt.binance,
+def cancelar_todas_ordens_futures_nativo(
     simbolo: str,
-    *,
-    max_tentativas: int = 8,
-    intervalo_s: float = 0.25,
+    exchange: ccxt.binance | None = None,
 ) -> None:
-    """Confirma que não há ordens reduce-only pendentes antes de recriar brackets."""
-    for _ in range(max_tentativas):
-        n_ro = _count_reduce_only_open_orders(exchange, simbolo)
-        if n_ro == 0:
-            return
-        if n_ro < 0:
-            time.sleep(intervalo_s)
-            continue
-        time.sleep(intervalo_s)
-    n_final = _count_reduce_only_open_orders(exchange, simbolo)
-    raise RuntimeError(
-        f"{_TAG} Limpeza reduce-only não confirmou zero ordens em {simbolo} (restantes={n_final})."
-    )
+    """
+    Cancelamento nativo de Futures (equiv. `futures_cancel_all_open_orders`).
+    Fallback para CCXT unificado apenas se endpoint nativo falhar.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    sid = _futures_symbol_id(ex, simbolo)
+    try:
+        ex.fapiPrivateDeleteAllOpenOrders({"symbol": sid})
+        print(f"{_TAG} Nuke nativo futures executado para {sid}.")
+        return
+    except Exception as e_native:  # noqa: BLE001
+        print(
+            f"{_TAG} Nuke nativo futures falhou ({e_native}); fallback cancel_all_orders em {sym}.",
+            file=sys.stderr,
+        )
+    try:
+        ex.cancel_all_orders(sym)
+    except Exception as e_fallback:  # noqa: BLE001
+        print(f"{_TAG} Fallback cancel_all_orders falhou: {e_fallback}", file=sys.stderr)
+
+
+def obter_ordens_abertas_futures_nativo(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> list[dict[str, Any]]:
+    """Leitura nativa de ordens abertas futures (equiv. `futures_get_open_orders`)."""
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    sid = _futures_symbol_id(ex, simbolo)
+    try:
+        rows = ex.fapiPrivateGetOpenOrders({"symbol": sid})
+        return rows if isinstance(rows, list) else []
+    except Exception as e_native:  # noqa: BLE001
+        print(
+            f"{_TAG} leitura nativa open_orders falhou ({e_native}); fallback fetch_open_orders({sym}).",
+            file=sys.stderr,
+        )
+    try:
+        rows_ccxt = ex.fetch_open_orders(sym)
+        return rows_ccxt if isinstance(rows_ccxt, list) else []
+    except Exception as e_fb:  # noqa: BLE001
+        print(f"{_TAG} fetch_open_orders fallback falhou: {e_fb}", file=sys.stderr)
+        return []
 
 
 def assegurar_brackets_apos_reconciliacao(
@@ -1217,10 +1236,15 @@ def assegurar_brackets_apos_reconciliacao(
         else float(TRAILING_ACTIVATION_MULTIPLIER)
     )
 
-    # Limpeza radical: remove sempre toda proteção reduce-only antes de recriar brackets.
-    # Só recria após confirmação explícita de mesa limpa (zero reduce-only abertas).
-    cancelar_ordens_reduce_only_abertas(simbolo, exchange)
-    _aguardar_limpeza_reduce_only(exchange, simbolo)
+    # Nuke estrito: cancelar tudo no símbolo (endpoint nativo futures), depois validar zero abertas.
+    cancelar_todas_ordens_futures_nativo(simbolo, exchange)
+    ordens_restantes = obter_ordens_abertas_futures_nativo(simbolo, exchange)
+    if len(ordens_restantes) > 0:
+        print(
+            f"{_TAG} [ERRO] Falha ao limpar ordens antigas. Abortando criação de brackets para evitar spam.",
+            file=sys.stderr,
+        )
+        return
     if d == "LONG":
         _criar_bracket_long(
             exchange,
