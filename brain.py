@@ -474,6 +474,113 @@ def analyze_decision(market_context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def revisar_tese_posicao_aberta(
+    *,
+    direcao_posicao: str,
+    roi_frac: float,
+    pnl_nao_realizado: float | None,
+    funding_rate: float | None,
+    order_book_imbalance_pct: float | None,
+    bid_volume_total: float | None,
+    ask_volume_total: float | None,
+    rsi_14: float | None = None,
+    distancia_vwap_pct: float | None = None,
+    inclinacao_ema9_pct: float | None = None,
+    contexto_sentimento_noticias: str | None = None,
+    noticias_recentes: str | None = None,
+    verbose: bool = True,
+) -> tuple[str, str]:
+    """
+    Revisão de tese ativa para posição já aberta.
+    Retorna: ("MANTER"|"FECHAR", "motivo curto").
+    """
+    if not _token_configurado():
+        _avisar_token_ausente()
+        return ("MANTER", "Token Replicate ausente; fallback conservador para manter.")
+
+    d = str(direcao_posicao or "LONG").strip().upper()
+    if d not in ("LONG", "SHORT"):
+        d = "LONG"
+
+    pnl_txt = "N/A" if pnl_nao_realizado is None else f"{float(pnl_nao_realizado):.6f} USDC"
+    fr_txt = "N/A" if funding_rate is None else f"{float(funding_rate):.8f}"
+    imb_txt = (
+        "N/A"
+        if order_book_imbalance_pct is None
+        else f"{float(order_book_imbalance_pct):+.2f}%"
+    )
+    bid_txt = "N/A" if bid_volume_total is None else f"{float(bid_volume_total):.6f}"
+    ask_txt = "N/A" if ask_volume_total is None else f"{float(ask_volume_total):.6f}"
+    rsi_txt = "N/A" if rsi_14 is None else f"{float(rsi_14):.2f}"
+    vwap_dist_txt = "N/A" if distancia_vwap_pct is None else f"{float(distancia_vwap_pct):+.3f}%"
+    ema9_slope_txt = "N/A" if inclinacao_ema9_pct is None else f"{float(inclinacao_ema9_pct):+.3f}%"
+    nota_ctx = (contexto_sentimento_noticias or "").strip()
+    if not nota_ctx:
+        nota_ctx = "Nenhuma nota manual ativa no Supabase."
+    noticias_ctx = (noticias_recentes or "").strip() or "Sem notícias de impacto no momento"
+
+    prompt = (
+        "És um gestor de risco intraday para trade já aberto.\n"
+        "Objetivo: decidir se mantém ou fecha antecipadamente a posição.\n"
+        "Importante: order book pode conter spoofing; só recomende FECHAR por livro se houver "
+        "assimetria forte e coerente com Funding/ROI.\n\n"
+        "Dados da posição:\n"
+        f"- direcao_posicao: {d}\n"
+        f"- roi_frac: {float(roi_frac):+.6f} (equivale a {float(roi_frac)*100:+.2f}%)\n"
+        f"- pnl_nao_realizado: {pnl_txt}\n"
+        f"- funding_rate: {fr_txt}\n"
+        f"- order_book_imbalance_pct: {imb_txt}\n"
+        f"- bid_volume_total_nivel20: {bid_txt}\n"
+        f"- ask_volume_total_nivel20: {ask_txt}\n"
+        f"- rsi_14: {rsi_txt}\n"
+        f"- distancia_vwap_pct: {vwap_dist_txt}\n"
+        f"- inclinacao_ema9_pct: {ema9_slope_txt}\n\n"
+        "Contexto de Sentimento/Notícias (nota manual ativa):\n"
+        f"{nota_ctx}\n\n"
+        "[NOTÍCIAS RECENTES]:\n"
+        f"{noticias_ctx}\n\n"
+        "Prioriza identificar mudança estrutural técnica contra a posição "
+        "(momentum, exaustão, perda de VWAP, inversão de inclinação EMA9), "
+        "mas só recomende FECHAR se houver evidência forte e consistente.\n\n"
+        "Responda em 2 linhas EXATAMENTE:\n"
+        "Linha 1: [MANTER] ou [FECHAR]\n"
+        "Linha 2: motivo curto em uma frase.\n"
+        "Sem JSON, sem markdown, sem texto extra."
+    )
+
+    if verbose:
+        print("🧠 [BRAIN] Revisão de tese ativa: consultando Claude...", flush=True)
+
+    try:
+        output = replicate.run(
+            REPLICATE_MODEL,
+            input={
+                "prompt": prompt,
+                "max_tokens": 220,
+                "temperature": 0.2,
+            },
+        )
+        raw = _saida_replicate_para_string(output).strip()
+        up = raw.upper()
+        if "[FECHAR]" in up:
+            action = "FECHAR"
+        elif "[MANTER]" in up:
+            action = "MANTER"
+        else:
+            # Fail-safe: sem comando explícito, manter posição.
+            action = "MANTER"
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        reason = "Sem detalhe retornado pelo modelo."
+        if len(lines) >= 2:
+            reason = lines[1]
+        elif len(lines) == 1:
+            reason = lines[0].replace("[MANTER]", "").replace("[FECHAR]", "").strip() or reason
+        return (action, reason[:300])
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ [BRAIN ERROR] Revisão de tese falhou: {e}")
+        return ("MANTER", f"Falha no LLM ({e}); mantendo posição por segurança.")
+
+
 if __name__ == "__main__":
     from intelligence_hub import obter_hub_padrao
 

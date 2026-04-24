@@ -55,7 +55,18 @@ export interface TradeOutcomeRow {
   side: "LONG" | "SHORT" | string;
   ml_probability_at_entry?: number | null;
   claude_justification?: string | null;
+  /** PnL realizado em USDC (nome novo) */
+  pnl_usdc?: number | null;
+  /** Compat legado */
   pnl_realized?: number | null;
+  /** ROI em % (nome novo) */
+  roi_pct?: number | null;
+  /** Compat legado */
+  final_roi?: number | null;
+  /** Motivo de fecho (nome novo) */
+  motivo_fecho?: string | null;
+  /** Compat legado */
+  exit_type?: string | null;
   closed_at: string;
 }
 

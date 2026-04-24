@@ -21,8 +21,11 @@ import traceback
 from datetime import datetime, timedelta, timezone
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from typing import Any
 
+import aiohttp
 import ccxt
 
 import brain
@@ -66,6 +69,7 @@ CLAUDE_RATE_LIMIT_WINDOW_S = 300.0
 METRICS_FLUSH_EVERY_TRIGGERS = 50
 METRICS_FLUSH_EVERY_S = 3600.0
 OUTCOME_AUDIT_INTERVAL_S = 300.0
+REVISAO_TESE_INTERVAL_S = 300.0
 # Resiliência HFT: reconexão WS e backoff após falha de ordem (HTTP / margem / notional).
 WS_RECONNECT_DELAY_S = 5.0
 ORDER_FAILURE_BACKOFF_S = 5.0
@@ -84,6 +88,7 @@ FATOR_STOP_LOSS_SHORT = 1.006  # preço >= entrada × 1.006 (ROI -0,6%)
 ML_PROB_SHORT_MAX = 0.45
 WAKE_FILTER_SHORT_MAX = 0.45
 WAKE_FILTER_LONG_MIN = 0.55
+ML_MACRO_OVERRIDE_PROB = 0.70  # Override counter-trend quando confiança estatística é muito alta.
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
@@ -142,6 +147,12 @@ _partial_tp_pos_key: tuple[float, str] | None = None
 _partial_tp_locked: bool = False
 _ultimo_rsi_14: float = 0.0
 _ultimo_adx_14: float = 0.0
+# Watchdog de vela 1m: minuto UTC (0–59) visto com vela fechada (x) no WS; alinhado ao relógio do watchdog.
+ultimo_minuto_processado: int = -1
+# Lock + cooldown partilhados entre WebSocket e `safe_rodar_ciclo` (watchdog).
+_gatilho_ciclo_lock: asyncio.Lock | None = None
+_ultimo_gatilho_ciclo_mono: float = 0.0
+_watchdog_relogio_task: asyncio.Task[None] | None = None
 _ultimo_contexto_raw_supabase: str = "{}"
 justificativa_ia: str = "Aguardando primeira leitura..."
 # Heartbeat Supabase em MODO VIGIA (não bloqueia TP/SL — envio em thread daemon).
@@ -149,6 +160,7 @@ VIGIA_HEARTBEAT_INTERVAL_S = 30.0
 _vigia_heartbeat_last_monotonic: float = 0.0
 # Log único de confirmação de direção/gatilhos ao entrar numa chave (entrada, lado) de vigia.
 _vigia_gatilhos_confirm_key: tuple[float, str] | None = None
+ultima_revisao_tese_ts: float = 0.0
 _metrics_lock = threading.Lock()
 _metrics_counters: dict[str, int] = {
     "triggers_total": 0,
@@ -727,6 +739,34 @@ def _maybe_emit_vigia_heartbeat_supabase(
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _sync_entry_price_supabase() -> None:
+    """
+    Sincroniza estado da posição no Supabase para o dashboard:
+    - wallet_status(id=1): posicao_aberta + entry_price
+    - fallback bot_control(id=1) quando schema/colunas divergirem
+    """
+    if logger.supabase is None:
+        return
+    opened = bool(posicao_aberta and float(preco_compra) > 0)
+    entry_price = float(preco_compra) if opened else None
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": 1,
+        "posicao_aberta": opened,
+        "entry_price": entry_price,
+        "updated_at": now_iso,
+    }
+    try:
+        logger.supabase.table("wallet_status").upsert(payload, on_conflict="id").execute()
+        return
+    except Exception as e_ws:  # noqa: BLE001
+        print(f"⚠️ [STATE SYNC] wallet_status entry_price falhou: {e_ws}")
+    try:
+        logger.supabase.table("bot_control").update(payload).eq("id", 1).execute()
+    except Exception as e_bc:  # noqa: BLE001
+        print(f"⚠️ [STATE SYNC] bot_control entry_price fallback falhou: {e_bc}")
+
+
 def _exit_meta_contexto_json(*, partial_tp_50: bool, stop_hit: bool) -> str:
     return json.dumps(
         {
@@ -1186,6 +1226,7 @@ def _executar_comando_manual_imediato_sync(
         preco_compra = 0.0
         direcao_posicao = "LONG"
         _reset_vigia_eth_usdc_guards()
+        _sync_entry_price_supabase()
         print("👑 [GOD MODE] CLOSE: RAM resetada (sem posição).")
         return
     raise ValueError(f"Comando manual inválido: {c!r}")
@@ -1485,6 +1526,7 @@ def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
                 f"[Estado] Sincronizado: carteira com posição ({direcao_posicao}) — "
                 f"preco ref. entrada = {preco_compra:.4f} USDC"
             )
+            _sync_entry_price_supabase()
         else:
             print(
                 "[Estado] Aviso: há posição, mas não há log de abertura (COMPRA_LONG / ABRE_SHORT) "
@@ -1507,11 +1549,18 @@ def _sincronizar_estado_com_carteira(ex: Any, ex_mod: Any) -> None:
             )
         except Exception as e_pf:  # noqa: BLE001
             print(f"⚠️ [Estado] Supabase fecho (carteira flat, RAM com posição): {e_pf}")
+        try:
+            print("🧹 [ORDENS] Carteira flat detectada. Limpando ordens abertas do símbolo...", flush=True)
+            executor_futures.cancelar_todas_ordens_futures_nativo(SYMBOL_TRADE, ex)
+            executor_futures.cancelar_todas_ordens_abertas(SYMBOL_TRADE, ex)
+        except Exception as e_orf:  # noqa: BLE001
+            print(f"⚠️ [ORDENS] Limpeza pós-fecho (orphan orders) falhou: {e_orf}")
         print("[Estado] Carteira sem posição — resetando posicao_aberta / preco_compra.")
         posicao_aberta = False
         preco_compra = 0.0
         direcao_posicao = "LONG"
         _reset_vigia_eth_usdc_guards()
+        _sync_entry_price_supabase()
 
 
 def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
@@ -1607,6 +1656,7 @@ def _reconciliar_posicao_futures_binance_supabase(ex: Any, modo: str) -> None:
         posicao_aberta = True
         preco_compra = ep
         direcao_posicao = lado_bn
+        _sync_entry_price_supabase()
         try:
             executor_futures.assegurar_brackets_apos_reconciliacao(
                 SYMBOL_TRADE,
@@ -1634,7 +1684,7 @@ def _gerenciar_saida_modo_vigia(
     global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
     global _god_mode_auto_ativo, _trailing_callback_cfg
     global _spread_trailing_pause_until, _partial_tp_pos_key, _partial_tp_locked
-    global _vigia_gatilhos_confirm_key
+    global _vigia_gatilhos_confirm_key, ultima_revisao_tese_ts
 
     if float(preco) <= 0:
         print("⚠️ [GOD MODE] Tick inválido (0.0000). Mantendo último stop seguro sem alterações.")
@@ -1660,6 +1710,8 @@ def _gerenciar_saida_modo_vigia(
                 f"[VIGIA] Direção Confirmada: {direcao_posicao} | "
                 "Verificando integridade dos gatilhos..."
             )
+            # Nova posição/chave de vigia: reinicia relógio da revisão de tese.
+            ultima_revisao_tese_ts = time.time()
 
     _maybe_emit_vigia_heartbeat_supabase(
         preco=float(preco),
@@ -1671,6 +1723,7 @@ def _gerenciar_saida_modo_vigia(
         rsi_14=_ultimo_rsi_14,
         adx_14=_ultimo_adx_14,
     )
+    _sync_entry_price_supabase()
 
     if "FUTURES" in modo_label and float(preco_compra) > 0:
         try:
@@ -1975,6 +2028,161 @@ def _gerenciar_saida_modo_vigia(
         f"    [VIGIA] ROI atual={roi*100:.2f}% | trailing_callback_rate ativo={trailing_ativo:.3f}%"
     )
 
+    # Revisão de tese ativa: a cada 5 minutos com posição aberta.
+    if posicao_aberta and preco_compra > 0:
+        now_ts = time.time()
+        if ultima_revisao_tese_ts <= 0:
+            ultima_revisao_tese_ts = now_ts
+        elif (now_ts - ultima_revisao_tese_ts) >= REVISAO_TESE_INTERVAL_S:
+            print(
+                "⏳ [REVISÃO DE TESE] 5 min passados. Analisando Livro de Ordens e Funding...",
+                flush=True,
+            )
+            ultima_revisao_tese_ts = now_ts
+            try:
+                fr_now: float | None = None
+                bid_vol_total: float | None = None
+                ask_vol_total: float | None = None
+                imbalance_pct: float | None = None
+                pnl_unreal: float | None = None
+                rsi_rev: float | None = None
+                vwap_dist_pct: float | None = None
+                ema9_slope_pct: float | None = None
+                nota_manual_ctx: str | None = None
+                noticias_rss: str = "Sem notícias de impacto no momento"
+                if "FUTURES" in modo_label:
+                    try:
+                        fr_now = executor_futures.obter_funding_rate(SYMBOL_TRADE, ex)
+                    except Exception:
+                        fr_now = None
+                    sym_ob = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
+                else:
+                    sym_ob = SYMBOL_TRADE
+                try:
+                    ob = ex.fetch_order_book(sym_ob, limit=20)
+                    bids = ob.get("bids") if isinstance(ob, dict) else []
+                    asks = ob.get("asks") if isinstance(ob, dict) else []
+                    bid_vol_total = sum(float(lv[1]) for lv in (bids or []) if len(lv) >= 2)
+                    ask_vol_total = sum(float(lv[1]) for lv in (asks or []) if len(lv) >= 2)
+                    den = bid_vol_total + ask_vol_total
+                    if den > 0:
+                        imbalance_pct = ((bid_vol_total - ask_vol_total) / den) * 100.0
+                except Exception as e_ob:
+                    print(f"⚠️ [REVISÃO DE TESE] Falha ao capturar Order Book: {e_ob}")
+                try:
+                    qty_abs = 0.0
+                    if "FUTURES" in modo_label:
+                        snap_pos = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
+                        qty_abs = abs(float(snap_pos.get("contratos") or 0.0))
+                    if qty_abs > 0:
+                        if str(direcao_posicao).upper() == "SHORT":
+                            pnl_unreal = (float(preco_compra) - float(preco)) * qty_abs
+                        else:
+                            pnl_unreal = (float(preco) - float(preco_compra)) * qty_abs
+                except Exception:
+                    pnl_unreal = None
+                try:
+                    snap_tese = ml_model.obter_snapshot_indicadores_eth(SYMBOL_TRADE, prob_ml=None)
+                    rv = snap_tese.get("rsi_14")
+                    rsi_rev = float(rv) if rv is not None else None
+                    vwap_v = snap_tese.get("vwap_d")
+                    close_v = snap_tese.get("preco_close")
+                    if vwap_v is not None and close_v is not None:
+                        vwap_f = float(vwap_v)
+                        close_f = float(close_v)
+                        if abs(vwap_f) > 1e-12:
+                            vwap_dist_pct = ((close_f - vwap_f) / vwap_f) * 100.0
+                except Exception as e_ta:
+                    print(f"⚠️ [REVISÃO DE TESE] TA snapshot indisponível: {e_ta}")
+                try:
+                    ema9_slope_pct = _ema9_slope_pct_1m(ex, sym_ob)
+                except Exception as e_ema:
+                    print(f"⚠️ [REVISÃO DE TESE] EMA9 slope indisponível: {e_ema}")
+                try:
+                    nota_manual_ctx = obter_valor_market_observation_supabase()
+                except Exception:
+                    nota_manual_ctx = None
+                try:
+                    noticias_rss = fetch_crypto_rss_news("ETH")
+                except Exception:
+                    noticias_rss = "Sem notícias de impacto no momento"
+                print(
+                    "📈 [REVISÃO TA] "
+                    f"RSI={rsi_rev if rsi_rev is not None else 'N/A'} | "
+                    f"dist_vwap={f'{vwap_dist_pct:+.3f}%' if vwap_dist_pct is not None else 'N/A'} | "
+                    f"ema9_slope={f'{ema9_slope_pct:+.3f}%' if ema9_slope_pct is not None else 'N/A'}",
+                    flush=True,
+                )
+
+                decisao, motivo = brain.revisar_tese_posicao_aberta(
+                    direcao_posicao=str(direcao_posicao),
+                    roi_frac=float(roi),
+                    pnl_nao_realizado=pnl_unreal,
+                    funding_rate=fr_now,
+                    order_book_imbalance_pct=imbalance_pct,
+                    bid_volume_total=bid_vol_total,
+                    ask_volume_total=ask_vol_total,
+                    rsi_14=rsi_rev,
+                    distancia_vwap_pct=vwap_dist_pct,
+                    inclinacao_ema9_pct=ema9_slope_pct,
+                    contexto_sentimento_noticias=nota_manual_ctx,
+                    noticias_recentes=noticias_rss,
+                    verbose=False,
+                )
+                print(
+                    f"🧠 [DECISÃO CLAUDE] {decisao} posição. Motivo: {motivo}",
+                    flush=True,
+                )
+                if decisao == "FECHAR":
+                    try:
+                        if "FUTURES" in modo_label:
+                            ordem = executor_futures.fechar_posicao_market(SYMBOL_TRADE, ex)
+                        else:
+                            ordem = ex_mod.executar_venda_spot_total(SYMBOL_TRADE, ex)
+                        logger.registrar_log_trade(
+                            par_moeda=SYMBOL_TRADE,
+                            preco=preco,
+                            prob_ml=0.0,
+                            sentimento="—",
+                            acao="REVISAO_TESE_FECHAR",
+                            justificativa=(
+                                f"Claude revisão de tese (5m): FECHAR. {motivo} "
+                                f"| funding={fr_now} | ob_imbalance_pct={imbalance_pct}"
+                            ),
+                            lado_ordem=str(direcao_posicao).upper(),
+                            contexto_raw=_ultimo_contexto_raw_supabase,
+                            justificativa_ia=motivo,
+                        )
+                        posicao_aberta = False
+                        preco_compra = 0.0
+                        direcao_posicao = "LONG"
+                        ultima_revisao_tese_ts = 0.0
+                        _reset_vigia_eth_usdc_guards()
+                        print(
+                            f"🏁 [REVISÃO DE TESE] Posição encerrada por decisão ativa. id={ordem.get('id')}",
+                            flush=True,
+                        )
+                        return
+                    except Exception as e_close:
+                        print(f"🚨 [REVISÃO DE TESE] Falha ao fechar posição: {e_close}", flush=True)
+                else:
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco,
+                        prob_ml=0.0,
+                        sentimento="—",
+                        acao="REVISAO_TESE_MANTER",
+                        justificativa=(
+                            f"Claude revisão de tese (5m): MANTER. {motivo} "
+                            f"| funding={fr_now} | ob_imbalance_pct={imbalance_pct}"
+                        ),
+                        lado_ordem=str(direcao_posicao).upper(),
+                        contexto_raw=_ultimo_contexto_raw_supabase,
+                        justificativa_ia=motivo,
+                    )
+            except Exception as e_rt:  # noqa: BLE001
+                print(f"⚠️ [REVISÃO DE TESE] Erro interno na revisão ativa: {e_rt}", flush=True)
+
     if preco_compra <= 0:
         print("[Modo Vigia] preco_compra inválido — não é possível avaliar TP/SL.")
         return
@@ -2011,6 +2219,7 @@ def _gerenciar_saida_modo_vigia(
                 _short_last_low_15m = None
                 _rsi_tighten_ativo = False
                 _reset_vigia_eth_usdc_guards()
+                _sync_entry_price_supabase()
                 print(f"  [Estado] posição encerrada por STALL EXIT. id={ordem.get('id')}")
             except Exception as e_stall:  # noqa: BLE001
                 print(f"  [ERRO] STALL EXIT SHORT: {e_stall}")
@@ -2060,6 +2269,7 @@ def _gerenciar_saida_modo_vigia(
                 preco_compra = 0.0
                 direcao_posicao = "LONG"
                 _reset_vigia_eth_usdc_guards()
+                _sync_entry_price_supabase()
                 print("  [Estado] posição encerrada após TP (short).")
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída TP short: {e_v}")
@@ -2108,6 +2318,7 @@ def _gerenciar_saida_modo_vigia(
                 preco_compra = 0.0
                 direcao_posicao = "LONG"
                 _reset_vigia_eth_usdc_guards()
+                _sync_entry_price_supabase()
                 print("  [Estado] posição encerrada após SL (short).")
             except Exception as e_v:  # noqa: BLE001
                 print(f"  [ERRO] Saída SL short: {e_v}")
@@ -2168,6 +2379,7 @@ def _gerenciar_saida_modo_vigia(
             preco_compra = 0.0
             direcao_posicao = "LONG"
             _reset_vigia_eth_usdc_guards()
+            _sync_entry_price_supabase()
             print("  [Estado] posicao_aberta=False | preco_compra zerado após TP.")
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída TP: {e_v}")
@@ -2214,6 +2426,7 @@ def _gerenciar_saida_modo_vigia(
             preco_compra = 0.0
             direcao_posicao = "LONG"
             _reset_vigia_eth_usdc_guards()
+            _sync_entry_price_supabase()
             print("  [Estado] posicao_aberta=False | preco_compra zerado após SL.")
         except Exception as e_v:  # noqa: BLE001
             print(f"  [ERRO] Saída SL: {e_v}")
@@ -2234,12 +2447,21 @@ def _gerenciar_saida_modo_vigia(
 
 
 def rodar_ciclo(modo: str) -> None:
+    """Delega o ciclo à implementação; captura exceções não tratadas (ex.: asyncio.to_thread)."""
+    try:
+        _rodar_ciclo_impl(modo)
+    except Exception as e:  # noqa: BLE001
+        print(f"\n🚨 ERRO FATAL NO CICLO: {e}", flush=True)
+        traceback.print_exc()
+
+
+def _rodar_ciclo_impl(modo: str) -> None:
     """Um ciclo: Vigia (saída) OU Buscando Oportunidade (entrada ML + sentimento)."""
     global posicao_aberta, preco_compra, direcao_posicao, _last_modo_detectado, _aperto_seguranca_ativo
     global _rsi_tighten_ativo, _short_stall_count_15m, _short_last_candle_ts_15m, _short_last_low_15m
     global _equity_inicio_dia, _travado_ate_ts
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
-    global _ultimo_preco_ws
+    global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws
     global USER_MARKET_OBSERVATION
 
     if not logger.obter_bot_ativo():
@@ -2269,7 +2491,25 @@ def rodar_ciclo(modo: str) -> None:
     if modo == "FUTURES":
         preco = float(_ultimo_preco_ws or 0.0)
         if preco <= 0:
-            print("⚠️ [WS PRICE] Sem tick real válido. Ciclo ignorado para preservar stops.")
+            bid_bt = float(_best_bid_ws or 0.0)
+            ask_bt = float(_best_ask_ws or 0.0)
+            # Mesma referência que o terminal ("Preço Atual" = bookTicker bid); depois ask / mid.
+            if bid_bt > 0:
+                preco = bid_bt
+            elif ask_bt > 0:
+                preco = ask_bt
+            if preco > 0:
+                _ultimo_preco_ws = preco
+                print(
+                    f"ℹ️ [WS PRICE] Kline sem close válido; a usar bookTicker → {preco:.4f} USDC "
+                    "(referência para ciclo / notional).",
+                    flush=True,
+                )
+        if preco <= 0:
+            print(
+                "⚠️ [WS PRICE] Sem preço kline nem bookTicker válido. Ciclo ignorado para preservar stops.",
+                flush=True,
+            )
             return
     else:
         preco = obter_preco_referencia(SYMBOL_TRADE, modo)
@@ -2480,6 +2720,12 @@ def rodar_ciclo(modo: str) -> None:
     # 1. Sinal Técnico (XGBoost) + snapshot ADX / VWAP / BB (um download OHLCV)
     probabilidade = ml_model.obter_sinal_atual()
     print(f"📊 [ML] Probabilidade de Alta: {probabilidade:.2%}")
+    long_prob = max(0.0, min(1.0, float(probabilidade)))
+    short_prob = max(0.0, min(1.0, 1.0 - long_prob))
+    print(
+        f"📊 [ML PROBABILIDADES] Long: {long_prob:.2%} | Short: {short_prob:.2%} "
+        f"(limiares: long>{WAKE_FILTER_LONG_MIN:.0%}, short<{WAKE_FILTER_SHORT_MAX:.0%})"
+    )
     prob_ml_base = float(probabilidade)
     parede_venda_proxima_confirma_short = False
     parede_venda_preco_ref: float | None = None
@@ -2717,6 +2963,10 @@ def rodar_ciclo(modo: str) -> None:
             )
             return
 
+    print(
+        f"🧭 [DIRECAO ML] Regras: LONG se P(alta)>{limiar_long:.2f}; "
+        f"SHORT se P(alta)<{limiar_short:.2f}; caso contrário NEUTRO."
+    )
     if probabilidade > limiar_long:
         direcao_sugerida = "LONG"
     elif probabilidade < limiar_short:
@@ -2773,53 +3023,85 @@ def rodar_ciclo(modo: str) -> None:
             print(f"⚠️ [VETO_TENDENCIA_EMA200] Falha ao salvar log: {e_veto}")
         return
 
+    counter_trend_ml_override = False
+    counter_trend_ml_override_msg = ""
     if macro_allow in ("LONG", "SHORT") and direcao_sugerida != macro_allow:
-        print(
-            f"🛑 [EMA200 FILTER] {direcao_sugerida} bloqueado pela tendência macro "
-            f"({macro_trend}). Permitido apenas {macro_allow}."
-        )
-        snap_veto = {
-            **snap,
-            "prob_ml": probabilidade,
-            "macro_trend": macro_trend,
-            "macro_allow_dir": macro_allow,
-            "macro_ema200": ema200_v,
-            "direcao_sugerida": direcao_sugerida,
-        }
-        try:
-            ctx_veto = indicators.formatar_log_contexto_raw(
-                "VETO_TENDENCIA_EMA200 por direção oposta ao filtro macro EMA200 15m.",
-                snap_veto,
+        prob_alta = max(0.0, min(1.0, float(probabilidade)))
+        prob_baixa = max(0.0, min(1.0, 1.0 - prob_alta))
+        allow_long_override = direcao_sugerida == "LONG" and prob_alta >= ML_MACRO_OVERRIDE_PROB
+        allow_short_override = direcao_sugerida == "SHORT" and prob_baixa >= ML_MACRO_OVERRIDE_PROB
+        if allow_long_override or allow_short_override:
+            counter_trend_ml_override = True
+            if direcao_sugerida == "LONG":
+                counter_trend_ml_override_msg = (
+                    "Operação Counter-Trend autorizada por override estatístico: "
+                    f"P(alta)={prob_alta:.2%} ≥ {ML_MACRO_OVERRIDE_PROB:.0%}."
+                )
+                print(
+                    f"🔥 [ML OVERRIDE] LONG contra a macro! Confiança do ML ({prob_alta:.2%}) "
+                    "superou o bloqueio da EMA200."
+                )
+            else:
+                counter_trend_ml_override_msg = (
+                    "Operação Counter-Trend autorizada por override estatístico: "
+                    f"P(baixa)={prob_baixa:.2%} ≥ {ML_MACRO_OVERRIDE_PROB:.0%}."
+                )
+                print(
+                    f"🔥 [ML OVERRIDE] SHORT contra a macro! Confiança do ML ({prob_baixa:.2%}) "
+                    "superou o bloqueio da EMA200."
+                )
+        else:
+            print(
+                f"🛑 [EMA200 FILTER] {direcao_sugerida} bloqueado pela tendência macro "
+                f"({macro_trend}). Permitido apenas {macro_allow}."
             )
-        except Exception:
-            ctx_veto = None
-        try:
-            logger.registrar_log_trade(
-                par_moeda=SYMBOL_TRADE,
-                preco=preco,
-                prob_ml=probabilidade,
-                sentimento="NEUTRAL",
-                acao="VETO_TENDENCIA_EMA200",
-                justificativa=(
-                    f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
-                    f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
-                ),
-                contexto_raw=ctx_veto,
-                justificativa_ia=(
-                    f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
-                    f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
-                ),
-                dist_ema200_pct=dist_ema200_pct,
-                spread_atual=spread_atual,
-                book_imbalance=book_imbalance,
-                hora_do_dia=hora_do_dia_cycle,
-                atr_14=atr_14_cycle,
-                funding_rate=funding_rate,
-                long_short_ratio=long_short_ratio,
-            )
-        except Exception as e_veto:  # noqa: BLE001
-            print(f"⚠️ [VETO_TENDENCIA_EMA200] Falha ao salvar log: {e_veto}")
-        return
+            if direcao_sugerida == "LONG":
+                print(
+                    f"🧾 [LONG ABORTADO] Filtro macro EMA200 vetou LONG (tendência={macro_trend}, "
+                    f"permitido={macro_allow})."
+                )
+            snap_veto = {
+                **snap,
+                "prob_ml": probabilidade,
+                "macro_trend": macro_trend,
+                "macro_allow_dir": macro_allow,
+                "macro_ema200": ema200_v,
+                "direcao_sugerida": direcao_sugerida,
+            }
+            try:
+                ctx_veto = indicators.formatar_log_contexto_raw(
+                    "VETO_TENDENCIA_EMA200 por direção oposta ao filtro macro EMA200 15m.",
+                    snap_veto,
+                )
+            except Exception:
+                ctx_veto = None
+            try:
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento="NEUTRAL",
+                    acao="VETO_TENDENCIA_EMA200",
+                    justificativa=(
+                        f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                        f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+                    ),
+                    contexto_raw=ctx_veto,
+                    justificativa_ia=(
+                        f"Filtro direcional EMA200 15m: tendência {macro_trend}, "
+                        f"direção sugerida={direcao_sugerida}, permitido={macro_allow}."
+                    ),
+                    dist_ema200_pct=dist_ema200_pct,
+                    spread_atual=spread_atual,
+                    book_imbalance=book_imbalance,
+                    hora_do_dia=hora_do_dia_cycle,
+                    atr_14=atr_14_cycle,
+                    funding_rate=funding_rate,
+                    long_short_ratio=long_short_ratio,
+                )
+            except Exception as e_veto:  # noqa: BLE001
+                print(f"⚠️ [VETO_TENDENCIA_EMA200] Falha ao salvar log: {e_veto}")
+            return
 
     print(f"    → direcao_sugerida={direcao_sugerida} (ML vs limiares long/short)")
     pa_bundle: dict[str, Any] = {}
@@ -2882,8 +3164,34 @@ def rodar_ciclo(modo: str) -> None:
         contexto_humano,
         USER_MARKET_OBSERVATION,
     )
+    if counter_trend_ml_override:
+        extra_override = (
+            "[COUNTER_TREND_ML_OVERRIDE]\n"
+            f"{counter_trend_ml_override_msg}\n"
+            "Esta operação é contra a direção macro EMA200, mas foi aprovada por confiança "
+            "estatística elevada do modelo. Não vetar apenas por estar contra a EMA200; "
+            "avaliar gestão de risco, exaustão e confirmação contextual."
+        )
+        contexto_humano_brain = (
+            f"{contexto_humano_brain}\n\n{extra_override}"
+            if contexto_humano_brain
+            else extra_override
+        )
 
     # 3. Ativa o Cérebro (Claude) com rate limiter para proteger a API.
+    print(
+        "🧪 [TA->CLAUDE] "
+        f"RSI14={snap.get('rsi_14')} | ADX14={snap.get('adx_14')} | "
+        f"ATR%={snap.get('atr_pct')} | BB_squeeze={snap.get('bollinger_squeeze')} | "
+        f"BB_width={snap.get('bb_width_pct')} | VWAP_vies={snap.get('vies_vwap')} | "
+        f"funding={snap_log.get('funding_rate')} | long_short_ratio={snap_log.get('long_short_ratio')} | "
+        f"direcao_sugerida={direcao_sugerida}"
+    )
+    if counter_trend_ml_override:
+        print(
+            "🧠 [CLAUDE CONTEXTO] Counter-Trend override ativo por alta confiança do ML; "
+            "instrução enviada para não vetar apenas por EMA200."
+        )
     pode_chamar_claude, n_chamadas, espera_s = _permitir_consulta_claude()
     if pode_chamar_claude:
         print(
@@ -3013,6 +3321,11 @@ def rodar_ciclo(modo: str) -> None:
             justificativa_ia=just_ia,
             noticias_agregadas=contexto,
         )
+        if direcao_sugerida == "LONG":
+            print(
+                f"🧾 [LONG ABORTADO] Sentimento do Claude não autorizou entrada LONG "
+                f"(sentimento={sent})."
+            )
         return
 
     if (
@@ -3036,6 +3349,11 @@ def rodar_ciclo(modo: str) -> None:
             justificativa_ia=just_ia,
             noticias_agregadas=contexto,
         )
+        if direcao_sugerida == "LONG" or pos_rec == "LONG":
+            print(
+                f"🧾 [LONG ABORTADO] Claude não confirmou LONG "
+                f"(posicao_recomendada={pos_rec}, direcao_sugerida={direcao_sugerida})."
+            )
         return
 
     if not manual_override_veredito and conf_num < CONFIANCA_BRAIN_MIN_ENTRADA:
@@ -3054,6 +3372,11 @@ def rodar_ciclo(modo: str) -> None:
             justificativa_ia=just_ia,
             noticias_agregadas=contexto,
         )
+        if direcao_sugerida == "LONG":
+            print(
+                f"🧾 [LONG ABORTADO] Confiança insuficiente para LONG: "
+                f"{conf_num}% < {CONFIANCA_BRAIN_MIN_ENTRADA}%."
+            )
         return
 
     if (
@@ -3094,6 +3417,10 @@ def rodar_ciclo(modo: str) -> None:
                     justificativa_ia=just_ia,
                     noticias_agregadas=contexto,
                 )
+                if bloq_long:
+                    print(
+                        "🧾 [LONG ABORTADO] BB Squeeze sem breakout válido para entrada LONG."
+                    )
                 return
 
     if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("short_squeeze"):
@@ -3123,6 +3450,7 @@ def rodar_ciclo(modo: str) -> None:
             print(
                 "    [Price Action] Double Top (dois topos locais + recuo) — viés baixa; LONG vetado."
             )
+            print("🧾 [LONG ABORTADO] Padrão Double Top detectado (filtro de Price Action).")
             logger.registrar_log_trade(
                 par_moeda=SYMBOL_TRADE,
                 preco=preco,
@@ -3322,6 +3650,9 @@ def rodar_ciclo(modo: str) -> None:
         print(
             f"    [VETO_RSI_EXAUSTAO] Sinal de LONG bloqueado (RSI muito alto: {rsi_num:.2f})."
         )
+        print(
+            f"🧾 [LONG ABORTADO] RSI em exaustão ({rsi_num:.2f} > 65.00) — evitando compra no topo."
+        )
         logger.registrar_log_trade(
             par_moeda=SYMBOL_TRADE,
             preco=preco,
@@ -3383,6 +3714,7 @@ def rodar_ciclo(modo: str) -> None:
             preco_compra = float(ordem.get("auric_entry_price") or preco)
             posicao_aberta = True
             direcao_posicao = "LONG"
+            _sync_entry_price_supabase()
             bracket_note = (
                 " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
                 f"activation no antigo TP×{trailing_mult:.3f}, callback {trailing_cb:.3f}%)."
@@ -3507,6 +3839,7 @@ def rodar_ciclo(modo: str) -> None:
             preco_compra = float(ordem.get("auric_entry_price") or preco)
             posicao_aberta = True
             direcao_posicao = "SHORT"
+            _sync_entry_price_supabase()
             just_final = (
                 f"{just_ia_entry} | Short id={oid} status={st}; notional alvo ≈ {notional_alvo:.2f} USDC. "
                 " Bracket reduce-only na Binance (SL STOP_MARKET + TRAILING_STOP_MARKET; "
@@ -3559,11 +3892,11 @@ def rodar_ciclo(modo: str) -> None:
 
 
 async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
-    """Executa o ciclo completo em thread para não bloquear o event loop."""
+    """Executa o ciclo completo em thread para não bloquear o event loop (asyncio.to_thread)."""
     try:
         await asyncio.to_thread(rodar_ciclo, modo)
     except Exception as e:  # noqa: BLE001
-        print(f"\n[ERRO CICLO — gatilho {origem}] {e}")
+        print(f"\n🚨 ERRO CRÍTICO FATAL NO CICLO (rodar_ciclo / {origem}): {e}", flush=True)
         traceback.print_exc()
         try:
             preco = await asyncio.to_thread(obter_preco_referencia, SYMBOL_TRADE, modo)
@@ -3578,6 +3911,106 @@ async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+
+
+async def safe_rodar_ciclo() -> None:
+    """
+    Pipeline de gatilho alinhado ao WS (config dinâmica, standby, lock, cooldown, RSI/ADX).
+    Usado pelo watchdog quando o fecho 1m (x) falha no multiplex.
+    """
+    global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
+    global _ultimo_gatilho_ciclo_mono
+    if _gatilho_ciclo_lock is None:
+        return
+    now_mono = time.monotonic()
+    if now_mono - _ultimo_gatilho_ciclo_mono < TRIGGER_COOLDOWN_S:
+        return
+    if _gatilho_ciclo_lock.locked():
+        return
+
+    cfg_dyn = await _obter_configuracoes_dinamicas()
+    _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
+    _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
+    _trailing_callback_cfg = float(cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO))
+    _trailing_activation_mult_cfg = float(
+        cfg_dyn.get(
+            "trailing_activation_multiplier",
+            TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+        )
+    )
+    print(
+        "\n[WATCHDOG] Config dinâmica (relogio): "
+        f"risk={_risk_fraction_cfg*100:.1f}% | lev={_alavancagem_cfg:.2f}x | "
+        f"trail_cb={_trailing_callback_cfg:.3f}% | trail_act_mult={_trailing_activation_mult_cfg:.3f}",
+        flush=True,
+    )
+
+    permitido = await asyncio.to_thread(verificar_permissao_operacao)
+    if not permitido:
+        print("\n💤 [WATCHDOG] Standby (is_active=false). Ciclo não executado.", flush=True)
+        return
+
+    modo = await asyncio.to_thread(obter_modo_operacao)
+    print(
+        f"\n🚀 [WATCHDOG] modo={modo} | iniciando ciclo (rodar_ciclo em worker thread)...",
+        flush=True,
+    )
+    try:
+        await asyncio.to_thread(_sincronizar_rsi_adx_globais_de_snap_ws)
+    except Exception as e_snap:  # noqa: BLE001
+        print(
+            f"\n🚨 [WATCHDOG] sync RSI/ADX: {e_snap}",
+            flush=True,
+        )
+        traceback.print_exc()
+
+    async with _gatilho_ciclo_lock:
+        _ultimo_gatilho_ciclo_mono = time.monotonic()
+        try:
+            await _executar_ciclo_assincrono(modo, "WATCHDOG_CLOCK")
+        finally:
+            estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
+            print(f"\n✅ [WATCHDOG] Ciclo concluído. Estado atual: {estado}", flush=True)
+
+
+async def _watchdog_relogio() -> None:
+    """
+    Rede de segurança: se o minuto UTC mudar e o WS não tiver atualizado `ultimo_minuto_processado`,
+    força `safe_rodar_ciclo`. Heartbeat em :00, :20, :40 para confirmar que o loop corre.
+    """
+    global ultimo_minuto_processado
+    print(
+        "🐕 [WATCHDOG] Cão de guarda ativado e a monitorizar o relógio (Versão Blindada)!",
+        flush=True,
+    )
+    while True:
+        try:
+            await asyncio.sleep(1)
+            agora = datetime.now(timezone.utc)
+            minuto_atual = agora.minute
+            segundo_atual = agora.second
+
+            if segundo_atual in (0, 20, 40):
+                print(
+                    f"🐕 [WATCHDOG] ♥ vivo | UTC {agora.strftime('%H:%M:%S')}",
+                    flush=True,
+                )
+
+            if segundo_atual >= 2 and minuto_atual != ultimo_minuto_processado:
+                if ultimo_minuto_processado == -1:
+                    ultimo_minuto_processado = minuto_atual
+                    continue
+
+                print(
+                    f"🚨 [WATCHDOG] Binance falhou na virada do minuto! "
+                    f"Forçando ciclo do minuto {minuto_atual}...",
+                    flush=True,
+                )
+                ultimo_minuto_processado = minuto_atual
+                asyncio.create_task(safe_rodar_ciclo())
+        except Exception as e:  # noqa: BLE001
+            print(f"🐕 [WATCHDOG] ERRO FATAL: {e}", flush=True)
+            traceback.print_exc()
 
 
 async def _flush_metrics_supabase(uptime_s: float) -> None:
@@ -3824,6 +4257,121 @@ def _sincronizar_rsi_adx_globais_de_snap_ws() -> None:
         _ultimo_adx_14 = 0.0
 
 
+def _ema9_slope_pct_1m(ex: Any, simbolo_ccxt: str) -> float | None:
+    """
+    Inclinação percentual da EMA9 (1m) entre os dois últimos pontos.
+    Retorna % (ex.: +0.12, -0.08) ou None se dados insuficientes.
+    """
+    candles = ex.fetch_ohlcv(simbolo_ccxt, timeframe="1m", limit=40) or []
+    closes = [float(c[4]) for c in candles if len(c) >= 5]
+    if len(closes) < 12:
+        return None
+    alpha = 2.0 / (9.0 + 1.0)
+    ema_vals: list[float] = []
+    ema_prev = closes[0]
+    for px in closes:
+        ema_prev = (px * alpha) + (ema_prev * (1.0 - alpha))
+        ema_vals.append(float(ema_prev))
+    if len(ema_vals) < 2:
+        return None
+    prev = float(ema_vals[-2])
+    cur = float(ema_vals[-1])
+    if abs(prev) <= 1e-12:
+        return None
+    return ((cur - prev) / prev) * 100.0
+
+
+async def _fetch_rss_feed_entries(
+    session: aiohttp.ClientSession,
+    *,
+    source: str,
+    url: str,
+) -> list[tuple[datetime, str, str]]:
+    """
+    Busca um RSS e devolve [(dt_utc, fonte, título)].
+    """
+    out: list[tuple[datetime, str, str]] = []
+    try:
+        async with session.get(url, timeout=3) as resp:
+            if resp.status != 200:
+                return out
+            raw = await resp.read()
+        root = ET.fromstring(raw)
+        for it in root.findall(".//item"):
+            title = ((it.findtext("title") or "").strip())
+            if not title:
+                continue
+            dt_obj: datetime | None = None
+            pub_raw = (it.findtext("pubDate") or it.findtext("published") or "").strip()
+            if pub_raw:
+                try:
+                    dt_obj = parsedate_to_datetime(pub_raw)
+                except Exception:
+                    dt_obj = None
+            if dt_obj is None:
+                # Atom fallback
+                upd_raw = (it.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+                if upd_raw:
+                    try:
+                        dt_obj = datetime.fromisoformat(upd_raw.replace("Z", "+00:00"))
+                    except Exception:
+                        dt_obj = None
+            if dt_obj is None:
+                # Sem data: assume "agora" para não descartar sinal potencial.
+                dt_obj = datetime.now(timezone.utc)
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+            out.append((dt_obj.astimezone(timezone.utc), source, title))
+    except Exception:
+        return out
+    return out
+
+
+async def _fetch_crypto_rss_news_async(symbol: str = "ETH") -> str:
+    feeds = [
+        ("Cointelegraph", "https://cointelegraph.com/rss"),
+        ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+        ("CryptoSlate", "https://cryptoslate.com/feed/"),
+    ]
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(hours=2)
+    sym = str(symbol or "ETH").upper().strip()
+    keywords = {sym, "ETH", "ETHEREUM", "SEC", "ETF", "HACK"}
+    timeout = aiohttp.ClientTimeout(total=3.0)
+    headers = {"User-Agent": "AuricBot/1.0 (+rss-aggregator)"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        tasks = [
+            _fetch_rss_feed_entries(session, source=src, url=url)
+            for src, url in feeds
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    entries: list[tuple[datetime, str, str]] = []
+    for res in results:
+        if isinstance(res, Exception):
+            continue
+        entries.extend(res)
+    entries_recent = [e for e in entries if e[0] >= cutoff]
+    # Embaralha por data: mistura multi-fonte e ordena por recência para priorizar contexto atual.
+    entries_recent.sort(key=lambda x: x[0], reverse=True)
+    relevant = [e for e in entries_recent if any(k in e[2].upper() for k in keywords)]
+    chosen = (relevant[:5] if relevant else entries_recent[:3])
+    if not chosen:
+        return "Sem notícias de impacto no momento"
+    return "\n".join([f"- [{src}]: {title}" for _, src, title in chosen])
+
+
+def fetch_crypto_rss_news(symbol: str = "ETH") -> str:
+    """
+    Agregador RSS robusto (Cointelegraph, CoinDesk, CryptoSlate) com fetch assíncrono em paralelo.
+    """
+    print("📰 [RSS NEWS] Lendo cabeçalhos globais para análise...", flush=True)
+    try:
+        return asyncio.run(_fetch_crypto_rss_news_async(symbol))
+    except Exception as e_rss:  # noqa: BLE001
+        print(f"⚠️ [RSS NEWS] Falha no agregador RSS ({e_rss}).", flush=True)
+        return "Sem notícias de impacto no momento"
+
+
 async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     """
     Engine orientado por eventos:
@@ -3836,12 +4384,14 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
     del args  # mantido por compat CLI; loop é orientado por eventos WS.
     ultima_vela_fechada_ts: int | None = None
     volume_ultima_vela_fechada: float | None = None
-    execucao_lock = asyncio.Lock()
-    last_trigger_time = 0.0
 
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
     global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws, _ultimo_tick_ws_ts, _ws_force_restart_requested
     global _ultimo_rsi_14, _ultimo_adx_14
+    global _gatilho_ciclo_lock, _ultimo_gatilho_ciclo_mono, ultimo_minuto_processado
+    if _gatilho_ciclo_lock is None:
+        raise RuntimeError("_gatilho_ciclo_lock ausente: inicializar em main() antes do loop WS.")
+    execucao_lock = _gatilho_ciclo_lock
 
     while True:
         try:
@@ -3852,6 +4402,9 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                 )
                 _ultimo_tick_ws_ts = time.monotonic()
                 _last_heartbeat_print = time.monotonic()
+                global _watchdog_relogio_task
+                if _watchdog_relogio_task is None or _watchdog_relogio_task.done():
+                    _watchdog_relogio_task = asyncio.create_task(_watchdog_relogio())
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
@@ -3884,6 +4437,7 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                         continue
 
                     try:
+                        # Multiplex Binance: envelope {"stream": "...", "data": {...}}; payload em data.
                         data = msg.get("data", msg)
                         if not isinstance(data, dict):
                             continue
@@ -3894,8 +4448,11 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                                 ask_bt = float(data.get("a") or 0.0)
                                 if bid_bt > 0:
                                     _best_bid_ws = bid_bt
+                                    _ultimo_preco_ws = bid_bt
                                 if ask_bt > 0:
                                     _best_ask_ws = ask_bt
+                                if bid_bt <= 0 and ask_bt > 0:
+                                    _ultimo_preco_ws = ask_bt
                             except Exception:
                                 pass
                             # Imprime apenas o preço atual na mesma linha para não gerar flood
@@ -3923,84 +4480,112 @@ async def _loop_websocket_tempo_real(args: argparse.Namespace) -> None:
                         preco = float(k.get("c") or 0.0)
                         if preco > 0:
                             _ultimo_preco_ws = preco
-                        is_kline_closed = bool(k.get("x"))
-                        vol_atual = float(k.get("v") or 0.0)
-                        open_time = int(k.get("t") or 0)
-                        if is_kline_closed:
-                            await asyncio.to_thread(_sincronizar_rsi_adx_globais_de_snap_ws)
+                        try:
+                            is_kline_closed = bool(k.get("x"))
+                            vol_atual = float(k.get("v") or 0.0)
+                            open_time = int(k.get("t") or 0)
+                            if is_kline_closed:
+                                ultimo_minuto_processado = datetime.now(timezone.utc).minute
+                                try:
+                                    await asyncio.to_thread(
+                                        _sincronizar_rsi_adx_globais_de_snap_ws
+                                    )
+                                except Exception as e_snap:  # noqa: BLE001
+                                    print(
+                                        f"\n🚨 ERRO CRÍTICO FATAL NO CICLO (sync RSI/ADX WS): {e_snap}",
+                                        flush=True,
+                                    )
+                                    traceback.print_exc()
+                                print(
+                                    f"\n✅ [VELA FECHADA] ETHUSDC | RSI: {_ultimo_rsi_14:.1f} | "
+                                    f"ADX: {_ultimo_adx_14:.1f}"
+                                )
+
+                            trigger: str | None = None
+                            pending_close_ack: tuple[int, float] | None = None
+                            if is_kline_closed and open_time != ultima_vela_fechada_ts:
+                                trigger = "CLOSE_1M"
+                                pending_close_ack = (open_time, vol_atual)
+                            elif volume_ultima_vela_fechada and volume_ultima_vela_fechada > 0:
+                                fator = 1.0 + float(indicators.VOLUME_SPIKE_FRACAO_1M)
+                                if vol_atual >= fator * volume_ultima_vela_fechada:
+                                    trigger = "VOLUME_SPIKE_INTRA_1M"
+
+                            if not trigger:
+                                continue
+
+                            _metric_inc("triggers_total", 1)
+                            now = time.monotonic()
+                            if now - _ultimo_gatilho_ciclo_mono < TRIGGER_COOLDOWN_S:
+                                _metric_inc("ignored_cooldown", 1)
+                                restante = TRIGGER_COOLDOWN_S - (now - _ultimo_gatilho_ciclo_mono)
+                                print(
+                                    f"\n[WS] {trigger} detetado, mas bloqueado por cooldown de "
+                                    f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
+                                )
+                                continue
+
+                            if execucao_lock.locked():
+                                _metric_inc("triggers_ignored_lock", 1)
+                                print(
+                                    f"\n⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
+                                    "(ciclo em andamento)."
+                                )
+                                continue
+
+                            cfg_dyn = await _obter_configuracoes_dinamicas()
+                            _risk_fraction_cfg = float(
+                                cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO)
+                            )
+                            _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
+                            _trailing_callback_cfg = float(
+                                cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
+                            )
+                            _trailing_activation_mult_cfg = float(
+                                cfg_dyn.get(
+                                    "trailing_activation_multiplier",
+                                    TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
+                                )
+                            )
                             print(
-                                f"\n✅ [VELA FECHADA] ETHUSDC | RSI: {_ultimo_rsi_14:.1f} | "
-                                f"ADX: {_ultimo_adx_14:.1f}"
+                                "\n[WS] Config dinâmica carregada: "
+                                f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
+                                f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
+                                f"trail_cb={_trailing_callback_cfg:.3f}% | "
+                                f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
                             )
 
-                        trigger = None
-                        if is_kline_closed and open_time != ultima_vela_fechada_ts:
-                            trigger = "CLOSE_1M"
-                            ultima_vela_fechada_ts = open_time
-                            volume_ultima_vela_fechada = vol_atual
-                        elif volume_ultima_vela_fechada and volume_ultima_vela_fechada > 0:
-                            fator = 1.0 + float(indicators.VOLUME_SPIKE_FRACAO_1M)
-                            if vol_atual >= fator * volume_ultima_vela_fechada:
-                                trigger = "VOLUME_SPIKE_INTRA_1M"
+                            permitido = await asyncio.to_thread(verificar_permissao_operacao)
+                            if not permitido:
+                                print(
+                                    "\n💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false)."
+                                )
+                                continue
 
-                        if not trigger:
-                            continue
-
-                        _metric_inc("triggers_total", 1)
-                        now = time.monotonic()
-                        if now - last_trigger_time < TRIGGER_COOLDOWN_S:
-                            _metric_inc("ignored_cooldown", 1)
-                            restante = TRIGGER_COOLDOWN_S - (now - last_trigger_time)
+                            modo = await asyncio.to_thread(obter_modo_operacao)
                             print(
-                                f"\n[WS] {trigger} detetado, mas bloqueado por cooldown de "
-                                f"{TRIGGER_COOLDOWN_S:.0f}s (restam {restante:.1f}s)."
+                                f"\n🚀 [WS] Trigger={trigger} | modo={modo} | "
+                                "iniciando ciclo ML+Hub+Claude (rodar_ciclo em worker thread)..."
                             )
+                            async with execucao_lock:
+                                _ultimo_gatilho_ciclo_mono = time.monotonic()
+                                try:
+                                    await _executar_ciclo_assincrono(modo, trigger)
+                                    if pending_close_ack is not None:
+                                        ultima_vela_fechada_ts = pending_close_ack[0]
+                                        volume_ultima_vela_fechada = pending_close_ack[1]
+                                finally:
+                                    estado = (
+                                        "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
+                                    )
+                                    print(
+                                        f"\n✅ [WS] Ciclo concluído. Estado atual: {estado}",
+                                        flush=True,
+                                    )
+                        except Exception as e:  # noqa: BLE001
+                            print(f"\n🚨 ERRO CRÍTICO FATAL NO CICLO: {e}", flush=True)
+                            traceback.print_exc()
                             continue
-
-                        if execucao_lock.locked():
-                            _metric_inc("triggers_ignored_lock", 1)
-                            print(
-                                f"\n⏳ [WS] Trigger={trigger}, mas bloqueado por lock de execução única "
-                                "(ciclo em andamento)."
-                            )
-                            continue
-
-                        cfg_dyn = await _obter_configuracoes_dinamicas()
-                        _risk_fraction_cfg = float(cfg_dyn.get("risk_fraction", RISK_FRACTION_PADRAO))
-                        _alavancagem_cfg = float(cfg_dyn.get("leverage", ALAVANCAGEM_PADRAO))
-                        _trailing_callback_cfg = float(
-                            cfg_dyn.get("trailing_callback_rate", TRAILING_CALLBACK_PADRAO)
-                        )
-                        _trailing_activation_mult_cfg = float(
-                            cfg_dyn.get(
-                                "trailing_activation_multiplier",
-                                TRAILING_ACTIVATION_MULTIPLIER_PADRAO,
-                            )
-                        )
-                        print(
-                            "\n[WS] Config dinâmica carregada: "
-                            f"risk={_risk_fraction_cfg*100:.1f}% do saldo USDC (margem) por trade | "
-                            f"lev={_alavancagem_cfg:.2f}x → notional≈saldo×risk×lev | "
-                            f"trail_cb={_trailing_callback_cfg:.3f}% | "
-                            f"trail_act_mult={_trailing_activation_mult_cfg:.3f}"
-                        )
-
-                        permitido = await asyncio.to_thread(verificar_permissao_operacao)
-                        if not permitido:
-                            print("\n💤 [WS] Trigger recebido, mas bot em STANDBY (is_active=false).")
-                            continue
-
-                        modo = await asyncio.to_thread(obter_modo_operacao)
-                        print(
-                            f"\n🚀 [WS] Trigger={trigger} | modo={modo} | iniciando ciclo ML+Hub+Claude..."
-                        )
-                        async with execucao_lock:
-                            last_trigger_time = time.monotonic()
-                            try:
-                                await _executar_ciclo_assincrono(modo, trigger)
-                            finally:
-                                estado = "MODO VIGIA" if posicao_aberta else "BUSCANDO OPORTUNIDADE"
-                                print(f"\n✅ [WS] Ciclo concluído. Estado atual: {estado}")
                     except Exception as e:
                         print(f"\n[ERRO FATAL WS] Falha ao processar mensagem: {e}", flush=True)
                         traceback.print_exc()
@@ -4095,6 +4680,8 @@ async def main() -> None:
         "gatilhos por WebSocket (fecho de vela 1m / pico de volume intra-vela).\n"
     )
     start_monotonic = time.monotonic()
+    global _gatilho_ciclo_lock
+    _gatilho_ciclo_lock = asyncio.Lock()
     manual_listener_task = asyncio.create_task(_escutar_comandos_manuais())
     metrics_task = asyncio.create_task(_metrics_reporter_task(start_monotonic))
     outcome_task = asyncio.create_task(_auditoria_outcome_engine_task())
@@ -4104,12 +4691,18 @@ async def main() -> None:
         manual_listener_task.cancel()
         outcome_task.cancel()
         metrics_task.cancel()
+        global _watchdog_relogio_task
+        if _watchdog_relogio_task is not None:
+            _watchdog_relogio_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await manual_listener_task
         with contextlib.suppress(asyncio.CancelledError):
             await outcome_task
         with contextlib.suppress(asyncio.CancelledError):
             await metrics_task
+        if _watchdog_relogio_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await _watchdog_relogio_task
 
 
 if __name__ == "__main__":

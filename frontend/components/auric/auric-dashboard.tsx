@@ -76,6 +76,8 @@ export function AuricDashboard() {
     botBusy,
     setBotActive,
     walletUsdt,
+    entryPrice,
+    positionOpen,
     walletFetchFailed,
     manualPending,
     insertManualCommand,
@@ -310,6 +312,8 @@ export function AuricDashboard() {
               balanceLoading={false}
               pnlDayPct={formatPct(pnl ?? null)}
               pnlPositive={pnlPositive}
+              entryPrice={null}
+              positionOpen={false}
               ethPrice={livePrice}
               ethChangePct={ethCh}
               ethLoading={livePrice == null}
@@ -372,6 +376,8 @@ export function AuricDashboard() {
               balanceLoading={false}
               pnlDayPct={formatPct(pnl ?? null)}
               pnlPositive={pnlPositive}
+              entryPrice={entryPrice}
+              positionOpen={positionOpen}
               ethPrice={livePrice}
               ethChangePct={ethCh}
               ethLoading={livePrice == null}

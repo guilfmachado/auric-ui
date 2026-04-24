@@ -1245,6 +1245,7 @@ def assegurar_brackets_apos_reconciliacao(
         else float(TRAILING_ACTIVATION_MULTIPLIER)
     )
 
+    print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
     # Nuke estrito: cancelar tudo no símbolo (endpoint nativo futures), depois validar zero abertas.
     cancelar_todas_ordens_futures_nativo(simbolo, exchange)
     ordens_restantes = obter_ordens_abertas_futures_nativo(simbolo, exchange)
@@ -1601,6 +1602,8 @@ def abrir_long_market(
         print(f"{_TAG} Long aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "LONG", lev)
+        print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
+        cancelar_todas_ordens_futures_nativo(simbolo, ex)
         ord_trailing, ord_sl = _criar_bracket_long(
             ex,
             sym,
@@ -1695,6 +1698,8 @@ def abrir_short_market(
         print(f"{_TAG} Short aceito. id={ordem.get('id')} status={ordem.get('status')}")
         qty_pos, preco_ent = _aguardar_qty_e_preco_entrada(ex, sym)
         _log_liquidacao_estimada(preco_ent, "SHORT", lev)
+        print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
+        cancelar_todas_ordens_futures_nativo(simbolo, ex)
         ord_trailing, ord_sl = _criar_bracket_short(
             ex,
             sym,
@@ -1784,6 +1789,8 @@ def fechar_posicao_market(
 
     print(f"{_TAG} Posição encerrada. id={ordem.get('id')} status={ordem.get('status')}")
     try:
+        print("🧹 [ORDENS] Posição fechada. Limpando todas as ordens órfãs...", flush=True)
+        cancelar_todas_ordens_futures_nativo(simbolo, ex)
         cancelar_todas_ordens_abertas(simbolo, ex)
     except ccxt.BaseError as e2:
         print(f"{_TAG} Pós-fecho: cancelamento extra: {e2}", file=sys.stderr)
@@ -1843,9 +1850,16 @@ def registrar_trade_performance_fecho(
         import logger
 
         roi = _roi_fechamento_percentual(direcao, preco_entrada, preco_saida)
+        motivo = str(exit_type)
         logger.atualizar_ultimo_trade_campos(
             simbolo,
-            {"final_roi": float(roi), "exit_type": str(exit_type)},
+            {
+                "final_roi": float(roi),
+                "exit_type": motivo,
+            },
+        )
+        print(
+            f"📝 [DB SYNC] Trade fechado gravado. Final ROI: {float(roi):+.2f}% | Motivo: {motivo}."
         )
     except Exception as e:  # noqa: BLE001
         print(f"{_TAG} ⚠️ registrar_trade_performance_fecho (Supabase): {e}")
@@ -2007,6 +2021,10 @@ def executar_saida_hibrida_roi_break_even_trailing(
 
         logger.atualizar_ultimo_trade_campos(
             simbolo, {"partial_roi": float(PARTIAL_TP_ROI_PCT_SUPABASE)}
+        )
+        print(
+            "📝 [DB SYNC] Parcial gravado. "
+            f"Partial ROI: {float(PARTIAL_TP_ROI_PCT_SUPABASE):+.2f}% | Motivo: PARTIAL_TP_50."
         )
     except Exception as e_pr:  # noqa: BLE001
         print(f"{_TAG} ⚠️ partial_roi Supabase: {e_pr}")

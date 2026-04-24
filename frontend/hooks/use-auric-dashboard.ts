@@ -84,6 +84,8 @@ export function useAuricDashboard() {
   const [botActive, setBotActiveState] = useState(false);
   const [botBusy, setBotBusy] = useState(false);
   const [walletUsdt, setWalletUsdt] = useState<number | null>(null);
+  const [entryPrice, setEntryPrice] = useState<number | null>(null);
+  const [positionOpen, setPositionOpen] = useState(false);
   /** Após o primeiro fetch de `wallet_status` (mesmo com saldo null). */
   const [walletHydrated, setWalletHydrated] = useState(false);
   /** Erro na leitura de `wallet_status` (UI neutra; detalhe na consola). */
@@ -109,7 +111,7 @@ export function useAuricDashboard() {
     try {
       const { data, error } = await supabase
         .from("wallet_status")
-        .select("usdc_balance, usdt_balance")
+        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
         .eq("id", 1)
         .single();
 
@@ -126,6 +128,9 @@ export function useAuricDashboard() {
         setWalletUsdt(
           row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
         );
+        const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
+        setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
+        setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
       }
     } catch (err) {
       console.error("[auric] fetchWalletBalance:", err);
@@ -215,7 +220,7 @@ export function useAuricDashboard() {
     try {
       const { data, error: e } = await supabase
         .from("wallet_status")
-        .select("usdc_balance, usdt_balance")
+        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
         .eq("id", 1)
         .single();
       if (e) {
@@ -228,6 +233,9 @@ export function useAuricDashboard() {
       setWalletUsdt(
         row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
       );
+      const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
+      setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
+      setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
     } finally {
       setWalletHydrated(true);
     }
@@ -269,7 +277,10 @@ export function useAuricDashboard() {
     setTradeOutcomesLoading(true);
     const { data, error: e } = await supabase
       .from("trade_outcomes")
-      .select("*")
+      .select(
+        "order_id, symbol, side, ml_probability_at_entry, claude_justification, pnl_usdc, pnl_realized, roi_pct, final_roi, motivo_fecho, exit_type, closed_at"
+      )
+      .not("closed_at", "is", null)
       .order("closed_at", { ascending: false })
       .limit(50);
     setTradeOutcomesLoading(false);
@@ -456,7 +467,7 @@ export function useAuricDashboard() {
         const [wRes, lRes] = await Promise.all([
           supabase
             .from("wallet_status")
-            .select("usdc_balance, usdt_balance")
+            .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
             .eq("id", 1)
             .single(),
           supabase
@@ -471,10 +482,18 @@ export function useAuricDashboard() {
           return;
         }
         setWalletFetchFailed(false);
-        const wrow = wRes.data as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
+        const wrow = wRes.data as {
+          usdc_balance?: unknown;
+          usdt_balance?: unknown;
+          entry_price?: unknown;
+          posicao_aberta?: unknown;
+        } | null;
         setWalletUsdt(
           wrow != null ? coerceQuoteBalance(wrow.usdc_balance ?? wrow.usdt_balance) : null
         );
+        const ep = Number(wrow?.entry_price);
+        setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
+        setPositionOpen(Boolean(wrow?.posicao_aberta));
         setWalletHydrated(true);
 
         if (lRes.error) {
@@ -617,12 +636,20 @@ export function useAuricDashboard() {
         "postgres_changes",
         { event: "*", schema: "public", table: "wallet_status" },
         (payload) => {
-          const row = payload.new as { usdc_balance?: unknown; usdt_balance?: unknown } | null;
+          const row = payload.new as {
+            usdc_balance?: unknown;
+            usdt_balance?: unknown;
+            entry_price?: unknown;
+            posicao_aberta?: unknown;
+          } | null;
           if (row && ("usdc_balance" in row || "usdt_balance" in row)) {
             const n = coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance);
             if (n !== null) {
               setWalletFetchFailed(false);
               setWalletUsdt(n);
+              const ep = Number(row.entry_price);
+              setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
+              setPositionOpen(Boolean(row.posicao_aberta));
               setWalletHydrated(true);
               return;
             }
@@ -740,6 +767,8 @@ export function useAuricDashboard() {
     botBusy,
     setBotActive,
     walletUsdt,
+    entryPrice,
+    positionOpen,
     walletHydrated,
     walletFetchFailed,
     manualPending,

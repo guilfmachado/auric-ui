@@ -16,6 +16,8 @@ type Props = {
   isLoading?: boolean;
   pnlDayPct: string;
   pnlPositive: boolean | null;
+  entryPrice: number | null;
+  positionOpen?: boolean;
   ethPrice: number | null;
   ethChangePct: number | null;
   ethLoading?: boolean;
@@ -53,6 +55,8 @@ export function PulseHero({
   isLoading,
   pnlDayPct,
   pnlPositive,
+  entryPrice,
+  positionOpen = false,
   ethPrice,
   ethChangePct,
   ethLoading,
@@ -70,7 +74,7 @@ export function PulseHero({
       variants={{
         show: { transition: { staggerChildren: 0.07 } },
       }}
-      className="grid gap-4 md:grid-cols-3"
+      className="grid gap-4 md:grid-cols-2 xl:grid-cols-4"
     >
       <motion.div variants={item}>
         <TerminalCard className="flex min-h-[140px] flex-col justify-between">
@@ -110,6 +114,32 @@ export function PulseHero({
             <p className="mt-1 text-[10px] text-zinc-600">
               USDC · <span className="text-zinc-500">wallet_status</span>
             </p>
+          </div>
+        </TerminalCard>
+      </motion.div>
+
+      <motion.div variants={item}>
+        <TerminalCard className="flex min-h-[140px] flex-col justify-between">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] font-semibold tracking-[0.2em] text-gray-400 uppercase">
+              Entry Price
+            </span>
+            <Activity className={cn("size-4", positionOpen ? "text-sky-400" : "text-zinc-600")} />
+          </div>
+          <div>
+            {isLoading ? (
+              <Skeleton className="h-10 w-[min(100%,11rem)] rounded-lg" />
+            ) : (
+              <Mono className="text-xl font-semibold text-white">
+                {positionOpen && entryPrice != null
+                  ? `$ ${entryPrice.toLocaleString("en-US", {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}`
+                  : "—"}
+              </Mono>
+            )}
+            <p className="mt-1 text-[10px] text-zinc-600">Preço de entrada da posição ativa</p>
           </div>
         </TerminalCard>
       </motion.div>
