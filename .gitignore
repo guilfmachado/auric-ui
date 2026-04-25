@@ -1,0 +1,26 @@
+# Ambiente
+venv/
+.venv/
+env/
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Segredos e local
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Build / logs locais
+dist/
+build/
+*.egg-info/
+*.log
