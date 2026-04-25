@@ -23,7 +23,7 @@ else:
 
 # Nomes canónicos Supabase (sincronia com migrações / dashboard).
 TABELA_LOGS = "logs"
-TABELA_TRADES = "trades"
+TABELA_TRADES = "trade_logs"
 TABELA_WALLET_STATUS = "wallet_status"
 TABELA_CONFIG = "config"
 COLUNA_USDT_BALANCE = "usdt_balance"
@@ -38,6 +38,13 @@ _FEATURES_LOG_DEFAULTS: dict[str, Any] = {
     "atr_14": None,
     "funding_rate": None,
     "long_short_ratio": None,
+    "whale_flow_score": None,
+    "social_sentiment_score": None,
+    "funnel_stage": None,
+    "funnel_abort_reason": None,
+    "ml_prob_base": None,
+    "ml_prob_calibrated": None,
+    "llava_veto": None,
 }
 
 
@@ -50,6 +57,13 @@ def configurar_features_log_ciclo(
     atr_14: float | None = None,
     funding_rate: float | None = None,
     long_short_ratio: float | None = None,
+    whale_flow_score: float | None = None,
+    social_sentiment_score: float | None = None,
+    funnel_stage: str | None = None,
+    funnel_abort_reason: str | None = None,
+    ml_prob_base: float | None = None,
+    ml_prob_calibrated: float | None = None,
+    llava_veto: bool | None = None,
 ) -> None:
     """Atualiza defaults de features para os próximos `registrar_log_trade`."""
     global _FEATURES_LOG_DEFAULTS
@@ -61,7 +75,71 @@ def configurar_features_log_ciclo(
         "atr_14": atr_14,
         "funding_rate": funding_rate,
         "long_short_ratio": long_short_ratio,
+        "whale_flow_score": whale_flow_score,
+        "social_sentiment_score": social_sentiment_score,
+        "funnel_stage": funnel_stage,
+        "funnel_abort_reason": funnel_abort_reason,
+        "ml_prob_base": ml_prob_base,
+        "ml_prob_calibrated": ml_prob_calibrated,
+        "llava_veto": llava_veto,
     }
+
+
+def persistir_whale_flow_score(
+    score: float,
+    *,
+    row_id: int = 1,
+    social_sentiment_score: float | None = None,
+) -> None:
+    """Upsert de `wallet_status.whale_flow_score` + `social_sentiment_score` para dashboard."""
+    if not supabase:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": row_id,
+        "whale_flow_score": float(score),
+        "updated_at": now,
+    }
+    if social_sentiment_score is not None:
+        payload["social_sentiment_score"] = float(social_sentiment_score)
+    try:
+        supabase.table(TABELA_WALLET_STATUS).upsert(payload, on_conflict="id").execute()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ persistir_whale_flow_score ({TABELA_WALLET_STATUS}): {e}")
+
+
+def obter_contexto_ultima_abertura(par_moeda: str = "ETH/USDC") -> dict[str, Any]:
+    """Último log de abertura LONG/SHORT para atribuição de alpha no fecho."""
+    if not supabase:
+        return {}
+    acoes_abertura = (
+        "COMPRA_LONG_LIMIT",
+        "COMPRA_LONG_MARKET",
+        "COMPRA_LONG",
+        "ABRE_SHORT_LIMIT",
+        "ABRE_SHORT_MARKET",
+        "ABRE_SHORT",
+        "RECON_EMERGENCY_LONG",
+        "RECON_EMERGENCY_SHORT",
+    )
+    for sym in _variants_symbolo_trade(par_moeda):
+        try:
+            res = (
+                supabase.table(TABELA_LOGS)
+                .select("id, par_moeda, probabilidade_ml, acao_tomada, contexto_raw, created_at")
+                .eq("par_moeda", sym)
+                .in_("acao_tomada", list(acoes_abertura))
+                .order("id", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+            if rows:
+                row = rows[0]
+                return row if isinstance(row, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ obter_contexto_ultima_abertura ({sym}): {e}")
+    return {}
 
 
 def obter_bot_ativo() -> bool:
@@ -155,7 +233,7 @@ def _variants_symbolo_trade(par_moeda: str) -> list[str]:
 
 def atualizar_qty_left_ultimo_trade(par_moeda: str, qty_left: float) -> None:
     """
-    Atualiza `qty_left` na linha mais recente de `public.trades` para o símbolo
+    Atualiza `qty_left` na linha mais recente de `public.trade_logs` para o símbolo
     (abertura mais recente). Falha de schema/RLS apenas regista aviso.
     """
     if not supabase:
@@ -195,7 +273,7 @@ def atualizar_qty_left_ultimo_trade(par_moeda: str, qty_left: float) -> None:
 
 def atualizar_ultimo_trade_campos(par_moeda: str, campos: dict[str, Any]) -> None:
     """
-    UPDATE na linha mais recente de `public.trades` para o símbolo (ex.: `partial_roi`,
+    UPDATE na linha mais recente de `public.trade_logs` para o símbolo (ex.: `partial_roi`,
     `final_roi`, `exit_type`). Chaves com valor `None` são omitidas do payload.
     """
     if not supabase:
@@ -229,6 +307,22 @@ def atualizar_ultimo_trade_campos(par_moeda: str, campos: dict[str, Any]) -> Non
         f"⚠️ atualizar_ultimo_trade_campos: sem linha em {TABELA_TRADES} para {par_moeda!r} — "
         "campos não actualizados."
     )
+
+
+def atualizar_ultimo_trade_mood_scores(
+    par_moeda: str,
+    *,
+    whale_flow_score: float | None,
+    social_sentiment_score: float | None,
+) -> None:
+    """Atualiza scores de humor na última linha de `trade_logs` (quando existir)."""
+    payload: dict[str, Any] = {}
+    if whale_flow_score is not None:
+        payload["whale_flow_score"] = float(whale_flow_score)
+    if social_sentiment_score is not None:
+        payload["social_sentiment_score"] = float(social_sentiment_score)
+    if payload:
+        atualizar_ultimo_trade_campos(par_moeda, payload)
 
 
 def persistir_saldo_usdt(saldo: float, *, row_id: int = 1) -> None:
@@ -298,6 +392,13 @@ def registrar_log_trade(
     atr_14: float | None = None,
     funding_rate: float | None = None,
     long_short_ratio: float | None = None,
+    whale_flow_score: float | None = None,
+    social_sentiment_score: float | None = None,
+    funnel_stage: str | None = None,
+    funnel_abort_reason: str | None = None,
+    ml_prob_base: float | None = None,
+    ml_prob_calibrated: float | None = None,
+    llava_veto: bool | None = None,
     rsi_14: float | None = None,
     adx_14: float | None = None,
 ):
@@ -350,6 +451,35 @@ def registrar_log_trade(
             long_short_ratio
             if long_short_ratio is not None
             else _FEATURES_LOG_DEFAULTS["long_short_ratio"]
+        ),
+        "whale_flow_score": (
+            whale_flow_score
+            if whale_flow_score is not None
+            else _FEATURES_LOG_DEFAULTS["whale_flow_score"]
+        ),
+        "social_sentiment_score": (
+            social_sentiment_score
+            if social_sentiment_score is not None
+            else _FEATURES_LOG_DEFAULTS["social_sentiment_score"]
+        ),
+        "funnel_stage": (
+            funnel_stage if funnel_stage is not None else _FEATURES_LOG_DEFAULTS["funnel_stage"]
+        ),
+        "funnel_abort_reason": (
+            funnel_abort_reason
+            if funnel_abort_reason is not None
+            else _FEATURES_LOG_DEFAULTS["funnel_abort_reason"]
+        ),
+        "ml_prob_base": (
+            ml_prob_base if ml_prob_base is not None else _FEATURES_LOG_DEFAULTS["ml_prob_base"]
+        ),
+        "ml_prob_calibrated": (
+            ml_prob_calibrated
+            if ml_prob_calibrated is not None
+            else _FEATURES_LOG_DEFAULTS["ml_prob_calibrated"]
+        ),
+        "llava_veto": (
+            llava_veto if llava_veto is not None else _FEATURES_LOG_DEFAULTS["llava_veto"]
         ),
     }
     if rsi_14 is not None:

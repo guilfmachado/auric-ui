@@ -86,6 +86,14 @@ export function useAuricDashboard() {
   const [walletUsdt, setWalletUsdt] = useState<number | null>(null);
   const [entryPrice, setEntryPrice] = useState<number | null>(null);
   const [positionOpen, setPositionOpen] = useState(false);
+  const [whaleFlowScore, setWhaleFlowScore] = useState<number | null>(null);
+  const [socialSentimentScore, setSocialSentimentScore] = useState<number | null>(null);
+  const [newsSentimentScore, setNewsSentimentScore] = useState<number | null>(null);
+  const [forecastPrecoAlvo, setForecastPrecoAlvo] = useState<number | null>(null);
+  const [forecastTendenciaAlta, setForecastTendenciaAlta] = useState<boolean | null>(null);
+  const [llavaVeto, setLlavaVeto] = useState<boolean>(false);
+  const [funnelStage, setFunnelStage] = useState<string | null>(null);
+  const [funnelAbortReason, setFunnelAbortReason] = useState<string | null>(null);
   /** Após o primeiro fetch de `wallet_status` (mesmo com saldo null). */
   const [walletHydrated, setWalletHydrated] = useState(false);
   /** Erro na leitura de `wallet_status` (UI neutra; detalhe na consola). */
@@ -111,7 +119,7 @@ export function useAuricDashboard() {
     try {
       const { data, error } = await supabase
         .from("wallet_status")
-        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
+        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta, whale_flow_score, social_sentiment_score, news_sentiment_score, forecast_preco_alvo, forecast_tendencia_alta, llava_veto, funnel_stage, funnel_abort_reason")
         .eq("id", 1)
         .single();
 
@@ -131,6 +139,21 @@ export function useAuricDashboard() {
         const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
         setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
         setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
+        const wfs = Number((row as { whale_flow_score?: unknown } | null)?.whale_flow_score);
+        setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
+        const sss = Number((row as { social_sentiment_score?: unknown } | null)?.social_sentiment_score);
+        setSocialSentimentScore(Number.isFinite(sss) ? sss : null);
+        const nss = Number((row as { news_sentiment_score?: unknown } | null)?.news_sentiment_score);
+        setNewsSentimentScore(Number.isFinite(nss) ? nss : null);
+        const fpa = Number((row as { forecast_preco_alvo?: unknown } | null)?.forecast_preco_alvo);
+        setForecastPrecoAlvo(Number.isFinite(fpa) ? fpa : null);
+        const ftaRaw = (row as { forecast_tendencia_alta?: unknown } | null)?.forecast_tendencia_alta;
+        setForecastTendenciaAlta(typeof ftaRaw === "boolean" ? ftaRaw : null);
+        setLlavaVeto(Boolean((row as { llava_veto?: unknown } | null)?.llava_veto));
+        const fs = (row as { funnel_stage?: unknown } | null)?.funnel_stage;
+        setFunnelStage(typeof fs === "string" && fs.length > 0 ? fs : null);
+        const far = (row as { funnel_abort_reason?: unknown } | null)?.funnel_abort_reason;
+        setFunnelAbortReason(typeof far === "string" && far.length > 0 ? far : null);
       }
     } catch (err) {
       console.error("[auric] fetchWalletBalance:", err);
@@ -220,7 +243,7 @@ export function useAuricDashboard() {
     try {
       const { data, error: e } = await supabase
         .from("wallet_status")
-        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
+        .select("usdc_balance, usdt_balance, entry_price, posicao_aberta, whale_flow_score, social_sentiment_score, news_sentiment_score, forecast_preco_alvo, forecast_tendencia_alta, llava_veto, funnel_stage, funnel_abort_reason")
         .eq("id", 1)
         .single();
       if (e) {
@@ -236,6 +259,21 @@ export function useAuricDashboard() {
       const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
       setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
       setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
+      const wfs = Number((row as { whale_flow_score?: unknown } | null)?.whale_flow_score);
+      setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
+      const sss = Number((row as { social_sentiment_score?: unknown } | null)?.social_sentiment_score);
+      setSocialSentimentScore(Number.isFinite(sss) ? sss : null);
+      const nss = Number((row as { news_sentiment_score?: unknown } | null)?.news_sentiment_score);
+      setNewsSentimentScore(Number.isFinite(nss) ? nss : null);
+      const fpa = Number((row as { forecast_preco_alvo?: unknown } | null)?.forecast_preco_alvo);
+      setForecastPrecoAlvo(Number.isFinite(fpa) ? fpa : null);
+      const ftaRaw = (row as { forecast_tendencia_alta?: unknown } | null)?.forecast_tendencia_alta;
+      setForecastTendenciaAlta(typeof ftaRaw === "boolean" ? ftaRaw : null);
+      setLlavaVeto(Boolean((row as { llava_veto?: unknown } | null)?.llava_veto));
+      const fs = (row as { funnel_stage?: unknown } | null)?.funnel_stage;
+      setFunnelStage(typeof fs === "string" && fs.length > 0 ? fs : null);
+      const far = (row as { funnel_abort_reason?: unknown } | null)?.funnel_abort_reason;
+      setFunnelAbortReason(typeof far === "string" && far.length > 0 ? far : null);
     } finally {
       setWalletHydrated(true);
     }
@@ -467,7 +505,7 @@ export function useAuricDashboard() {
         const [wRes, lRes] = await Promise.all([
           supabase
             .from("wallet_status")
-            .select("usdc_balance, usdt_balance, entry_price, posicao_aberta")
+            .select("usdc_balance, usdt_balance, entry_price, posicao_aberta, whale_flow_score, social_sentiment_score, news_sentiment_score, forecast_preco_alvo, forecast_tendencia_alta, llava_veto, funnel_stage, funnel_abort_reason")
             .eq("id", 1)
             .single(),
           supabase
@@ -487,6 +525,14 @@ export function useAuricDashboard() {
           usdt_balance?: unknown;
           entry_price?: unknown;
           posicao_aberta?: unknown;
+          whale_flow_score?: unknown;
+          social_sentiment_score?: unknown;
+          news_sentiment_score?: unknown;
+          forecast_preco_alvo?: unknown;
+          forecast_tendencia_alta?: unknown;
+          llava_veto?: unknown;
+          funnel_stage?: unknown;
+          funnel_abort_reason?: unknown;
         } | null;
         setWalletUsdt(
           wrow != null ? coerceQuoteBalance(wrow.usdc_balance ?? wrow.usdt_balance) : null
@@ -494,6 +540,31 @@ export function useAuricDashboard() {
         const ep = Number(wrow?.entry_price);
         setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
         setPositionOpen(Boolean(wrow?.posicao_aberta));
+        const wfs = Number(wrow?.whale_flow_score);
+        setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
+        const sss = Number(wrow?.social_sentiment_score);
+        setSocialSentimentScore(Number.isFinite(sss) ? sss : null);
+        const nss = Number(wrow?.news_sentiment_score);
+        setNewsSentimentScore(Number.isFinite(nss) ? nss : null);
+        const fpa = Number(wrow?.forecast_preco_alvo);
+        setForecastPrecoAlvo(Number.isFinite(fpa) ? fpa : null);
+        setForecastTendenciaAlta(
+          typeof wrow?.forecast_tendencia_alta === "boolean"
+            ? wrow.forecast_tendencia_alta
+            : null
+        );
+        setLlavaVeto(Boolean(wrow?.llava_veto));
+        setFunnelStage(
+          typeof wrow?.funnel_stage === "string" && wrow.funnel_stage.length > 0
+            ? wrow.funnel_stage
+            : null
+        );
+        setFunnelAbortReason(
+          typeof wrow?.funnel_abort_reason === "string" &&
+            wrow.funnel_abort_reason.length > 0
+            ? wrow.funnel_abort_reason
+            : null
+        );
         setWalletHydrated(true);
 
         if (lRes.error) {
@@ -641,6 +712,14 @@ export function useAuricDashboard() {
             usdt_balance?: unknown;
             entry_price?: unknown;
             posicao_aberta?: unknown;
+            whale_flow_score?: unknown;
+            social_sentiment_score?: unknown;
+            news_sentiment_score?: unknown;
+            forecast_preco_alvo?: unknown;
+            forecast_tendencia_alta?: unknown;
+            llava_veto?: unknown;
+            funnel_stage?: unknown;
+            funnel_abort_reason?: unknown;
           } | null;
           if (row && ("usdc_balance" in row || "usdt_balance" in row)) {
             const n = coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance);
@@ -650,6 +729,30 @@ export function useAuricDashboard() {
               const ep = Number(row.entry_price);
               setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
               setPositionOpen(Boolean(row.posicao_aberta));
+              const wfs = Number(row.whale_flow_score);
+              setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
+              const sss = Number(row.social_sentiment_score);
+              setSocialSentimentScore(Number.isFinite(sss) ? sss : null);
+              const nss = Number(row.news_sentiment_score);
+              setNewsSentimentScore(Number.isFinite(nss) ? nss : null);
+              const fpa = Number(row.forecast_preco_alvo);
+              setForecastPrecoAlvo(Number.isFinite(fpa) ? fpa : null);
+              setForecastTendenciaAlta(
+                typeof row.forecast_tendencia_alta === "boolean"
+                  ? row.forecast_tendencia_alta
+                  : null
+              );
+              setLlavaVeto(Boolean(row.llava_veto));
+              setFunnelStage(
+                typeof row.funnel_stage === "string" && row.funnel_stage.length > 0
+                  ? row.funnel_stage
+                  : null
+              );
+              setFunnelAbortReason(
+                typeof row.funnel_abort_reason === "string" && row.funnel_abort_reason.length > 0
+                  ? row.funnel_abort_reason
+                  : null
+              );
               setWalletHydrated(true);
               return;
             }
@@ -771,6 +874,14 @@ export function useAuricDashboard() {
     positionOpen,
     walletHydrated,
     walletFetchFailed,
+    whaleFlowScore,
+    socialSentimentScore,
+    newsSentimentScore,
+    forecastPrecoAlvo,
+    forecastTendenciaAlta,
+    llavaVeto,
+    funnelStage,
+    funnelAbortReason,
     manualPending,
     insertManualCommand,
     tradeOutcomes,

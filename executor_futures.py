@@ -18,6 +18,10 @@ from typing import Any
 
 import ccxt
 from dotenv import load_dotenv
+try:
+    import redis
+except Exception:  # noqa: BLE001
+    redis = None  # type: ignore[assignment]
 
 load_dotenv()
 
@@ -53,6 +57,23 @@ SYNTHETIC_BOOK_HALF_SPREAD = 0.05
 TRAILING_LUCRO_ATIVACAO_FRAC = 0.01  # 1%
 TRAILING_SL_DIST_FRAC = 0.008  # 0,8% atrás (LONG) / à frente (SHORT) do preço atual
 
+# --- Risco dinâmico por ATR (Wilder) — SL/ativação/callback derivados da volatilidade ---
+RISK_ATR_MODE = str(os.getenv("AURIC_RISK_ATR_MODE", "1")).strip().lower() in ("1", "true", "yes")
+AURIC_ATR_TIMEFRAME = os.getenv("AURIC_ATR_TIMEFRAME", "15m").strip() or "15m"
+AURIC_ATR_PERIOD = max(2, int(os.getenv("AURIC_ATR_PERIOD", "14")))
+RISK_ATR_SL_MULT = float(os.getenv("AURIC_ATR_SL_MULT", "1.5"))
+RISK_ATR_TP_REF_MULT = float(os.getenv("AURIC_ATR_TP_REF_MULT", "2.5"))
+RISK_ATR_TRAIL_ACTIV_MULT = float(os.getenv("AURIC_ATR_TRAIL_ACTIV_MULT", "1.0"))
+RISK_ATR_TRAIL_CALLBACK_FRAC = float(os.getenv("AURIC_ATR_TRAIL_CALLBACK_FRAC", "1.0"))
+# Free runner (scale-out): fração da posição em TAKE_PROFIT_MARKET a 2,5×ATR; resto = runner (SL+trailing).
+AURIC_PARTIAL_TP_PCT = max(0.01, min(0.99, float(os.getenv("AURIC_PARTIAL_TP_PCT", "0.50"))))
+FREE_RUNNER_ATR_ENABLED = str(os.getenv("AURIC_FREE_RUNNER", "1")).strip().lower() in ("1", "true", "yes")
+
+# Estado Modo Vigia — Free Runner (qty inicial após abertura; break-even após TP parcial).
+_free_runner_anchor_qty: dict[str, float] = {}
+_free_runner_preco_entrada: dict[str, float] = {}
+_free_runner_be_aplicado: dict[str, bool] = {}
+
 # Abertura LIMIT IOC + chase: após timeout sem fill suficiente, cancela (se ainda aberta) e reabre
 # no novo bid/ask até N rondas. LONG: defaults abaixo. SHORT: mercado em queda rápida —
 # timeouts mais curtos / mais rondas. Overrides via env.
@@ -69,16 +90,306 @@ TURBO_CHASE_OFFSET_FRAC = float(os.getenv("AURIC_TURBO_CHASE_OFFSET", "0.00025")
 PARTIAL_TP_EXECUTION = os.getenv("AURIC_PARTIAL_TP_EXEC", "market").strip().lower()
 # Alinhado ao `PARTIAL_TP_ROI_FRAC` do main (fracção → % no Supabase `trades.partial_roi`).
 PARTIAL_TP_ROI_PCT_SUPABASE = float(os.getenv("AURIC_PARTIAL_TP_ROI_PCT", "0.6"))
+# Trava anti-loop: mais ordens abertas que isto no símbolo → abortar criação (default 4).
+# Hard cap: `fetch_open_orders` com mais ordens que isto → abortar criação (default: >5 = 6+ ordens).
+AURIC_MAX_OPEN_ORDERS_GUARD = max(1, int(os.getenv("AURIC_MAX_OPEN_ORDERS_BEFORE_PROTECT", "5")))
+# Só substituir SL na bolsa se o novo stop difere > esta fração do preço já armado (anti micro-loop).
+SL_REPLACE_MIN_REL_DIFF = float(os.getenv("AURIC_SL_REPLACE_MIN_REL_DIFF", "0.001"))  # 0,1 %
+# Após cada `create_order` de proteção: dar tempo à API refletir estado.
+PROTECTION_ORDER_CREATE_THROTTLE_S = float(os.getenv("AURIC_PROTECTION_CREATE_THROTTLE_S", "5"))
+# Após cancelar ordem do mesmo tipo (fetch_open_orders) antes de recriar.
+PROTECTION_PRE_CREATE_CANCEL_SLEEP_S = float(os.getenv("AURIC_PROTECTION_PRE_CREATE_CANCEL_SLEEP_S", "5"))
+# Loop `cancelar_livro_aberto_ate_zero_sync`: pausa entre rondas até `fetch_open_orders` = [].
+PROTECTION_CANCEL_CONFIRM_LOOP_SLEEP_S = float(os.getenv("AURIC_PROTECTION_CANCEL_LOOP_SLEEP_S", "5"))
+# Bloqueio total de spam: mínimo de segundos entre criações de ordens de proteção (SL/TP cond./trailing).
+PROTECTION_MIN_INTERVAL_BETWEEN_CREATES_S = float(os.getenv("AURIC_PROTECTION_MIN_INTERVAL_S", "10"))
+# Último `time.monotonic()` em que uma ordem de proteção foi criada com sucesso (0 = ainda nenhuma).
+_last_order_time: float = 0.0
+# True entre «livro confirmado vazio» e o fim de `_criar_bracket_*` (permite TP+trailing+SL em sequência).
+_in_protection_order_batch: bool = False
+
+# Lock atómico de entrada (anti-spam entre loops/processos): SET key value NX EX <ttl>.
+ORDER_LOCK_TTL_S = max(1.0, float(os.getenv("AURIC_ORDER_LOCK_TTL_S", "5")))
+ORDER_LOCK_KEY_PREFIX = (os.getenv("AURIC_ORDER_LOCK_PREFIX") or "lock").strip() or "lock"
+REDIS_URL = (os.getenv("REDIS_URL") or "redis://localhost:6379/0").strip()
+REDIS_SOCKET_TIMEOUT_S = max(0.2, float(os.getenv("REDIS_SOCKET_TIMEOUT_S", "0.5")))
+_redis_client: Any | None = None
+
+
+def _order_lock_key(simbolo: str) -> str:
+    clean = "".join(ch for ch in str(simbolo or "").upper() if ch.isalnum())
+    return f"{ORDER_LOCK_KEY_PREFIX}_{clean or 'SYMBOL'}"
+
+
+def _obter_redis_client() -> Any | None:
+    global _redis_client
+    if redis is None:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    try:
+        _redis_client = redis.Redis.from_url(  # type: ignore[attr-defined]
+            REDIS_URL,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_S,
+            socket_connect_timeout=REDIS_SOCKET_TIMEOUT_S,
+            decode_responses=True,
+        )
+        _redis_client.ping()
+        return _redis_client
+    except Exception as e:  # noqa: BLE001
+        print(f"{_TAG} [REDIS] indisponível em {REDIS_URL}: {e}. Lock atómico desativado.", flush=True)
+        _redis_client = None
+        return None
+
+
+def _adquirir_lock_entrada(simbolo: str) -> tuple[str, str] | None:
+    cli = _obter_redis_client()
+    if cli is None:
+        return None
+    key = _order_lock_key(simbolo)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    ttl_int = int(math.ceil(float(ORDER_LOCK_TTL_S)))
+    try:
+        ok = bool(cli.set(key, token, nx=True, ex=ttl_int))
+        if ok:
+            return key, token
+        return ("", "")
+    except Exception as e:  # noqa: BLE001
+        print(f"{_TAG} [REDIS] falha ao adquirir lock {key}: {e}. Prosseguindo sem lock.", flush=True)
+        return None
+
+
+def _liberar_lock_entrada(lock_ctx: tuple[str, str] | None) -> None:
+    if not lock_ctx:
+        return
+    key, token = lock_ctx
+    if not key:
+        return
+    cli = _obter_redis_client()
+    if cli is None:
+        return
+    # Release seguro: remove só se o token atual for nosso (evita apagar lock novo de outro loop).
+    lua = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+"""
+    try:
+        cli.eval(lua, 1, key, token)
+    except Exception:
+        pass
+
+
+def _ordem_skip_lock(simbolo: str) -> dict[str, Any]:
+    return {
+        "id": None,
+        "status": "skipped",
+        "symbol": str(simbolo),
+        "auric_skipped": True,
+        "auric_skip_reason": "REDIS_LOCK_ACTIVE",
+    }
 
 # ORDER-GUARD (vigia): verificar SL + TP na bolsa no máximo 1×/30s por ciclo agregado.
 ORDER_GUARD_INTERVAL_S = 30.0
 _order_guard_last_monotonic: float = 0.0
 
+# Anti-spam: `assegurar_brackets_apos_reconciliacao` com a mesma assinatura (callback/mult/BE).
+BRACKET_REPLACE_DEBOUNCE_S = 25.0
+# Só retunar brackets «discrecionários» se o mark se mover ≥ isto a favor desde o último sucesso.
+BRACKET_REPLACE_MIN_FAVORABLE_PRICE_MOVE = float(
+    os.getenv("AURIC_BRACKET_MIN_FAVORABLE_MOVE", "0.001")
+)
+_bracket_last_mono_by_sym: dict[str, float] = {}
+_bracket_last_sig_by_sym: dict[str, tuple[float, float, bool]] = {}
+_bracket_last_anchor_mark_by_sym: dict[str, float] = {}
+# Último preço de referência onde `gerenciar_trailing_stop` mexeu no SL (anti-spam 0,1% a favor).
+_trailing_sl_adjust_anchor_by_sym: dict[str, float] = {}
+
+# Tipos condicionais de fecho (reduce-only) na Binance Futures — cancelar antes de recolocar.
+_FUTURES_PROTECTIVE_ORDER_TYPES = frozenset(
+    {
+        "STOP_MARKET",
+        "TAKE_PROFIT_MARKET",
+        "TRAILING_STOP_MARKET",
+        "STOP",  # STOP condicional (limit stop)
+        "TAKE_PROFIT",
+    }
+)
+# Só SL + trailing — nunca TAKE_PROFIT_* nem LIMIT (TP parcial / reduce-only limit).
+_FUTURES_SL_TRAILING_CANCEL_TYPES = frozenset(
+    {
+        "STOP_MARKET",
+        "TRAILING_STOP_MARKET",
+        "STOP",
+        "TRAILING_STOP",
+    }
+)
+_FUTURES_STOP_MARKET_ONLY_CANCEL_TYPES = frozenset({"STOP_MARKET", "STOP"})
+
 
 def reset_protective_order_guard_throttle() -> None:
     """Repor o throttle do ORDER-GUARD (ex.: ao fechar posição / reset vigia)."""
     global _order_guard_last_monotonic
+    global _bracket_last_mono_by_sym, _bracket_last_sig_by_sym, _bracket_last_anchor_mark_by_sym
+    global _last_order_time, _in_protection_order_batch
     _order_guard_last_monotonic = 0.0
+    _last_order_time = 0.0
+    _in_protection_order_batch = False
+    _bracket_last_mono_by_sym.clear()
+    _bracket_last_sig_by_sym.clear()
+    _bracket_last_anchor_mark_by_sym.clear()
+    _trailing_sl_adjust_anchor_by_sym.clear()
+    reset_free_runner_state()
+
+
+def reset_free_runner_state(simbolo: str | None = None, exchange: ccxt.binance | None = None) -> None:
+    """Limpa tracking do Free Runner (`simbolo is None` → todas as chaves; caso contrário só o par)."""
+    global _free_runner_anchor_qty, _free_runner_preco_entrada, _free_runner_be_aplicado
+    if simbolo is None:
+        _free_runner_anchor_qty.clear()
+        _free_runner_preco_entrada.clear()
+        _free_runner_be_aplicado.clear()
+        return
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    _free_runner_anchor_qty.pop(sym, None)
+    _free_runner_preco_entrada.pop(sym, None)
+    _free_runner_be_aplicado.pop(sym, None)
+
+
+def armar_free_runner_tracking(
+    simbolo: str,
+    exchange: ccxt.binance,
+    qty_inicial: float,
+    preco_entrada: float,
+) -> None:
+    """Chamar após abrir posição com TP parcial Free Runner armado (para detetar fill na vigia)."""
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    _free_runner_anchor_qty[sym] = abs(float(qty_inicial))
+    _free_runner_preco_entrada[sym] = float(preco_entrada)
+    _free_runner_be_aplicado[sym] = False
+
+
+def free_runner_tracking_ativo(simbolo: str, exchange: ccxt.binance | None = None) -> bool:
+    """True enquanto há sessão Free Runner (evita parcial ROI duplicada no main)."""
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    return sym in _free_runner_anchor_qty
+
+
+def _free_runner_split_qty(
+    exchange: ccxt.binance,
+    simbolo: str,
+    qty_total: float,
+    partial_pct: float,
+) -> tuple[float, float, bool]:
+    """
+    Divide qty em (parcial TP, runner). Quantidades com `amount_to_precision` da Binance.
+    Devolve (q_tp, q_runner, ok). ok=False se min amount ou arredondamento inviabilizam o split.
+    """
+    q_tot = float(exchange.amount_to_precision(simbolo, float(qty_total)))
+    if q_tot <= 0:
+        return 0.0, 0.0, False
+    mkt = exchange.market(simbolo)
+    min_amt = float(((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+    raw_tp = q_tot * float(partial_pct)
+    q_tp = float(exchange.amount_to_precision(simbolo, raw_tp))
+    q_runner = float(exchange.amount_to_precision(simbolo, q_tot - q_tp))
+    if q_tp <= 0 or q_runner <= 0:
+        return q_tot, 0.0, False
+    if min_amt > 0:
+        if q_tp + 1e-12 < min_amt or q_runner + 1e-12 < min_amt:
+            return q_tot, 0.0, False
+    if q_tp + q_runner > q_tot + 1e-9:
+        q_runner = float(exchange.amount_to_precision(simbolo, max(0.0, q_tot - q_tp)))
+    if q_runner <= 0:
+        return q_tot, 0.0, False
+    return q_tp, q_runner, True
+
+
+def verificar_free_runner_breakeven_posicao(
+    simbolo: str,
+    exchange: ccxt.binance,
+    direcao: str,
+    preco_entrada_ram: float,
+    *,
+    trailing_callback_rate: float,
+    trailing_activation_multiplier: float,
+) -> bool:
+    """
+    Se a posição encolheu ~para o runner (TP parcial 50% executado), cancela SL/trailing antigos
+    e recoloca brackets em break-even + trailing só sobre o restante.
+    Devolve True se aplicou o passo (o caller pode fixar `_partial_tp_locked` no main).
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    if sym not in _free_runner_anchor_qty:
+        return False
+    if _free_runner_be_aplicado.get(sym):
+        return False
+    anchor = float(_free_runner_anchor_qty.get(sym) or 0.0)
+    if anchor <= 0:
+        return False
+    snap = consultar_posicao_futures(simbolo, exchange)
+    if not snap.get("posicao_aberta"):
+        reset_free_runner_state(simbolo, exchange)
+        return False
+    q_now = abs(float(snap.get("contratos") or 0.0))
+    if q_now <= 0:
+        reset_free_runner_state(simbolo, exchange)
+        return False
+    target_rem = anchor * (1.0 - float(AURIC_PARTIAL_TP_PCT))
+    tol_hi = target_rem * 1.18
+    tol_lo = target_rem * 0.72
+    if not (tol_lo <= q_now <= tol_hi):
+        return False
+    pe = float(_free_runner_preco_entrada.get(sym) or preco_entrada_ram)
+    if pe <= 0:
+        pe = float(preco_entrada_ram)
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return False
+    print(
+        f"🛡️ [BREAKEVEN] Parcial atingida! Lucro no bolso. Stop Loss movido para o preço de entrada "
+        f"({pe:.6f}). Risco zero.",
+        flush=True,
+    )
+    try:
+        assegurar_brackets_apos_reconciliacao(
+            simbolo,
+            exchange,
+            d,
+            q_now,
+            pe,
+            trailing_callback_rate=float(trailing_callback_rate),
+            trailing_activation_multiplier=float(trailing_activation_multiplier),
+            source_tag="FREE_RUNNER_BE",
+            sl_break_even=True,
+            force_replace=True,
+        )
+    except Exception as e_be:  # noqa: BLE001
+        print(f"{_TAG} [FREE RUNNER] Falha ao recolocar break-even: {e_be}", file=sys.stderr)
+        return False
+    _free_runner_be_aplicado[sym] = True
+    try:
+        import logger
+
+        logger.registrar_log_trade(
+            par_moeda=simbolo,
+            preco=float(preco_entrada_ram),
+            prob_ml=0.0,
+            sentimento="—",
+            acao="FREE_RUNNER_BE",
+            justificativa=(
+                f"[FREE RUNNER] TP parcial ~{AURIC_PARTIAL_TP_PCT:.0%} executado; qty {anchor:g}→{q_now:g}; "
+                f"SL reposicionado em break-even @ {pe:.6f}."
+            ),
+            lado_ordem=d,
+        )
+    except Exception as e_log:  # noqa: BLE001
+        print(f"{_TAG} [FREE RUNNER] Log Supabase: {e_log}", file=sys.stderr)
+    return True
 
 
 def _order_reduce_only_flag(o: dict[str, Any]) -> bool:
@@ -86,7 +397,12 @@ def _order_reduce_only_flag(o: dict[str, Any]) -> bool:
         return True
     info = o.get("info") or {}
     v = str(info.get("reduceOnly", "")).lower()
-    return v in ("true", "1", "yes")
+    if v in ("true", "1", "yes"):
+        return True
+    # Binance Futures: fechos «close entire position» vêm por vezes só com closePosition.
+    if str(info.get("closePosition", "")).lower() in ("true", "1", "yes"):
+        return True
+    return False
 
 
 def _order_type_norm(o: dict[str, Any]) -> str:
@@ -96,6 +412,387 @@ def _order_type_norm(o: dict[str, Any]) -> str:
     info = o.get("info") or {}
     raw = info.get("type") or info.get("origType") or info.get("orderType") or ""
     return str(raw).upper().replace("-", "_")
+
+
+def _fetch_open_orders_ccxt_list(exchange: ccxt.binance, simbolo_ccxt: str) -> list[dict[str, Any]]:
+    try:
+        rows = exchange.fetch_open_orders(simbolo_ccxt)
+        return rows if isinstance(rows, list) else []
+    except ccxt.BaseError as e:
+        print(f"{_TAG} fetch_open_orders({simbolo_ccxt}): {e}", file=sys.stderr)
+        return []
+
+
+def _futures_one_way_position_side(o: dict[str, Any]) -> bool:
+    """True se parecer modo one-way (BOTH) — sem hedge LONG/SHORT separado."""
+    info = o.get("info") or {}
+    ps = str(info.get("positionSide") or "").upper()
+    return ps in ("", "BOTH")
+
+
+def _ordem_sl_ou_trailing_para_cancelar(o: dict[str, Any], direcao: str) -> bool:
+    """STOP_MARKET / TRAILING_* no lado de fecho; preserva TP (TAKE_PROFIT_*) e LIMIT."""
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return False
+    need_side = "sell" if d == "LONG" else "buy"
+    if str(o.get("side") or "").lower() != need_side:
+        return False
+    typ = _order_type_norm(o)
+    if typ in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+        return False
+    if typ == "LIMIT":
+        return False
+    if typ not in _FUTURES_SL_TRAILING_CANCEL_TYPES:
+        return False
+    if _order_reduce_only_flag(o):
+        return True
+    # fetch_open_orders por vezes omite reduceOnly em TRAILING_STOP_MARKET / STOP_MARKET;
+    # em one-way, estas ordens no lado de fecho são sempre proteção — cancelar para evitar spam.
+    return _futures_one_way_position_side(o)
+
+
+def _ordem_stop_market_protecao_para_cancelar(o: dict[str, Any], direcao: str) -> bool:
+    """Só STOP_MARKET / STOP (stop-limit); não cancela trailing nem TP."""
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return False
+    need_side = "sell" if d == "LONG" else "buy"
+    if str(o.get("side") or "").lower() != need_side:
+        return False
+    typ = _order_type_norm(o)
+    if typ not in _FUTURES_STOP_MARKET_ONLY_CANCEL_TYPES:
+        return False
+    if _order_reduce_only_flag(o):
+        return True
+    return _futures_one_way_position_side(o)
+
+
+def cancelar_sl_trailing_reduce_only_ccxt(
+    exchange: ccxt.binance,
+    simbolo: str,
+    direcao: str,
+    *,
+    max_passes: int = 10,
+    sleep_s: float = 5.0,
+) -> int:
+    """
+    Cancela via CCXT (`fetch_open_orders` + `cancel_order`) todas as STOP_MARKET e
+    TRAILING_STOP_MARKET reduce-only do lado de fecho. Não cancela TAKE_PROFIT_MARKET
+    nem ordens LIMIT (TP parcial / exits limit).
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    d = str(direcao).strip().upper()
+    total = 0
+    for _ in range(max(1, int(max_passes))):
+        rows = _fetch_open_orders_ccxt_list(exchange, sym)
+        alvo = [o for o in rows if _ordem_sl_ou_trailing_para_cancelar(o, d)]
+        if not alvo:
+            return total
+        for o in alvo:
+            oid = o.get("id")
+            if oid is None:
+                continue
+            try:
+                exchange.cancel_order(str(oid), sym)
+                total += 1
+            except ccxt.BaseError as ec:
+                print(f"{_TAG} cancel SL/trail id={oid}: {ec}", file=sys.stderr)
+        time.sleep(float(sleep_s))
+    rem = [o for o in _fetch_open_orders_ccxt_list(exchange, sym) if _ordem_sl_ou_trailing_para_cancelar(o, d)]
+    if rem:
+        print(
+            f"{_TAG} [RISCO] Após {max_passes} passes persistem {len(rem)} ordem(ns) "
+            f"STOP/TRAILING reduce-only em {sym}.",
+            file=sys.stderr,
+            flush=True,
+        )
+    return total
+
+
+def protecao_sl_trailing_limpa_ccxt(exchange: ccxt.binance, simbolo: str, direcao: str) -> bool:
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    d = str(direcao).strip().upper()
+    rows = _fetch_open_orders_ccxt_list(exchange, sym)
+    return not any(_ordem_sl_ou_trailing_para_cancelar(o, d) for o in rows)
+
+
+def cancelar_stop_market_protecao_ccxt(
+    exchange: ccxt.binance,
+    simbolo: str,
+    direcao: str,
+    *,
+    max_passes: int = 10,
+    sleep_s: float = 5.0,
+) -> int:
+    """Só STOP_MARKET / STOP reduce-only no lado de fecho (atualização de SL sem remover trailing)."""
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    d = str(direcao).strip().upper()
+    total = 0
+    for _ in range(max(1, int(max_passes))):
+        rows = _fetch_open_orders_ccxt_list(exchange, sym)
+        alvo = [o for o in rows if _ordem_stop_market_protecao_para_cancelar(o, d)]
+        if not alvo:
+            return total
+        for o in alvo:
+            oid = o.get("id")
+            if oid is None:
+                continue
+            try:
+                exchange.cancel_order(str(oid), sym)
+                total += 1
+            except ccxt.BaseError as ec:
+                print(f"{_TAG} cancel STOP id={oid}: {ec}", file=sys.stderr)
+        time.sleep(float(sleep_s))
+    return total
+
+
+def protecao_stop_market_limpa_ccxt(exchange: ccxt.binance, simbolo: str, direcao: str) -> bool:
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    d = str(direcao).strip().upper()
+    rows = _fetch_open_orders_ccxt_list(exchange, sym)
+    return not any(_ordem_stop_market_protecao_para_cancelar(o, d) for o in rows)
+
+
+def cancelar_livro_aberto_ate_zero_sync(
+    exchange: ccxt.binance,
+    simbolo_any: str,
+    *,
+    context: str,
+    max_rounds: int = 48,
+) -> None:
+    """
+    Cancela **todas** as ordens abertas do símbolo até `fetch_open_orders` devolver lista vazia.
+    Entre rondas: `PROTECTION_CANCEL_CONFIRM_LOOP_SLEEP_S` (default 5s) para a API acompanhar.
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo_any)
+    slp = float(PROTECTION_CANCEL_CONFIRM_LOOP_SLEEP_S)
+    nmax = max(1, int(max_rounds))
+    rnd = 0
+    while True:
+        rnd += 1
+        if rnd > nmax:
+            break
+        rows = _fetch_open_orders_ccxt_list(exchange, sym)
+        if not rows:
+            return
+        for o in rows:
+            oid = o.get("id")
+            if oid is None:
+                continue
+            try:
+                exchange.cancel_order(str(oid), sym)
+            except ccxt.BaseError as ec:
+                print(
+                    f"{_TAG} cancelar_livro→0 [{context}] id={oid}: {ec}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        time.sleep(slp)
+    rows = _fetch_open_orders_ccxt_list(exchange, sym)
+    if rows:
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: após {nmax} rondas persistem {len(rows)} "
+            "ordem(ns) abertas (esperado zero)."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+
+
+def _marcar_criacao_ordem_protecao() -> None:
+    global _last_order_time
+    _last_order_time = time.monotonic()
+
+
+def _exigir_intervalo_min_entre_ordens_protecao(*, context: str) -> bool:
+    """Bloqueio total de spam: False se a última ordem de proteção foi criada há < N segundos."""
+    global _last_order_time
+    if _last_order_time <= 0:
+        return True
+    elapsed = time.monotonic() - _last_order_time
+    need = float(PROTECTION_MIN_INTERVAL_BETWEEN_CREATES_S)
+    if elapsed < need:
+        print(
+            f"{_TAG} [ANTI-SPAM] Criação bloqueada: última ordem de proteção há {elapsed:.1f}s "
+            f"(mínimo {need:.0f}s). {context}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
+def limpar_sl_trailing_e_confirmar_sync(
+    exchange: ccxt.binance,
+    simbolo: str,
+    direcao: str,
+    *,
+    context: str,
+) -> None:
+    """
+    Limpeza **síncrona** de SL/trailing: cancela via CCXT e só conclui quando
+    `protecao_sl_trailing_limpa_ccxt` confirmar livro sem esses tipos (senão RuntimeError).
+    """
+    d = str(direcao).strip().upper()
+    sym = _resolver_simbolo_perp(exchange, simbolo)
+    slp_confirm = float(PROTECTION_CANCEL_CONFIRM_LOOP_SLEEP_S)
+    cancelar_sl_trailing_reduce_only_ccxt(
+        exchange, simbolo, d, max_passes=16, sleep_s=slp_confirm
+    )
+    time.sleep(slp_confirm)
+    if not protecao_sl_trailing_limpa_ccxt(exchange, simbolo, d):
+        cancelar_sl_trailing_reduce_only_ccxt(
+            exchange, simbolo, d, max_passes=20, sleep_s=slp_confirm
+        )
+        time.sleep(slp_confirm)
+    if not protecao_sl_trailing_limpa_ccxt(exchange, simbolo, d):
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: SL/TRAILING ainda presentes após limpeza síncrona."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+
+
+def _contar_ordens_abertas_simbolo_ccxt(exchange: ccxt.binance, simbolo_any: str) -> int:
+    sym = _resolver_simbolo_perp(exchange, simbolo_any)
+    return len(_fetch_open_orders_ccxt_list(exchange, sym))
+
+
+def _quantidade_ordem_aberta_ccxt(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    o: dict[str, Any],
+) -> float:
+    """Quantidade em aberto (prioriza `remaining` CCXT, fallback Binance `origQty`)."""
+    raw_amt: float | None = None
+    rem = o.get("remaining")
+    if rem is not None and str(rem).strip() != "":
+        try:
+            r = float(rem)
+            if r > 0:
+                raw_amt = r
+        except (TypeError, ValueError):
+            pass
+    if raw_amt is None:
+        info = o.get("info") or {}
+        for k in ("origQty", "quantity", "q", "positionAmt"):
+            v = info.get(k)
+            if v is not None and str(v).strip() != "":
+                try:
+                    raw_amt = float(v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+    if raw_amt is None:
+        v2 = o.get("amount")
+        if v2 is not None and str(v2).strip() != "":
+            try:
+                raw_amt = float(v2)
+            except (TypeError, ValueError):
+                raw_amt = 0.0
+    if raw_amt is None or raw_amt <= 0:
+        return 0.0
+    return float(exchange.amount_to_precision(simbolo_ccxt, float(raw_amt)))
+
+
+def _buscar_take_profit_market_parcial_aberto(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    direcao: str,
+) -> dict[str, Any] | None:
+    """TP parcial Free Runner (TAKE_PROFIT_MARKET reduce-only, lado de fecho)."""
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return None
+    need_side = "sell" if d == "LONG" else "buy"
+    for o in _fetch_open_orders_ccxt_list(exchange, simbolo_ccxt):
+        if not _order_reduce_only_flag(o):
+            continue
+        if _order_type_norm(o) != "TAKE_PROFIT_MARKET":
+            continue
+        if str(o.get("side") or "").lower() != need_side:
+            continue
+        return o
+    return None
+
+
+def _obter_mark_price_futures(exchange: ccxt.binance, simbolo_ccxt: str) -> float:
+    """Mark ou last do ticker (Futures); 0.0 se indisponível."""
+    try:
+        t = exchange.fetch_ticker(simbolo_ccxt)
+        info = t.get("info") or {}
+        for k in ("markPrice", "p"):
+            raw = info.get(k)
+            if raw is not None and str(raw).strip() != "":
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+        mk = t.get("mark")
+        if mk is not None:
+            try:
+                v = float(mk)
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        for k in ("last", "close"):
+            raw = t.get(k)
+            if raw is not None:
+                try:
+                    v = float(raw)
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+    except ccxt.BaseError:
+        pass
+    return 0.0
+
+
+def cancelar_ordens_condicionais_protecao(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> int:
+    """
+    Cancela ordens condicionais reduce-only de protecção (SL/TP/trailing) no par.
+    Usar **antes** de recriar brackets — complementa o nuke global (alguns estados da API
+    podem atrasar ordens condicionais no livro).
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    n = 0
+    for pass_i in range(2):
+        try:
+            rows = ex.fetch_open_orders(sym)
+        except ccxt.BaseError as e:
+            print(f"{_TAG} cancelar_ordens_condicionais_protecao fetch: {e}", file=sys.stderr)
+            return n
+        for o in rows:
+            if not _order_reduce_only_flag(o):
+                continue
+            typ = _order_type_norm(o)
+            if typ not in _FUTURES_PROTECTIVE_ORDER_TYPES:
+                continue
+            oid = o.get("id")
+            if oid is None:
+                continue
+            try:
+                ex.cancel_order(oid, sym)
+                n += 1
+            except ccxt.BaseError as ec:
+                print(f"{_TAG} cancel condicional {typ} id={oid}: {ec}", file=sys.stderr)
+        if pass_i == 0 and n:
+            time.sleep(float(PROTECTION_PRE_CREATE_CANCEL_SLEEP_S))
+    if n:
+        print(
+            f"{_TAG} cancelar_ordens_condicionais_protecao({sym}): {n} ordem(ns) "
+            "STOP/TP/TRAILING reduce-only cancelada(s).",
+            flush=True,
+        )
+    return n
 
 
 def _protective_stop_and_tp_present(
@@ -199,6 +896,7 @@ def check_and_verify_protective_orders(
         trailing_activation_multiplier=float(trailing_activation_multiplier),
         source_tag="ORDER_GUARD",
         sl_break_even=bool(sl_break_even),
+        force_replace=True,
     )
 
 
@@ -838,6 +1536,17 @@ def _entrar_limite_com_chase_futuros(
         )
         print(f"[DEBUG] Spread: {ask - bid:.4f} | Alvo Maker: {preco_limite:.4f}")
 
+        if reduce_only:
+            d_ro = "LONG" if str(side).lower() == "sell" else "SHORT"
+            if not _assert_seguranca_antes_create_ordem_protecao(
+                ex,
+                simbolo,
+                d_ro,
+                context=f"chase_LIMIT_reduce {nome_lado} r{rnd}",
+                allow_other_open_orders=True,
+            ):
+                raise RuntimeError(f"{_TAG} chase reduce-only bloqueado por anti-spam ({nome_lado} r{rnd}).")
+
         try:
             order = ex.create_order(
                 simbolo,
@@ -919,6 +1628,18 @@ def _entrar_limite_com_chase_futuros(
                     f"{_TAG} ⚠️ Rejeição Post-Only; retry com {tick_steps} ticks "
                     f"({preco_limite} -> {preco_aj})."
                 )
+                if reduce_only:
+                    d_ro2 = "LONG" if str(side).lower() == "sell" else "SHORT"
+                    if not _assert_seguranca_antes_create_ordem_protecao(
+                        ex,
+                        simbolo,
+                        d_ro2,
+                        context=f"chase_LIMIT_reduce_retry {nome_lado} r{rnd}",
+                        allow_other_open_orders=True,
+                    ):
+                        raise RuntimeError(
+                            f"{_TAG} chase reduce-only retry bloqueado por anti-spam ({nome_lado} r{rnd})."
+                        )
                 order = ex.create_order(
                     simbolo,
                     "limit",
@@ -1222,12 +1943,21 @@ def assegurar_brackets_apos_reconciliacao(
     trailing_activation_multiplier: float | None = None,
     source_tag: str | None = None,
     sl_break_even: bool = False,
+    force_replace: bool = True,
 ) -> None:
     """
-    Após detetar posição na Binance sem estado completo no maestro: remove TP/SL reduce-only
-    antigos e recria SL dinâmico (N× trailing) + TRAILING_STOP (modo vigia na bolsa).
+    Após detetar posição na Binance sem estado completo no maestro: cancela **só**
+    STOP_MARKET / TRAILING_STOP_MARKET reduce-only (via `fetch_open_orders` + `cancel_order`),
+    preservando TAKE_PROFIT_MARKET e ordens LIMIT; valida livro limpo antes de recriar
+    SL dinâmico + TRAILING_STOP (modo vigia na bolsa).
     Se `sl_break_even=True`, o STOP_MARKET de protecção fica no preço de entrada (risco zero).
+
+    `force_replace=True` (default): sempre cancela e recria (recon, ORDER_GUARD, híbrido).
+    `force_replace=False`: ignora chamadas repetidas com a mesma assinatura dentro de
+    `BRACKET_REPLACE_DEBOUNCE_S`; se a assinatura mudar dentro da janela, exige movimento de mark
+    ≥ `BRACKET_REPLACE_MIN_FAVORABLE_PRICE_MOVE` a favor da posição (anti-spam API).
     """
+    global _bracket_last_mono_by_sym, _bracket_last_sig_by_sym, _bracket_last_anchor_mark_by_sym
     d = str(direcao).strip().upper()
     sym = _resolver_simbolo_perp(exchange, simbolo)
     q = abs(float(qty_contratos))
@@ -1245,16 +1975,66 @@ def assegurar_brackets_apos_reconciliacao(
         else float(TRAILING_ACTIVATION_MULTIPLIER)
     )
 
-    print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
-    # Nuke estrito: cancelar tudo no símbolo (endpoint nativo futures), depois validar zero abertas.
-    cancelar_todas_ordens_futures_nativo(simbolo, exchange)
-    ordens_restantes = obter_ordens_abertas_futures_nativo(simbolo, exchange)
-    if len(ordens_restantes) > 0:
-        print(
-            f"{_TAG} [ERRO] Falha ao limpar ordens antigas. Abortando criação de brackets para evitar spam.",
-            file=sys.stderr,
-        )
-        return
+    sig = (round(cb_rate, 9), round(act_mult, 9), bool(sl_break_even))
+    now_m = time.monotonic()
+    if not force_replace:
+        prev_sig = _bracket_last_sig_by_sym.get(sym)
+        last_t = _bracket_last_mono_by_sym.get(sym, 0.0)
+        if prev_sig == sig and (now_m - last_t) < float(BRACKET_REPLACE_DEBOUNCE_S):
+            print(
+                f"{_TAG} assegurar_brackets: debounce {BRACKET_REPLACE_DEBOUNCE_S:.0f}s "
+                f"(mesma assinatura callback/mult/BE) — skip [{source_tag or '—'}].",
+                flush=True,
+            )
+            return
+        if (
+            prev_sig is not None
+            and prev_sig != sig
+            and (now_m - last_t) < float(BRACKET_REPLACE_DEBOUNCE_S)
+        ):
+            mark_now = _obter_mark_price_futures(exchange, sym)
+            anchor = _bracket_last_anchor_mark_by_sym.get(sym, 0.0)
+            thr = float(BRACKET_REPLACE_MIN_FAVORABLE_PRICE_MOVE)
+            if anchor > 0 and mark_now > 0 and thr > 0:
+                if d == "LONG":
+                    if mark_now < anchor * (1.0 + thr):
+                        print(
+                            f"{_TAG} assegurar_brackets: mark ainda não subiu ≥{thr:.2%} vs último "
+                            f"sucesso — skip retune [{source_tag or '—'}].",
+                            flush=True,
+                        )
+                        return
+                elif d == "SHORT":
+                    if mark_now > anchor * (1.0 - thr):
+                        print(
+                            f"{_TAG} assegurar_brackets: mark ainda não desceu ≥{thr:.2%} vs último "
+                            f"sucesso — skip retune [{source_tag or '—'}].",
+                            flush=True,
+                        )
+                        return
+
+    print(
+        f"{_TAG} assegurar_brackets [{source_tag or '—'}]: reconciliar proteções "
+        "(limpeza total + recriação síncrona em `_criar_bracket_*`).",
+        flush=True,
+    )
+    _assert_posicao_aberta_para_protecao_sync(
+        exchange, simbolo, d, context=f"assegurar[{source_tag or '—'}]_pre_create"
+    )
+    atr_risk: float | None = None
+    if RISK_ATR_MODE:
+        atr_risk = calcular_atr_absoluto(exchange, sym)
+        if atr_risk is not None:
+            print(
+                f"{_TAG} [RISK-ATR] assegurar_brackets [{source_tag or '—'}]: ATR14={atr_risk:.6f} "
+                f"tf={AURIC_ATR_TIMEFRAME} n={AURIC_ATR_PERIOD}",
+                flush=True,
+            )
+        elif atr_risk is None:
+            print(
+                f"{_TAG} [RISK-ATR] ATR indisponível — a usar brackets em percentagem (legado).",
+                flush=True,
+            )
     if d == "LONG":
         _criar_bracket_long(
             exchange,
@@ -1264,6 +2044,7 @@ def assegurar_brackets_apos_reconciliacao(
             trailing_callback_rate=cb_rate,
             trailing_activation_multiplier=act_mult,
             sl_break_even=sl_break_even,
+            risk_atr_abs=atr_risk,
         )
     elif d == "SHORT":
         _criar_bracket_short(
@@ -1274,9 +2055,16 @@ def assegurar_brackets_apos_reconciliacao(
             trailing_callback_rate=cb_rate,
             trailing_activation_multiplier=act_mult,
             sl_break_even=sl_break_even,
+            risk_atr_abs=atr_risk,
         )
     else:
         raise ValueError(f"{_TAG} direcao inválida: {d!r}")
+    mark_done = _obter_mark_price_futures(exchange, sym)
+    if mark_done > 0:
+        _bracket_last_anchor_mark_by_sym[sym] = mark_done
+    _bracket_last_mono_by_sym[sym] = time.monotonic()
+    _bracket_last_sig_by_sym[sym] = sig
+
     if source_tag:
         print(
             f"{_TAG} [{source_tag}] Brackets reconciliados com callbackRate="
@@ -1324,6 +2112,57 @@ def _stop_price_break_even_exato(
     return float(exchange.price_to_precision(simbolo, pe))
 
 
+def calcular_atr_absoluto(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    *,
+    timeframe: str | None = None,
+    period: int | None = None,
+) -> float | None:
+    """
+    ATR (Wilder) em preço absoluto sobre `timeframe` (default `AURIC_ATR_TIMEFRAME`).
+    Devolve None se dados insuficientes ou erro de API.
+    """
+    tf = (timeframe or AURIC_ATR_TIMEFRAME).strip() or "15m"
+    n = int(period) if period is not None else int(AURIC_ATR_PERIOD)
+    n = max(2, n)
+    lim = max(n + 5, 80)
+    try:
+        exchange.load_markets()
+        ohlcv = exchange.fetch_ohlcv(simbolo_ccxt, timeframe=tf, limit=lim)
+    except ccxt.BaseError as e:
+        print(f"{_TAG} calcular_atr_absoluto fetch_ohlcv: {e}", file=sys.stderr)
+        return None
+    if not ohlcv or len(ohlcv) < n + 1:
+        return None
+    highs = [float(c[2]) for c in ohlcv]
+    lows = [float(c[3]) for c in ohlcv]
+    closes = [float(c[4]) for c in ohlcv]
+    if len(highs) < n + 1:
+        return None
+    trs: list[float] = []
+    for i in range(1, len(closes)):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < n:
+        return None
+    atr = sum(trs[:n]) / float(n)
+    for tr in trs[n:]:
+        atr = (atr * float(n - 1) + float(tr)) / float(n)
+    return float(atr) if atr > 0 else None
+
+
+def _callback_rate_pct_from_atr(atr: float, ref_price: float) -> float:
+    """
+    Converte ~1×ATR de recuo desde o máximo pós-ativação num `callbackRate` % (Binance TRAILING_STOP_MARKET).
+    Limites típicos Binance: 0,1%–5%.
+    """
+    px = max(float(ref_price), 1e-12)
+    a = max(float(atr), 0.0) * float(RISK_ATR_TRAIL_CALLBACK_FRAC)
+    raw_pct = 100.0 * a / px
+    return max(0.1, min(5.0, round(raw_pct, 2)))
+
+
 def _criar_bracket_long(
     exchange: ccxt.binance,
     simbolo: str,
@@ -1333,12 +2172,51 @@ def _criar_bracket_long(
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
     sl_break_even: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    risk_atr_abs: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """
     Bracket LONG na Binance Futures linear:
     - STOP_MARKET (SL inicial = SL_DISTANCE_VS_TRAILING_MULT × trailing %, ou break-even)
     - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
+
+    Se `risk_atr_abs` > 0 (modo ATR): SL a `RISK_ATR_SL_MULT`×ATR abaixo da entrada; ativação do
+    trailing a `RISK_ATR_TRAIL_ACTIV_MULT`×ATR acima; `callbackRate` ≈ 1×ATR em % do preço (rede
+    ~1 ATR abaixo do máximo pós-ativação). Com Free Runner: TAKE_PROFIT_MARKET em
+    `RISK_ATR_TP_REF_MULT`×ATR sobre `AURIC_PARTIAL_TP_PCT` da posição; runner com SL+trailing.
+
+    Devolve (ord_trailing, ord_sl, ord_tp_parcial) — o terceiro dict pode estar vazio.
     """
+    global _in_protection_order_batch
+    cancelar_livro_aberto_ate_zero_sync(
+        exchange, simbolo, context="bracket_LONG(pré)"
+    )
+    _in_protection_order_batch = True
+    try:
+        return _criar_bracket_long_impl(
+            exchange,
+            simbolo,
+            qty,
+            preco_entrada,
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+            sl_break_even=sl_break_even,
+            risk_atr_abs=risk_atr_abs,
+        )
+    finally:
+        _in_protection_order_batch = False
+
+
+def _criar_bracket_long_impl(
+    exchange: ccxt.binance,
+    simbolo: str,
+    qty: float,
+    preco_entrada: float,
+    *,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
+    sl_break_even: bool = False,
+    risk_atr_abs: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     q = float(exchange.amount_to_precision(simbolo, qty))
     cb_rate = (
         float(trailing_callback_rate)
@@ -1354,6 +2232,10 @@ def _criar_bracket_long(
         cb_rate = float(TRAILING_CALLBACK_RATE)
     if act_mult <= 0:
         act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
+
+    atr_use = float(risk_atr_abs) if risk_atr_abs is not None and float(risk_atr_abs) > 0 else None
+    pe = float(preco_entrada)
+    tp_ref_audit: float | None = None
 
     if sl_break_even:
         tp_raw = float(preco_entrada)
@@ -1365,6 +2247,18 @@ def _criar_bracket_long(
         )
         sl_frac = 0.0
         act_txt = "break-even (entrada)"
+        if atr_use is not None:
+            cb_rate = _callback_rate_pct_from_atr(atr_use, pe)
+    elif atr_use is not None:
+        sl_raw = pe - float(RISK_ATR_SL_MULT) * atr_use
+        tp_raw = pe + float(RISK_ATR_TRAIL_ACTIV_MULT) * atr_use
+        tp_ref_audit = pe + float(RISK_ATR_TP_REF_MULT) * atr_use
+        cb_rate = _callback_rate_pct_from_atr(atr_use, pe)
+        sl_frac = max(0.0, (pe - sl_raw) / max(pe, 1e-12))
+        act_txt = (
+            f"+{RISK_ATR_TRAIL_ACTIV_MULT:g}×ATR (ativa trailing); "
+            f"TP_ref_audit +{RISK_ATR_TP_REF_MULT:g}×ATR"
+        )
     else:
         tp_raw = preco_entrada * (1.0 + (LONG_TP * act_mult))  # activationPrice do trailing
         sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
@@ -1374,11 +2268,85 @@ def _criar_bracket_long(
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
     p_ro = _params_reduce_futures()
+    ord_tp_partial: dict[str, Any] = {}
+    q_work = q
+
+    if (
+        (not sl_break_even)
+        and atr_use is not None
+        and FREE_RUNNER_ATR_ENABLED
+        and tp_ref_audit is not None
+    ):
+        ex_tp = _buscar_take_profit_market_parcial_aberto(exchange, simbolo, "LONG")
+        reuse_tp = False
+        if ex_tp is not None:
+            q_tp_re = float(_quantidade_ordem_aberta_ccxt(exchange, simbolo, ex_tp))
+            q_runner_re = float(exchange.amount_to_precision(simbolo, max(0.0, q - q_tp_re)))
+            mkt = exchange.market(simbolo)
+            min_amt = float(((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+            ok_sz = q_tp_re > 0 and q_runner_re > 0
+            if ok_sz and min_amt > 0:
+                if q_tp_re + 1e-12 < min_amt or q_runner_re + 1e-12 < min_amt:
+                    ok_sz = False
+            if ok_sz:
+                q_tp, q_runner, split_ok = q_tp_re, q_runner_re, True
+                reuse_tp = True
+            else:
+                q_tp, q_runner, split_ok = _free_runner_split_qty(
+                    exchange, simbolo, q, float(AURIC_PARTIAL_TP_PCT)
+                )
+        else:
+            q_tp, q_runner, split_ok = _free_runner_split_qty(
+                exchange, simbolo, q, float(AURIC_PARTIAL_TP_PCT)
+            )
+        if split_ok:
+            q_work = float(exchange.amount_to_precision(simbolo, q_runner))
+            tp_market_p = float(exchange.price_to_precision(simbolo, float(tp_ref_audit)))
+            if reuse_tp:
+                ord_tp_partial = ex_tp
+                print(
+                    f"{_TAG} [FREE RUNNER] TP parcial já na bolsa id={ord_tp_partial.get('id')} "
+                    f"qty≈{q_tp:g} — sem duplicar; trailing+SL só no runner {q_work:g}.",
+                    flush=True,
+                )
+            else:
+                if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TP_PARTIAL"):
+                    return {}, {}, ord_tp_partial
+                if not _assert_seguranca_antes_create_ordem_protecao(
+                    exchange, simbolo, "LONG", context="bracket_LONG TP_PARTIAL"
+                ):
+                    return {}, {}, ord_tp_partial
+                ord_tp_partial = exchange.create_order(
+                    simbolo,
+                    "TAKE_PROFIT_MARKET",
+                    "sell",
+                    float(exchange.amount_to_precision(simbolo, q_tp)),
+                    None,
+                    {**p_ro, "stopPrice": tp_market_p},
+                )
+                _marcar_criacao_ordem_protecao()
+                _sleep_apos_criar_ordem_protecao()
+                print(
+                    f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
+                    flush=True,
+                )
+            print(
+                f"{_TAG} [FREE RUNNER] LONG qty total={q:g} → TP={q_tp:g} + runner={q_work:g} | "
+                f"TAKE_PROFIT_MARKET id={ord_tp_partial.get('id')}",
+                flush=True,
+            )
+
+    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TRAILING"):
+        return {}, {}, ord_tp_partial
+    if not _assert_seguranca_antes_create_ordem_protecao(
+        exchange, simbolo, "LONG", context="bracket_LONG TRAILING"
+    ):
+        return {}, {}, ord_tp_partial
     ord_trailing = exchange.create_order(
         simbolo,
         "TRAILING_STOP_MARKET",
         "sell",
-        q,
+        q_work,
         None,
         {
             **p_ro,
@@ -1386,28 +2354,60 @@ def _criar_bracket_long(
             "callbackRate": cb_rate,
         },
     )
+    _marcar_criacao_ordem_protecao()
+    _sleep_apos_criar_ordem_protecao()
+    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG STOP_MARKET"):
+        return ord_trailing, {}, ord_tp_partial
+    if not _assert_seguranca_antes_create_ordem_protecao(
+        exchange, simbolo, "LONG", context="bracket_LONG STOP_MARKET"
+    ):
+        return ord_trailing, {}, ord_tp_partial
     ord_sl = exchange.create_order(
         simbolo,
         "STOP_MARKET",
         "sell",
-        q,
+        q_work,
         None,
         {**p_ro, "stopPrice": sl_p},
     )
+    _marcar_criacao_ordem_protecao()
+    _sleep_apos_criar_ordem_protecao()
     if sl_break_even:
         print(
             f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (BREAK-EVEN entrada) + "
             f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / {act_txt}, "
-            f"callbackRate={cb_rate:.1f}%), qty={q}"
+            f"callbackRate={cb_rate:.1f}%), qty={q_work}"
+        )
+        if atr_use is not None:
+            print(
+                f"{_TAG} [RISK-ATR] LONG break-even+trail: ATR14≈{atr_use:.6f} | "
+                f"trail_cb%≈1×ATR/px → {cb_rate:.2f}% (auditoria respiro trailing).",
+                flush=True,
+            )
+    elif atr_use is not None:
+        tpref = (
+            float(exchange.price_to_precision(simbolo, float(tp_ref_audit)))
+            if tp_ref_audit is not None
+            else None
+        )
+        rr = RISK_ATR_TP_REF_MULT / max(RISK_ATR_SL_MULT, 1e-9)
+        print(
+            f"{_TAG} [RISK-ATR] LONG brackets: ATR14={atr_use:.6f} (tf={AURIC_ATR_TIMEFRAME}, n={AURIC_ATR_PERIOD}) | "
+            f"SL_dist={RISK_ATR_SL_MULT:g}×ATR={RISK_ATR_SL_MULT * atr_use:.6f} → SL@{sl_p} | "
+            f"ativação_trail={RISK_ATR_TRAIL_ACTIV_MULT:g}×ATR @ {tp_p} | "
+            f"TP_ref_audit {RISK_ATR_TP_REF_MULT:g}×ATR → {tpref if tpref is not None else 'N/A'} | "
+            f"R/R_ref≈1:{rr:.2f} (TP_ref/SL_dist em ATR) | "
+            f"callbackRate={cb_rate:.2f}% (~1×ATR recuo desde máximo) | qty_runner={q_work}",
+            flush=True,
         )
     else:
         print(
             f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (−{sl_frac:.3%} = "
             f"{SL_DISTANCE_VS_TRAILING_MULT:g}× trailing {cb_rate:.3f}%) + "
             f"TRAILING_STOP_MARKET sell (activation @ {tp_p} / {act_txt}, "
-            f"callbackRate={cb_rate:.1f}%), qty={q}"
+            f"callbackRate={cb_rate:.1f}%), qty={q_work}"
         )
-    return ord_trailing, ord_sl
+    return ord_trailing, ord_sl, ord_tp_partial
 
 
 def _criar_bracket_short(
@@ -1419,12 +2419,49 @@ def _criar_bracket_short(
     trailing_callback_rate: float | None = None,
     trailing_activation_multiplier: float | None = None,
     sl_break_even: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    risk_atr_abs: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """
     Bracket SHORT na Binance Futures linear:
     - STOP_MARKET (SL inicial = SL_DISTANCE_VS_TRAILING_MULT × trailing %, ou break-even)
     - TRAILING_STOP_MARKET (take-profit dinâmico; ativa no antigo gatilho de TP)
+
+    Modo ATR (`risk_atr_abs`): espelho do LONG (SL acima, ativação trailing abaixo da entrada).
+    Free Runner: TAKE_PROFIT_MARKET (buy) na fração parcial ao preço entrada − 2,5×ATR.
+
+    Devolve (ord_trailing, ord_sl, ord_tp_parcial).
     """
+    global _in_protection_order_batch
+    cancelar_livro_aberto_ate_zero_sync(
+        exchange, simbolo, context="bracket_SHORT(pré)"
+    )
+    _in_protection_order_batch = True
+    try:
+        return _criar_bracket_short_impl(
+            exchange,
+            simbolo,
+            qty,
+            preco_entrada,
+            trailing_callback_rate=trailing_callback_rate,
+            trailing_activation_multiplier=trailing_activation_multiplier,
+            sl_break_even=sl_break_even,
+            risk_atr_abs=risk_atr_abs,
+        )
+    finally:
+        _in_protection_order_batch = False
+
+
+def _criar_bracket_short_impl(
+    exchange: ccxt.binance,
+    simbolo: str,
+    qty: float,
+    preco_entrada: float,
+    *,
+    trailing_callback_rate: float | None = None,
+    trailing_activation_multiplier: float | None = None,
+    sl_break_even: bool = False,
+    risk_atr_abs: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     q = float(exchange.amount_to_precision(simbolo, qty))
     cb_rate = (
         float(trailing_callback_rate)
@@ -1441,6 +2478,10 @@ def _criar_bracket_short(
     if act_mult <= 0:
         act_mult = float(TRAILING_ACTIVATION_MULTIPLIER)
 
+    atr_use = float(risk_atr_abs) if risk_atr_abs is not None and float(risk_atr_abs) > 0 else None
+    pe = float(preco_entrada)
+    tp_ref_audit: float | None = None
+
     if sl_break_even:
         tp_raw = float(preco_entrada)
         sl_raw = _stop_price_break_even_exato(
@@ -1451,6 +2492,18 @@ def _criar_bracket_short(
         )
         sl_frac = 0.0
         act_txt = "break-even (entrada)"
+        if atr_use is not None:
+            cb_rate = _callback_rate_pct_from_atr(atr_use, pe)
+    elif atr_use is not None:
+        sl_raw = pe + float(RISK_ATR_SL_MULT) * atr_use
+        tp_raw = pe - float(RISK_ATR_TRAIL_ACTIV_MULT) * atr_use
+        tp_ref_audit = pe - float(RISK_ATR_TP_REF_MULT) * atr_use
+        cb_rate = _callback_rate_pct_from_atr(atr_use, pe)
+        sl_frac = max(0.0, (sl_raw - pe) / max(pe, 1e-12))
+        act_txt = (
+            f"−{RISK_ATR_TRAIL_ACTIV_MULT:g}×ATR (ativa trailing); "
+            f"TP_ref_audit −{RISK_ATR_TP_REF_MULT:g}×ATR"
+        )
     else:
         tp_raw = preco_entrada * (1.0 - (SHORT_TP * act_mult))  # activationPrice do trailing
         sl_frac = _sl_frac_from_trailing_callback_pct(cb_rate)
@@ -1460,11 +2513,85 @@ def _criar_bracket_short(
     sl_p = float(exchange.price_to_precision(simbolo, sl_raw))
 
     p_ro = _params_reduce_futures()
+    ord_tp_partial: dict[str, Any] = {}
+    q_work = q
+
+    if (
+        (not sl_break_even)
+        and atr_use is not None
+        and FREE_RUNNER_ATR_ENABLED
+        and tp_ref_audit is not None
+    ):
+        ex_tp = _buscar_take_profit_market_parcial_aberto(exchange, simbolo, "SHORT")
+        reuse_tp = False
+        if ex_tp is not None:
+            q_tp_re = float(_quantidade_ordem_aberta_ccxt(exchange, simbolo, ex_tp))
+            q_runner_re = float(exchange.amount_to_precision(simbolo, max(0.0, q - q_tp_re)))
+            mkt = exchange.market(simbolo)
+            min_amt = float(((mkt.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
+            ok_sz = q_tp_re > 0 and q_runner_re > 0
+            if ok_sz and min_amt > 0:
+                if q_tp_re + 1e-12 < min_amt or q_runner_re + 1e-12 < min_amt:
+                    ok_sz = False
+            if ok_sz:
+                q_tp, q_runner, split_ok = q_tp_re, q_runner_re, True
+                reuse_tp = True
+            else:
+                q_tp, q_runner, split_ok = _free_runner_split_qty(
+                    exchange, simbolo, q, float(AURIC_PARTIAL_TP_PCT)
+                )
+        else:
+            q_tp, q_runner, split_ok = _free_runner_split_qty(
+                exchange, simbolo, q, float(AURIC_PARTIAL_TP_PCT)
+            )
+        if split_ok:
+            q_work = float(exchange.amount_to_precision(simbolo, q_runner))
+            tp_market_p = float(exchange.price_to_precision(simbolo, float(tp_ref_audit)))
+            if reuse_tp:
+                ord_tp_partial = ex_tp
+                print(
+                    f"{_TAG} [FREE RUNNER] TP parcial já na bolsa id={ord_tp_partial.get('id')} "
+                    f"qty≈{q_tp:g} — sem duplicar; trailing+SL só no runner {q_work:g}.",
+                    flush=True,
+                )
+            else:
+                if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TP_PARTIAL"):
+                    return {}, {}, ord_tp_partial
+                if not _assert_seguranca_antes_create_ordem_protecao(
+                    exchange, simbolo, "SHORT", context="bracket_SHORT TP_PARTIAL"
+                ):
+                    return {}, {}, ord_tp_partial
+                ord_tp_partial = exchange.create_order(
+                    simbolo,
+                    "TAKE_PROFIT_MARKET",
+                    "buy",
+                    float(exchange.amount_to_precision(simbolo, q_tp)),
+                    None,
+                    {**p_ro, "stopPrice": tp_market_p},
+                )
+                _marcar_criacao_ordem_protecao()
+                _sleep_apos_criar_ordem_protecao()
+                print(
+                    f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
+                    flush=True,
+                )
+            print(
+                f"{_TAG} [FREE RUNNER] SHORT qty total={q:g} → TP={q_tp:g} + runner={q_work:g} | "
+                f"TAKE_PROFIT_MARKET id={ord_tp_partial.get('id')}",
+                flush=True,
+            )
+
+    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TRAILING"):
+        return {}, {}, ord_tp_partial
+    if not _assert_seguranca_antes_create_ordem_protecao(
+        exchange, simbolo, "SHORT", context="bracket_SHORT TRAILING"
+    ):
+        return {}, {}, ord_tp_partial
     ord_trailing = exchange.create_order(
         simbolo,
         "TRAILING_STOP_MARKET",
         "buy",
-        q,
+        q_work,
         None,
         {
             **p_ro,
@@ -1472,28 +2599,60 @@ def _criar_bracket_short(
             "callbackRate": cb_rate,
         },
     )
+    _marcar_criacao_ordem_protecao()
+    _sleep_apos_criar_ordem_protecao()
+    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT STOP_MARKET"):
+        return ord_trailing, {}, ord_tp_partial
+    if not _assert_seguranca_antes_create_ordem_protecao(
+        exchange, simbolo, "SHORT", context="bracket_SHORT STOP_MARKET"
+    ):
+        return ord_trailing, {}, ord_tp_partial
     ord_sl = exchange.create_order(
         simbolo,
         "STOP_MARKET",
         "buy",
-        q,
+        q_work,
         None,
         {**p_ro, "stopPrice": sl_p},
     )
+    _marcar_criacao_ordem_protecao()
+    _sleep_apos_criar_ordem_protecao()
     if sl_break_even:
         print(
             f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (BREAK-EVEN entrada) + "
             f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / {act_txt}, "
-            f"callbackRate={cb_rate:.1f}%), qty={q}"
+            f"callbackRate={cb_rate:.1f}%), qty={q_work}"
+        )
+        if atr_use is not None:
+            print(
+                f"{_TAG} [RISK-ATR] SHORT break-even+trail: ATR14≈{atr_use:.6f} | "
+                f"trail_cb%≈1×ATR/px → {cb_rate:.2f}% (auditoria respiro trailing).",
+                flush=True,
+            )
+    elif atr_use is not None:
+        tpref = (
+            float(exchange.price_to_precision(simbolo, float(tp_ref_audit)))
+            if tp_ref_audit is not None
+            else None
+        )
+        rr = RISK_ATR_TP_REF_MULT / max(RISK_ATR_SL_MULT, 1e-9)
+        print(
+            f"{_TAG} [RISK-ATR] SHORT brackets: ATR14={atr_use:.6f} (tf={AURIC_ATR_TIMEFRAME}, n={AURIC_ATR_PERIOD}) | "
+            f"SL_dist={RISK_ATR_SL_MULT:g}×ATR={RISK_ATR_SL_MULT * atr_use:.6f} → SL@{sl_p} | "
+            f"ativação_trail={RISK_ATR_TRAIL_ACTIV_MULT:g}×ATR @ {tp_p} | "
+            f"TP_ref_audit {RISK_ATR_TP_REF_MULT:g}×ATR → {tpref if tpref is not None else 'N/A'} | "
+            f"R/R_ref≈1:{rr:.2f} (TP_ref/SL_dist em ATR) | "
+            f"callbackRate={cb_rate:.2f}% (~1×ATR recuo desde mínimo) | qty_runner={q_work}",
+            flush=True,
         )
     else:
         print(
             f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (+{sl_frac:.3%} = "
             f"{SL_DISTANCE_VS_TRAILING_MULT:g}× trailing {cb_rate:.3f}%) + "
             f"TRAILING_STOP_MARKET buy (activation @ {tp_p} / {act_txt}, "
-            f"callbackRate={cb_rate:.1f}%), qty={q}"
+            f"callbackRate={cb_rate:.1f}%), qty={q_work}"
         )
-    return ord_trailing, ord_sl
+    return ord_trailing, ord_sl, ord_tp_partial
 
 
 def _quote_de_balance_unificado(bal: dict[str, Any]) -> float:
@@ -1547,46 +2706,54 @@ def abrir_long_market(
     após ~CHASE_ENTRADA_TIMEOUT_S sem fill suficiente, reabre no novo livro (sem GTC pendurado).
     Notional = risk_fraction×saldo_margem×alav (fallback PERCENTUAL_BANCA); depois bracket (SL + trailing).
     """
-    ex = exchange or criar_exchange_binance()
-    sym = _resolver_simbolo_perp(ex, simbolo)
-    snap_pre = consultar_posicao_futures(simbolo, ex)
-    if bool(snap_pre.get("posicao_aberta")):
-        qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
-        side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
-        raise RuntimeError(
-            f"{_TAG} Entrada LONG abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+    lock_ctx = _adquirir_lock_entrada(simbolo)
+    if lock_ctx == ("", ""):
+        key = _order_lock_key(simbolo)
+        print(
+            f"{_TAG} [LOCK] Entrada LONG ignorada: lock ativo em `{key}` (TTL {ORDER_LOCK_TTL_S:.0f}s).",
+            flush=True,
         )
-    lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
-    if notional_usdt_override is not None:
-        quantidade_usd = float(notional_usdt_override)
-        rf_used = None
-    else:
-        quantidade_usd = notional_usdt_futuros_position_sizing(
-            ex, lev, risk_fraction=risk_fraction
-        )
-        rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
-        if rf_used <= 0:
-            rf_used = float(PERCENTUAL_BANCA)
-    if quantidade_usd <= 0:
-        raise ValueError(
-            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
-        )
-    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
-    saldo_m = obter_saldo_usdt_margem(ex)
-    risk_txt = (
-        f"{rf_used * 100:.1f}% margem USDC"
-        if rf_used is not None
-        else "notional override (risk N/A)"
-    )
-
-    print(
-        f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDC "
-        f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
-        f"chase até "
-        f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_ENTRADA_MAX_ROUNDS)}×/"
-        f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_ENTRADA_TIMEOUT_S):.0f}s..."
-    )
+        return _ordem_skip_lock(simbolo)
     try:
+        ex = exchange or criar_exchange_binance()
+        sym = _resolver_simbolo_perp(ex, simbolo)
+        snap_pre = consultar_posicao_futures(simbolo, ex)
+        if bool(snap_pre.get("posicao_aberta")):
+            qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
+            side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
+            raise RuntimeError(
+                f"{_TAG} Entrada LONG abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+            )
+        lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
+        if notional_usdt_override is not None:
+            quantidade_usd = float(notional_usdt_override)
+            rf_used = None
+        else:
+            quantidade_usd = notional_usdt_futuros_position_sizing(
+                ex, lev, risk_fraction=risk_fraction
+            )
+            rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
+            if rf_used <= 0:
+                rf_used = float(PERCENTUAL_BANCA)
+        if quantidade_usd <= 0:
+            raise ValueError(
+                f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
+            )
+        amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
+        saldo_m = obter_saldo_usdt_margem(ex)
+        risk_txt = (
+            f"{rf_used * 100:.1f}% margem USDC"
+            if rf_used is not None
+            else "notional override (risk N/A)"
+        )
+
+        print(
+            f"{_TAG} Abrir LONG {sym} — notional ~{quantidade_usd:.2f} USDC "
+            f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
+            f"chase até "
+            f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_ENTRADA_MAX_ROUNDS)}×/"
+            f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_ENTRADA_TIMEOUT_S):.0f}s..."
+        )
         ordem = _entrar_limite_com_chase_futuros(
             ex,
             sym,
@@ -1604,25 +2771,38 @@ def abrir_long_market(
         _log_liquidacao_estimada(preco_ent, "LONG", lev)
         print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
         cancelar_todas_ordens_futures_nativo(simbolo, ex)
-        ord_trailing, ord_sl = _criar_bracket_long(
+        atr_abs = calcular_atr_absoluto(ex, sym) if RISK_ATR_MODE else None
+        if RISK_ATR_MODE and atr_abs is None:
+            print(f"{_TAG} [RISK-ATR] LONG: ATR indisponível — brackets em percentagem (legado).", flush=True)
+        ord_trailing, ord_sl, ord_tp_part = _criar_bracket_long(
             ex,
             sym,
             qty_pos,
             preco_ent,
             trailing_callback_rate=trailing_callback_rate,
             trailing_activation_multiplier=trailing_activation_multiplier,
+            risk_atr_abs=atr_abs,
         )
         out = dict(ordem)
         out["auric_take_profit"] = ord_trailing  # compat legado
         out["auric_trailing_stop"] = ord_trailing
         out["auric_stop_loss"] = ord_sl
+        out["auric_tp_partial"] = ord_tp_part
         out["auric_entry_qty"] = qty_pos
         out["auric_entry_price"] = preco_ent
+        if atr_abs is not None:
+            out["auric_atr_14"] = float(atr_abs)
+            out["auric_atr_timeframe"] = AURIC_ATR_TIMEFRAME
+        if ord_tp_part.get("id"):
+            out["auric_free_runner"] = True
+            armar_free_runner_tracking(simbolo, ex, float(qty_pos), float(preco_ent))
         return out
     except Exception as e:
         print(f"{_TAG} ❌ [BINANCE-ERROR] {e}", file=sys.stderr)
         print(f"{_TAG} Erro ao abrir long / bracket: {e}", file=sys.stderr)
         raise
+    finally:
+        _liberar_lock_entrada(lock_ctx)
 
 
 def abrir_short_market(
@@ -1642,47 +2822,55 @@ def abrir_short_market(
     Abre **short** com LIMIT IOC + chase: preço = ask × (1 − offset 0,05%), `price_to_precision`;
     mesmo fluxo que o long. Depois **reduce-only** STOP_MARKET (SL) e TRAILING_STOP_MARKET.
     """
-    ex = exchange or criar_exchange_binance()
-    sym = _resolver_simbolo_perp(ex, simbolo)
-    snap_pre = consultar_posicao_futures(simbolo, ex)
-    if bool(snap_pre.get("posicao_aberta")):
-        qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
-        side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
-        raise RuntimeError(
-            f"{_TAG} Entrada SHORT abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+    lock_ctx = _adquirir_lock_entrada(simbolo)
+    if lock_ctx == ("", ""):
+        key = _order_lock_key(simbolo)
+        print(
+            f"{_TAG} [LOCK] Entrada SHORT ignorada: lock ativo em `{key}` (TTL {ORDER_LOCK_TTL_S:.0f}s).",
+            flush=True,
         )
-    lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
-    if notional_usdt_override is not None:
-        quantidade_usd = float(notional_usdt_override)
-        rf_used = None
-    else:
-        quantidade_usd = notional_usdt_futuros_position_sizing(
-            ex, lev, risk_fraction=risk_fraction
-        )
-        rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
-        if rf_used <= 0:
-            rf_used = float(PERCENTUAL_BANCA)
-    if quantidade_usd <= 0:
-        raise ValueError(
-            f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
-        )
-    amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
-    saldo_m = obter_saldo_usdt_margem(ex)
-    risk_txt = (
-        f"{rf_used * 100:.1f}% margem USDC"
-        if rf_used is not None
-        else "notional override (risk N/A)"
-    )
-
-    print(
-        f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDC "
-        f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
-        f"chase SHORT "
-        f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_SHORT_MAX_ROUNDS)}×/"
-        f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_SHORT_TIMEOUT_S):.0f}s "
-        f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
-    )
+        return _ordem_skip_lock(simbolo)
     try:
+        ex = exchange or criar_exchange_binance()
+        sym = _resolver_simbolo_perp(ex, simbolo)
+        snap_pre = consultar_posicao_futures(simbolo, ex)
+        if bool(snap_pre.get("posicao_aberta")):
+            qty_pre = abs(float(snap_pre.get("contratos") or 0.0))
+            side_pre = str(snap_pre.get("direcao_posicao") or "LONG").upper()
+            raise RuntimeError(
+                f"{_TAG} Entrada SHORT abortada: já existe posição aberta ({side_pre}, qty={qty_pre:g}) em {sym}."
+            )
+        lev = float(alavancagem) if alavancagem is not None else float(ALAVANCAGEM_REF_LOG_PADRAO)
+        if notional_usdt_override is not None:
+            quantidade_usd = float(notional_usdt_override)
+            rf_used = None
+        else:
+            quantidade_usd = notional_usdt_futuros_position_sizing(
+                ex, lev, risk_fraction=risk_fraction
+            )
+            rf_used = float(risk_fraction) if risk_fraction is not None else float(PERCENTUAL_BANCA)
+            if rf_used <= 0:
+                rf_used = float(PERCENTUAL_BANCA)
+        if quantidade_usd <= 0:
+            raise ValueError(
+                f"{_TAG} Notional inválido ({quantidade_usd:.4f} USDC). Verifique saldo em margem."
+            )
+        amt = _quantidade_base_a_partir_de_usd(ex, sym, quantidade_usd)
+        saldo_m = obter_saldo_usdt_margem(ex)
+        risk_txt = (
+            f"{rf_used * 100:.1f}% margem USDC"
+            if rf_used is not None
+            else "notional override (risk N/A)"
+        )
+
+        print(
+            f"{_TAG} Abrir SHORT {sym} — notional ~{quantidade_usd:.2f} USDC "
+            f"({risk_txt} × {lev:g}x lev; saldo_margem≈{saldo_m:.4f}; qty base ≈ {amt}); "
+            f"chase SHORT "
+            f"{(TURBO_CHASE_MAX_ROUNDS if turbo_chase else CHASE_SHORT_MAX_ROUNDS)}×/"
+            f"{(TURBO_CHASE_TIMEOUT_S if turbo_chase else CHASE_SHORT_TIMEOUT_S):.0f}s "
+            f"(queda rápida — re-quote apertado; env: AURIC_CHASE_SHORT_*)..."
+        )
         ordem = _entrar_limite_com_chase_futuros(
             ex,
             sym,
@@ -1700,25 +2888,38 @@ def abrir_short_market(
         _log_liquidacao_estimada(preco_ent, "SHORT", lev)
         print("🧹 [ORDENS] Limpando stops antigos antes de atualizar...", flush=True)
         cancelar_todas_ordens_futures_nativo(simbolo, ex)
-        ord_trailing, ord_sl = _criar_bracket_short(
+        atr_abs = calcular_atr_absoluto(ex, sym) if RISK_ATR_MODE else None
+        if RISK_ATR_MODE and atr_abs is None:
+            print(f"{_TAG} [RISK-ATR] SHORT: ATR indisponível — brackets em percentagem (legado).", flush=True)
+        ord_trailing, ord_sl, ord_tp_part = _criar_bracket_short(
             ex,
             sym,
             qty_pos,
             preco_ent,
             trailing_callback_rate=trailing_callback_rate,
             trailing_activation_multiplier=trailing_activation_multiplier,
+            risk_atr_abs=atr_abs,
         )
         out = dict(ordem)
         out["auric_take_profit"] = ord_trailing  # compat legado
         out["auric_trailing_stop"] = ord_trailing
         out["auric_stop_loss"] = ord_sl
+        out["auric_tp_partial"] = ord_tp_part
         out["auric_entry_qty"] = qty_pos
         out["auric_entry_price"] = preco_ent
+        if atr_abs is not None:
+            out["auric_atr_14"] = float(atr_abs)
+            out["auric_atr_timeframe"] = AURIC_ATR_TIMEFRAME
+        if ord_tp_part.get("id"):
+            out["auric_free_runner"] = True
+            armar_free_runner_tracking(simbolo, ex, float(qty_pos), float(preco_ent))
         return out
     except Exception as e:
         print(f"{_TAG} ❌ [BINANCE-ERROR] {e}", file=sys.stderr)
         print(f"{_TAG} Erro ao abrir short / bracket: {e}", file=sys.stderr)
         raise
+    finally:
+        _liberar_lock_entrada(lock_ctx)
 
 
 def fechar_posicao_market(
@@ -1845,17 +3046,56 @@ def registrar_trade_performance_fecho(
     direcao: str,
     exit_type: str,
 ) -> None:
-    """Grava `final_roi` (% vs entrada) e `exit_type` na última linha `trades` do símbolo."""
+    """Grava `final_roi` + `exit_type` + `alpha_attribution` na última linha `trades`."""
     try:
         import logger
+        import json
 
         roi = _roi_fechamento_percentual(direcao, preco_entrada, preco_saida)
         motivo = str(exit_type)
+        alpha_attr: dict[str, Any] = {
+            "ml_confidence": 0.0,
+            "whale_signal": "neutral",
+            "indicator_primary": "RSI_Squeeze",
+        }
+        try:
+            entrada_ctx = logger.obter_contexto_ultima_abertura(simbolo)
+            p_ml_open = float(entrada_ctx.get("probabilidade_ml") or 0.0)
+            raw_ctx = str(entrada_ctx.get("contexto_raw") or "")
+            whale_score_open = 0.0
+            whale_signal_open = ""
+            if raw_ctx:
+                try:
+                    ctx_obj = json.loads(raw_ctx)
+                    if isinstance(ctx_obj, dict):
+                        whale_score_open = float(ctx_obj.get("whale_flow_score") or 0.0)
+                        whale_signal_open = str(ctx_obj.get("whale_flow_signal") or "")
+                except Exception:
+                    whale_score_open = 0.0
+            if float(roi) > 0 and p_ml_open >= 0.80:
+                alpha_attr["ml_confidence"] = 0.9
+                alpha_attr["indicator_primary"] = "XGBoost_Confidence"
+            if (
+                float(roi) > 0
+                and str(direcao).upper() == "SHORT"
+                and (whale_score_open < 0.0 or whale_signal_open == "USDT_LIQUIDITY_OUTFLOW")
+            ):
+                alpha_attr["whale_signal"] = "bearish_liquidity_outflow"
+                alpha_attr["indicator_primary"] = "Whale_Flow"
+            elif whale_score_open > 0:
+                alpha_attr["whale_signal"] = "bullish"
+            elif whale_score_open < 0:
+                alpha_attr["whale_signal"] = "bearish"
+            if alpha_attr["ml_confidence"] <= 0:
+                alpha_attr["ml_confidence"] = max(0.0, min(1.0, p_ml_open))
+        except Exception as e_attr:  # noqa: BLE001
+            alpha_attr["indicator_primary"] = f"Fallback:{e_attr}"
         logger.atualizar_ultimo_trade_campos(
             simbolo,
             {
                 "final_roi": float(roi),
                 "exit_type": motivo,
+                "alpha_attribution": alpha_attr,
             },
         )
         print(
@@ -1881,6 +3121,11 @@ def fechar_posicao_emergencia_market(
         raise ccxt.InvalidOrder(f"{_TAG} Quantidade inválida para fecho emergência: {qty}")
     side = "sell" if str(snap.get("direcao_posicao") or "LONG").upper() == "LONG" else "buy"
     sym = _resolver_simbolo_perp(ex, simbolo)
+    d_em = str(snap.get("direcao_posicao") or "LONG").upper()
+    _abortar_se_demasiadas_ordens_abertas(ex, simbolo, context="fechar_posicao_emergencia_market")
+    _assert_posicao_aberta_para_protecao_sync(
+        ex, simbolo, d_em, context="fechar_posicao_emergencia_market"
+    )
     ordem = ex.create_order(sym, "market", side, qty, None, _params_reduce_futures())
     try:
         cancelar_todas_ordens_abertas(simbolo, ex)
@@ -1918,6 +3163,10 @@ def fechar_parcial_posicao_market(
         )
     lado = str(snap.get("direcao_posicao") or "LONG").upper()
     side = "sell" if lado == "LONG" else "buy"
+    _abortar_se_demasiadas_ordens_abertas(ex, simbolo, context="fechar_parcial_posicao_market")
+    _assert_posicao_aberta_para_protecao_sync(
+        ex, simbolo, lado, context="fechar_parcial_posicao_market"
+    )
     mode = (execution or PARTIAL_TP_EXECUTION or "market").strip().lower()
     p_ro = _params_reduce_futures()
     if mode == "ioc":
@@ -2015,6 +3264,7 @@ def executar_saida_hibrida_roi_break_even_trailing(
         trailing_activation_multiplier=act_mult,
         source_tag="HYBRID_EXIT",
         sl_break_even=True,
+        force_replace=True,
     )
     try:
         import logger
@@ -2035,22 +3285,13 @@ def executar_saida_hibrida_roi_break_even_trailing(
     }
 
 
-def consultar_posicao_futures(
-    simbolo: str,
-    exchange: ccxt.binance | None = None,
-) -> dict[str, Any]:
+def _primeira_posicao_info_de_fetch_rows(
+    posicoes: list[dict[str, Any]],
+) -> tuple[float, str, float | None]:
     """
-    Indica se há posição líquida no perpétuo (contratos != 0).
-    Compatível com a lógica antiga de `posicao_aberta` no main.
+    Primeira posição não-zero em `fetch_positions`: (contratos assinados, lado CCXT, entry_price).
+    (0.0, "", None) se flat.
     """
-    ex = exchange or criar_exchange_binance()
-    sym = _resolver_simbolo_perp(ex, simbolo)
-    ex.load_markets()
-    market = ex.markets[sym]
-    base = market["base"]
-    min_amt = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
-
-    posicoes = ex.fetch_positions([sym])
     contratos = 0.0
     lado = ""
     entry_price: float | None = None
@@ -2069,7 +3310,6 @@ def consultar_posicao_futures(
                 pass
         if not usou_native:
             side_l = str(p.get("side") or "").lower()
-            # CCXT por vezes devolve contracts>0 com side='short' — SHORT exige sinal negativo.
             if signed > 0 and side_l == "short":
                 signed = -abs(signed)
 
@@ -2089,6 +3329,26 @@ def consultar_posicao_futures(
             except (TypeError, ValueError):
                 entry_price = None
         break
+    return contratos, lado, entry_price
+
+
+def consultar_posicao_futures(
+    simbolo: str,
+    exchange: ccxt.binance | None = None,
+) -> dict[str, Any]:
+    """
+    Indica se há posição líquida no perpétuo (contratos != 0).
+    Compatível com a lógica antiga de `posicao_aberta` no main.
+    """
+    ex = exchange or criar_exchange_binance()
+    sym = _resolver_simbolo_perp(ex, simbolo)
+    ex.load_markets()
+    market = ex.markets[sym]
+    base = market["base"]
+    min_amt = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+
+    posicoes = ex.fetch_positions([sym])
+    contratos, lado, entry_price = _primeira_posicao_info_de_fetch_rows(posicoes)
 
     aberta = abs(contratos) > 0 and abs(contratos) >= (min_amt * 0.5 if min_amt else 1e-12)
     direcao_pos = "SHORT" if contratos < 0 else "LONG"
@@ -2103,6 +3363,161 @@ def consultar_posicao_futures(
         "min_quantidade_base": min_amt,
         "posicao_aberta": aberta,
     }
+
+
+def _abortar_se_demasiadas_ordens_abertas(
+    exchange: ccxt.binance,
+    simbolo_any: str,
+    *,
+    context: str,
+) -> int:
+    """`fetch_open_orders`: se contagem > limite → alerta + RuntimeError (parar criação)."""
+    sym = _resolver_simbolo_perp(exchange, simbolo_any)
+    n = _contar_ordens_abertas_simbolo_ccxt(exchange, simbolo_any)
+    if n > int(AURIC_MAX_OPEN_ORDERS_GUARD):
+        print(
+            "⚠️ [SEGURANÇA] Demasiadas ordens abertas. Abortando criação para evitar spam.",
+            flush=True,
+        )
+        print(
+            f"🚨 [ERRO CRÍTICO] {sym}: {n} ordens abertas via fetch_open_orders "
+            f"(limite {AURIC_MAX_OPEN_ORDERS_GUARD}). Criação interrompida. {context}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise RuntimeError(
+            f"{_TAG} {sym}: {n} ordens abertas > {AURIC_MAX_OPEN_ORDERS_GUARD} ({context})"
+        )
+    return n
+
+
+def _assert_posicao_aberta_para_protecao_sync(
+    exchange: ccxt.binance,
+    simbolo_any: str,
+    direcao: str,
+    *,
+    context: str,
+) -> float:
+    """
+    Obrigatório `fetch_positions` na corretora (não RAM/BD): tamanho ≠ 0 antes de SL/TP/trailing.
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo_any)
+    exchange.load_markets()
+    try:
+        pos_live = exchange.fetch_positions([sym])
+    except ccxt.BaseError as e_fp:
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: fetch_positions falhou ({e_fp}). "
+            "Abortar criação de proteção."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg) from e_fp
+    c_signed, _, _ = _primeira_posicao_info_de_fetch_rows(pos_live)
+    if abs(float(c_signed)) <= 1e-18:
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: fetch_positions → tamanho ZERO. "
+            "Proibido criar ordens de proteção (SL/TP/trailing)."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+    snap = consultar_posicao_futures(simbolo_any, exchange)
+    if not bool(snap.get("posicao_aberta")):
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: posição ZERO na Binance. "
+            "Proibido criar ordens de proteção (SL/TP/trailing)."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+    d_snap = str(snap.get("direcao_posicao") or "").upper()
+    d_exp = str(direcao).strip().upper()
+    if d_exp in ("LONG", "SHORT") and d_snap in ("LONG", "SHORT") and d_snap != d_exp:
+        msg = (
+            f"{_TAG} [CRÍTICO] {context} | {sym}: direção esperada {d_exp} ≠ posição {d_snap}."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        raise RuntimeError(msg)
+    return abs(float(snap.get("contratos") or 0.0))
+
+
+def _assert_seguranca_antes_create_ordem_protecao(
+    exchange: ccxt.binance,
+    simbolo_any: str,
+    direcao: str,
+    *,
+    context: str,
+    allow_other_open_orders: bool = False,
+) -> bool:
+    """
+    Posição real ≠ 0 antes de `create_order` de proteção.
+    Fora de `_in_protection_order_batch`: exige livro **vazio** (anti-spam; só criar se lista vazia).
+    `allow_other_open_orders=True` para p.ex. `atualizar_ordem_stop` (trailing/TP podem ficar no livro).
+    """
+    sym = _resolver_simbolo_perp(exchange, simbolo_any)
+    if not _in_protection_order_batch:
+        _abortar_se_demasiadas_ordens_abertas(exchange, simbolo_any, context=context)
+        if not allow_other_open_orders:
+            n = len(_fetch_open_orders_ccxt_list(exchange, sym))
+            if n > 0:
+                print(
+                    f"{_TAG} [ANTI-SPAM] {context} | {sym}: {n} ordem(ns) em aberto — "
+                    "skip imediato (livro tem de estar vazio antes de criar).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+    _assert_posicao_aberta_para_protecao_sync(exchange, simbolo_any, direcao, context=context)
+    return True
+
+
+def _lado_fecho_protecao(direcao: str) -> str:
+    d = str(direcao).strip().upper()
+    return "sell" if d == "LONG" else "buy"
+
+
+def _ordem_protecao_mesmo_tipo_lado(
+    o: dict[str, Any],
+    direcao: str,
+    tipo_norm: str,
+) -> bool:
+    """tipo_norm: STOP_MARKET | TRAILING_STOP_MARKET | TAKE_PROFIT_MARKET."""
+    if _order_type_norm(o) != str(tipo_norm).upper().replace("-", "_"):
+        return False
+    need = _lado_fecho_protecao(direcao)
+    if str(o.get("side") or "").lower() != need:
+        return False
+    return _order_reduce_only_flag(o) or _futures_one_way_position_side(o)
+
+
+def _cancelar_ordens_abertas_tipo_protecao(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    direcao: str,
+    tipo_norm: str,
+) -> int:
+    """
+    Cancela todas as ordens abertas do mesmo tipo (lado de fecho). Se cancelou alguma,
+    aguarda `PROTECTION_PRE_CREATE_CANCEL_SLEEP_S` antes do caller criar a nova.
+    """
+    d = str(direcao).strip().upper()
+    n = 0
+    for o in list(_fetch_open_orders_ccxt_list(exchange, simbolo_ccxt)):
+        if not _ordem_protecao_mesmo_tipo_lado(o, d, tipo_norm):
+            continue
+        oid = o.get("id")
+        if oid is None:
+            continue
+        try:
+            exchange.cancel_order(str(oid), simbolo_ccxt)
+            n += 1
+        except ccxt.BaseError as ec:
+            print(f"{_TAG} cancel pré-create {tipo_norm} id={oid}: {ec}", file=sys.stderr)
+    if n:
+        time.sleep(float(PROTECTION_PRE_CREATE_CANCEL_SLEEP_S))
+    return n
+
+
+def _sleep_apos_criar_ordem_protecao() -> None:
+    time.sleep(float(PROTECTION_ORDER_CREATE_THROTTLE_S))
 
 
 def _rsi_14_de_fechamentos(fechamentos: list[float]) -> float | None:
@@ -2180,9 +3595,9 @@ def _buscar_ordem_stop_loss_aberta(
     """
     d = str(direcao).strip().upper()
     for o in exchange.fetch_open_orders(simbolo):
-        if not o.get("reduceOnly"):
+        if not _order_reduce_only_flag(o):
             continue
-        typ = str(o.get("type") or "").upper()
+        typ = _order_type_norm(o)
         if typ != "STOP_MARKET":
             continue
         side = str(o.get("side") or "").lower()
@@ -2255,34 +3670,57 @@ def atualizar_ordem_stop(
     p_ro = _params_reduce_futures()
 
     if ord_sl is not None:
-        oid = ord_sl.get("id")
-        rem = ord_sl.get("remaining")
-        amt_raw = rem
-        if amt_raw is None or float(amt_raw) <= 0:
-            amt_raw = ord_sl.get("amount")
-        if amt_raw is None:
-            amt_raw = _quantidade_posicao_abs(ex, sym, d)
-        q = float(ex.amount_to_precision(sym, float(amt_raw)))
         prev = _stop_price_de_ordem(ord_sl)
         if prev is not None:
             sp_cmp = float(ex.price_to_precision(sym, prev))
-            if sp_cmp == sp:
-                print(f"{_TAG} Stop já em {sp}; sem alteração.")
+            ref_px = max(abs(sp_cmp), abs(sp), 1e-12)
+            rel_diff = abs(sp - sp_cmp) / ref_px
+            if rel_diff <= float(SL_REPLACE_MIN_REL_DIFF):
+                print(
+                    f"{_TAG} Stop novo {sp} ≈ existente {sp_cmp} (Δ {rel_diff:.4%} ≤ "
+                    f"{SL_REPLACE_MIN_REL_DIFF:.2%}); sem alteração."
+                )
                 return {"ok": True, "skipped": True, "stopPrice": sp, "order": ord_sl}
 
-        if oid is not None:
-            try:
-                ex.cancel_order(oid, sym)
-            except ccxt.BaseError as e:
-                print(f"{_TAG} Erro ao cancelar SL anterior: {e}", file=sys.stderr)
-                raise
-    else:
-        q = _quantidade_posicao_abs(ex, sym, d)
+    slp_loop = float(PROTECTION_CANCEL_CONFIRM_LOOP_SLEEP_S)
+    total_stop_cancels = 0
+    for _ in range(24):
+        if protecao_stop_market_limpa_ccxt(ex, simbolo, d):
+            break
+        n_st = cancelar_stop_market_protecao_ccxt(
+            ex, simbolo, d, max_passes=16, sleep_s=slp_loop
+        )
+        total_stop_cancels += int(n_st)
+        time.sleep(slp_loop)
+    if not protecao_stop_market_limpa_ccxt(ex, simbolo, d):
+        raise RuntimeError(
+            f"{_TAG} {sym}: STOP_MARKET/STOP ainda no livro após limpeza em loop — "
+            "abortar novo SL (anti-empilhamento)."
+        )
+    if total_stop_cancels:
         print(
-            f"{_TAG} Aviso: SL STOP_MARKET em aberto não encontrado; "
+            f"{_TAG} Cancelados ≥{total_stop_cancels} STOP_MARKET/STOP (reduce-only) "
+            "antes de recolocar SL único.",
+            flush=True,
+        )
+    time.sleep(float(PROTECTION_PRE_CREATE_CANCEL_SLEEP_S))
+    try:
+        q = float(ex.amount_to_precision(sym, float(_quantidade_posicao_abs(ex, sym, d))))
+    except ccxt.BaseError:
+        raise
+    if ord_sl is None:
+        print(
+            f"{_TAG} Aviso: SL STOP_MARKET em aberto não encontrado antes do replace; "
             f"a criar nova ordem reduce-only qty={q}.",
             file=sys.stderr,
         )
+
+    if not _exigir_intervalo_min_entre_ordens_protecao(context="atualizar_ordem_stop"):
+        return {"ok": False, "skipped": True, "reason": "anti_spam_interval"}
+    if not _assert_seguranca_antes_create_ordem_protecao(
+        ex, simbolo, d, context="atualizar_ordem_stop", allow_other_open_orders=False
+    ):
+        return {"ok": False, "skipped": True, "reason": "open_orders_not_empty"}
 
     try:
         if d == "LONG":
@@ -2304,6 +3742,8 @@ def atualizar_ordem_stop(
                 {**p_ro, "stopPrice": sp},
             )
         print(f"{_TAG} SL atualizado: STOP_MARKET @ {sp} qty={q} id={nova.get('id')}")
+        _marcar_criacao_ordem_protecao()
+        _sleep_apos_criar_ordem_protecao()
         return {"ok": True, "skipped": False, "stopPrice": sp, "order": nova}
     except ccxt.BaseError as e:
         print(f"{_TAG} Erro ao criar novo SL: {e}", file=sys.stderr)
@@ -2353,11 +3793,22 @@ def gerenciar_trailing_stop(
 
     novo_sl = float(ex.price_to_precision(sym, novo_sl))
 
+    global _trailing_sl_adjust_anchor_by_sym
+    anchor = float(_trailing_sl_adjust_anchor_by_sym.get(sym, 0.0))
+    thr_mv = float(BRACKET_REPLACE_MIN_FAVORABLE_PRICE_MOVE)
+    if anchor > 0 and pa > 0 and thr_mv > 0:
+        if d == "LONG" and pa < anchor * (1.0 + thr_mv):
+            return None
+        if d == "SHORT" and pa > anchor * (1.0 - thr_mv):
+            return None
+
     print(
         f"{_TAG} 🔄 [TRAILING STOP] Ajustando SL para {novo_sl:.4f} "
         f"(lucro {lucro_atual:.2%}, ref entrada {pe:.4f}, último {pa:.4f})"
     )
     out = atualizar_ordem_stop(simbolo, novo_sl, d, ex)
+    if out.get("ok"):
+        _trailing_sl_adjust_anchor_by_sym[sym] = pa
     out["lucro_atual"] = lucro_atual
     out["novo_sl"] = novo_sl
     return out

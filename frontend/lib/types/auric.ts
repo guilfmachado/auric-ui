@@ -46,6 +46,13 @@ export interface LogRow {
   /** Quando existir na tabela Supabase: % de PnL daquele evento (ex.: saída TP/SL). */
   resultado_trade?: number | null;
   pnl_pct?: number | null;
+  funnel_stage?: string | null;
+  funnel_abort_reason?: string | null;
+  ml_prob_base?: number | null;
+  ml_prob_calibrated?: number | null;
+  llava_veto?: boolean | null;
+  whale_flow_score?: number | null;
+  social_sentiment_score?: number | null;
 }
 
 /** Tabela `trade_outcomes` (Outcome Engine / auditoria pós-fecho). */

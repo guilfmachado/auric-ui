@@ -27,15 +27,28 @@ from typing import Any
 
 import aiohttp
 import ccxt
+try:
+    import redis.asyncio as redis_async  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    redis_async = None  # type: ignore[assignment]
 
 import brain
 import executor_futures
 import executor_spot
 import indicators
 import intelligence_hub
+import intelligence_module
 import logger
 import ml_model
 import websockets
+try:
+    import sentry_sdk  # type: ignore
+except Exception:  # noqa: BLE001
+    sentry_sdk = None
+try:
+    import logfire  # type: ignore
+except Exception:  # noqa: BLE001
+    logfire = None
 
 def _normalizar_symbol_env_para_ccxt(raw: str) -> str:
     s = str(raw or "").strip().upper()
@@ -75,6 +88,9 @@ WS_RECONNECT_DELAY_S = 5.0
 ORDER_FAILURE_BACKOFF_S = 5.0
 # Loop asyncio principal (para asyncio.sleep desde threads do ciclo ML sem bloquear outras tasks).
 _main_event_loop: asyncio.AbstractEventLoop | None = None
+REDIS_ORDER_LOCK_TTL_S = max(1, int(float(os.getenv("AURIC_ORDER_LOCK_TTL_S", "5"))))
+REDIS_ORDER_LOCK_URL = (os.getenv("REDIS_URL") or "redis://localhost:6379/0").strip()
+_redis_async_client: Any | None = None
 
 # Multiplicadores de saída sobre o preço de entrada gravado em memória (LONG: sobe = lucro).
 FATOR_TAKE_PROFIT = 1.02  # preço >= entrada × 1.02
@@ -89,6 +105,13 @@ ML_PROB_SHORT_MAX = 0.45
 WAKE_FILTER_SHORT_MAX = 0.45
 WAKE_FILTER_LONG_MIN = 0.55
 ML_MACRO_OVERRIDE_PROB = 0.70  # Override counter-trend quando confiança estatística é muito alta.
+# Anti-contra-tendência (XGBoost bruto `prob_ml_base`, antes do ajuste opcional do order book):
+# P(alta) acima disto → proibido abrir SHORT; abaixo disto → proibido abrir LONG.
+ML_PROB_BLOQUEIO_SHORT = float(os.getenv("AURIC_ML_ANTISHORT_PROB", "0.70"))
+ML_PROB_BLOQUEIO_LONG = float(os.getenv("AURIC_ML_ANTILONG_PROB", "0.30"))
+# Submissão do LLM: acima disto (LONG) / abaixo disto (SHORT) o prompt restringe vetos por notícias leves.
+ML_PROB_SUBMISSAO_LONG = float(os.getenv("AURIC_ML_SUBMISSAO_LONG", "0.80"))
+ML_PROB_SUBMISSAO_SHORT = float(os.getenv("AURIC_ML_SUBMISSAO_SHORT", "0.20"))
 
 # Mínimo de confiança do Brain (0–100) para permitir entrada.
 CONFIANCA_BRAIN_MIN_ENTRADA = 70
@@ -154,6 +177,18 @@ _gatilho_ciclo_lock: asyncio.Lock | None = None
 _ultimo_gatilho_ciclo_mono: float = 0.0
 _watchdog_relogio_task: asyncio.Task[None] | None = None
 _ultimo_contexto_raw_supabase: str = "{}"
+_ultimo_whale_flow_score: float = 0.0
+_ultimo_whale_flow_signal: str = "NEUTRAL"
+_ultimo_social_sentiment_score: float = 0.0
+_ultimo_news_sentiment_score: int = 0
+_ultimo_minuto_previsao_candle: int = -1
+_ultimo_preco_alvo_previsao: float | None = None
+_ultima_tendencia_alta_previsao: bool | None = None
+_ultimo_llava_veto: bool = False
+_ultima_etapa_funil: str = "IDLE"
+_ultima_razao_abort_funil: str | None = None
+_ultima_ml_prob_base: float | None = None
+_ultima_ml_prob_calibrada: float | None = None
 justificativa_ia: str = "Aguardando primeira leitura..."
 # Heartbeat Supabase em MODO VIGIA (não bloqueia TP/SL — envio em thread daemon).
 VIGIA_HEARTBEAT_INTERVAL_S = 30.0
@@ -196,6 +231,78 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _redis_lock_key_symbol(symbol: str) -> str:
+    clean = "".join(ch for ch in str(symbol or "").upper() if ch.isalnum())
+    return f"lock_{clean or 'SYMBOL'}"
+
+
+async def _get_redis_async_client() -> Any | None:
+    global _redis_async_client
+    if redis_async is None:
+        return None
+    if _redis_async_client is not None:
+        return _redis_async_client
+    try:
+        _redis_async_client = redis_async.from_url(
+            REDIS_ORDER_LOCK_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=0.5,
+            socket_connect_timeout=0.5,
+        )
+        await _redis_async_client.ping()
+        return _redis_async_client
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [REDIS] indisponível ({REDIS_ORDER_LOCK_URL}): {e}.", flush=True)
+        _redis_async_client = None
+        return None
+
+
+async def _acquire_redis_order_lock(symbol: str) -> tuple[str, str] | None:
+    """
+    Lock atômico com Redis (SET NX EX).
+    - None => Redis indisponível (segue sem lock).
+    - ("","") => lock já existe (pular execução).
+    - (key, token) => lock adquirido.
+    """
+    cli = await _get_redis_async_client()
+    if cli is None:
+        return None
+    key = _redis_lock_key_symbol(symbol)
+    token = f"{os.getpid()}-{time.time_ns()}"
+    try:
+        ok = bool(await cli.set(key, token, nx=True, ex=REDIS_ORDER_LOCK_TTL_S))
+        if ok:
+            return key, token
+        return ("", "")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ [REDIS] falha ao criar lock {key}: {e}.", flush=True)
+        return None
+
+
+async def _release_redis_order_lock(lock_ctx: tuple[str, str] | None) -> None:
+    if not lock_ctx:
+        return
+    key, token = lock_ctx
+    if not key:
+        return
+    cli = await _get_redis_async_client()
+    if cli is None:
+        return
+    # Release seguro (somente se token ainda for o nosso).
+    lua = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+"""
+    try:
+        await cli.eval(lua, 1, key, token)
+    except Exception:
+        pass
 
 
 def _registar_loop_principal_async() -> None:
@@ -442,6 +549,53 @@ def _inferir_direcao_sugerida_turbo(valor_supabase: str | None, texto_ram: str |
     return "LONG"
 
 
+def _contexto_tem_catastrofe_sistemica(texto: str) -> bool:
+    """
+    Eventos graves no texto agregado (notícias + alertas + justificativa).
+    Usado para manter VETO LONG mesmo com P(alta) muito alta (submissão ML).
+    """
+    t = (texto or "").lower()
+    needles = (
+        "hack",
+        "hacked",
+        "security breach",
+        "bridge hack",
+        "bridge exploit",
+        "bankruptcy",
+        "bankrupt",
+        "insolvent",
+        "insolvency",
+        "sec sue",
+        "sec lawsuit",
+        "sec charges",
+        "criminal charge",
+        "halt withdrawal",
+        "paused withdrawal",
+        "withdrawals suspended",
+        "exchange hacked",
+        "fraud charges",
+        "falência",
+        "falencia",
+        "binance foi hackeada",
+        "custody loss",
+    )
+    return any(n in t for n in needles)
+
+
+def _contexto_tem_catalisador_altista_estrutural(texto: str) -> bool:
+    """Catalisador raro que pode manter VETO SHORT mesmo com P(alta) muito baixa."""
+    t = (texto or "").lower()
+    needles = (
+        "etf approved",
+        "etf approval",
+        "sec approves bitcoin",
+        "sec approves spot",
+        "spot etf approved",
+        "major regulatory approval",
+    )
+    return any(n in t for n in needles)
+
+
 def _parse_supabase_updated_at(raw: Any) -> datetime | None:
     """Converte `updated_at` do PostgREST para UTC; None se inválido."""
     if raw is None:
@@ -640,6 +794,10 @@ def atualizar_saldo_supabase() -> None:
         return
     try:
         logger.persistir_saldo_usdt(saldo)
+        logger.persistir_whale_flow_score(
+            float(_ultimo_whale_flow_score),
+            social_sentiment_score=float(_ultimo_social_sentiment_score),
+        )
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ atualizar_saldo_supabase (Supabase): {e}")
         return
@@ -754,6 +912,16 @@ def _sync_entry_price_supabase() -> None:
         "id": 1,
         "posicao_aberta": opened,
         "entry_price": entry_price,
+        "whale_flow_score": float(_ultimo_whale_flow_score),
+        "social_sentiment_score": float(_ultimo_social_sentiment_score),
+        "news_sentiment_score": int(_ultimo_news_sentiment_score),
+        "forecast_preco_alvo": _ultimo_preco_alvo_previsao,
+        "forecast_tendencia_alta": _ultima_tendencia_alta_previsao,
+        "llava_veto": bool(_ultimo_llava_veto),
+        "funnel_stage": str(_ultima_etapa_funil),
+        "funnel_abort_reason": _ultima_razao_abort_funil,
+        "ml_prob_base": _ultima_ml_prob_base,
+        "ml_prob_calibrated": _ultima_ml_prob_calibrada,
         "updated_at": now_iso,
     }
     try:
@@ -777,6 +945,23 @@ def _exit_meta_contexto_json(*, partial_tp_50: bool, stop_hit: bool) -> str:
             }
         }
     )
+
+
+def _emit_funnel_observability(event: str, payload: dict[str, Any]) -> None:
+    """Telemetria opcional para Sentry/Logfire sem hard dependency."""
+    try:
+        if sentry_sdk is not None:
+            with sentry_sdk.push_scope() as scope:  # type: ignore[attr-defined]
+                for k, v in payload.items():
+                    scope.set_extra(str(k), v)
+                sentry_sdk.capture_message(f"[FUNIL] {event}")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        if logfire is not None and hasattr(logfire, "info"):
+            logfire.info(f"[FUNIL] {event}", **payload)  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def _marcar_comando_manual_executado(row_id: int) -> None:
@@ -827,7 +1012,7 @@ def verificar_comandos_manuais() -> None:
                     f"👑 [GOD MODE] Manual Override ativo (id={rid}, LONG): "
                     "ignorando filtros RSI/ADX/VWAP e enviando ordem."
                 )
-                executor_futures.abrir_long_market(
+                ordem_manual = executor_futures.abrir_long_market(
                     SYMBOL_TRADE,
                     ex,
                     alavancagem=float(_alavancagem_cfg),
@@ -835,6 +1020,9 @@ def verificar_comandos_manuais() -> None:
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
                 )
+                if isinstance(ordem_manual, dict) and bool(ordem_manual.get("auric_skipped")):
+                    print("⏭️ [MANUAL] LONG ignorado: lock Redis ativo (anti-spam).")
+                    continue
                 try:
                     t = ex.fetch_ticker(executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE))
                     preco_man = float(t.get("last") or t.get("close") or 0.0)
@@ -860,7 +1048,7 @@ def verificar_comandos_manuais() -> None:
                     "ignorando filtros RSI/ADX/VWAP e enviando ordem."
                 )
                 trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
-                executor_futures.abrir_short_market(
+                ordem_manual = executor_futures.abrir_short_market(
                     SYMBOL_TRADE,
                     ex,
                     alavancagem=float(_alavancagem_cfg),
@@ -868,6 +1056,9 @@ def verificar_comandos_manuais() -> None:
                     trailing_callback_rate=trailing_cb,
                     trailing_activation_multiplier=trailing_mult,
                 )
+                if isinstance(ordem_manual, dict) and bool(ordem_manual.get("auric_skipped")):
+                    print("⏭️ [MANUAL] SHORT ignorado: lock Redis ativo (anti-spam).")
+                    continue
                 try:
                     sym_man = executor_futures._resolver_simbolo_perp(ex, SYMBOL_TRADE)
                     t = ex.fetch_ticker(sym_man)
@@ -1166,6 +1357,9 @@ def _executar_comando_manual_imediato_sync(
                 force_reference_price=ws_ref,
                 is_manual_force=manual_row_id is not None,
             )
+        if bool(ordem.get("auric_skipped")):
+            print("⏭️ [GOD MODE] LONG ignorado: lock Redis ativo (anti-spam).")
+            return
         _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
         return
     if c == "SHORT":
@@ -1203,6 +1397,9 @@ def _executar_comando_manual_imediato_sync(
                 force_reference_price=ws_ref,
                 is_manual_force=manual_row_id is not None,
             )
+        if bool(ordem.get("auric_skipped")):
+            print("⏭️ [GOD MODE] SHORT ignorado: lock Redis ativo (anti-spam).")
+            return
         _god_mode_sincronizar_ram_e_supabase_posicao_vigia_sync(c, ordem, manual_row_id)
         return
     if c in ("CLOSE", "CLOSE_ALL"):
@@ -1739,6 +1936,20 @@ def _gerenciar_saida_modo_vigia(
         except Exception as e_og:  # noqa: BLE001
             print(f"⚠️ [ORDER-GUARD] {e_og}")
 
+    if "FUTURES" in modo_label and float(preco_compra) > 0:
+        try:
+            if executor_futures.verificar_free_runner_breakeven_posicao(
+                SYMBOL_TRADE,
+                ex,
+                str(direcao_posicao),
+                float(preco_compra),
+                trailing_callback_rate=float(_trailing_callback_cfg),
+                trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+            ):
+                _partial_tp_locked = True
+        except Exception as e_fr:  # noqa: BLE001
+            print(f"⚠️ [FREE RUNNER] {e_fr}")
+
     if _vigia_eth_usdc_futures(modo_label):
         bid_s = float(_best_bid_ws or 0.0)
         ask_s = float(_best_ask_ws or 0.0)
@@ -1765,6 +1976,7 @@ def _gerenciar_saida_modo_vigia(
     if (
         _vigia_eth_usdc_futures(modo_label)
         and not _partial_tp_locked
+        and not executor_futures.free_runner_tracking_ativo(SYMBOL_TRADE, ex)
         and roi >= PARTIAL_TP_ROI_FRAC
     ):
         try:
@@ -1874,6 +2086,7 @@ def _gerenciar_saida_modo_vigia(
                                 preco_compra,
                                 trailing_callback_rate=trailing_ativo,
                                 trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                                source_tag="APERTO_SEGURANCA",
                             )
                             print(
                                 "🔒 [MODO VIGIA] Brackets Futures atualizados com "
@@ -1992,6 +2205,7 @@ def _gerenciar_saida_modo_vigia(
                         )
                     else:
                         trailing_ativo = min(trailing_ativo, TRAILING_CALLBACK_RSI_TIGHTEN)
+                        rsi_tighten_primeiro_ciclo = not _rsi_tighten_ativo
                         if not _rsi_tighten_ativo:
                             _rsi_tighten_ativo = True
                             print(
@@ -2000,7 +2214,11 @@ def _gerenciar_saida_modo_vigia(
                         try:
                             snap = executor_futures.consultar_posicao_futures(SYMBOL_TRADE, ex)
                             qty = abs(float(snap.get("contratos") or 0.0))
-                            if qty > 0 and _vigia_trailing_updates_allowed():
+                            if (
+                                rsi_tighten_primeiro_ciclo
+                                and qty > 0
+                                and _vigia_trailing_updates_allowed()
+                            ):
                                 executor_futures.assegurar_brackets_apos_reconciliacao(
                                     SYMBOL_TRADE,
                                     ex,
@@ -2009,6 +2227,7 @@ def _gerenciar_saida_modo_vigia(
                                     preco_compra,
                                     trailing_callback_rate=trailing_ativo,
                                     trailing_activation_multiplier=float(_trailing_activation_mult_cfg),
+                                    source_tag="RSI_TIGHTEN",
                                 )
                         except Exception as e_tight:  # noqa: BLE001
                             print(f"⚠️ [RSI TIGHTEN] Falha ao aplicar trailing apertado: {e_tight}")
@@ -2463,6 +2682,11 @@ def _rodar_ciclo_impl(modo: str) -> None:
     global _risk_fraction_cfg, _alavancagem_cfg, _trailing_callback_cfg, _trailing_activation_mult_cfg
     global _ultimo_preco_ws, _best_bid_ws, _best_ask_ws
     global USER_MARKET_OBSERVATION
+    global _ultimo_rsi_14, _ultimo_adx_14, _ultimo_contexto_raw_supabase
+    global _ultimo_news_sentiment_score, _ultimo_minuto_previsao_candle
+    global _ultimo_preco_alvo_previsao, _ultima_tendencia_alta_previsao
+    global _ultimo_llava_veto, _ultima_etapa_funil, _ultima_razao_abort_funil
+    global _ultima_ml_prob_base, _ultima_ml_prob_calibrada
 
     if not logger.obter_bot_ativo():
         print("Bot em modo Standby via Dashboard")
@@ -2688,6 +2912,72 @@ def _rodar_ciclo_impl(modo: str) -> None:
         f"    ML P(alta)≥{WAKE_FILTER_LONG_MIN:.2f} (LONG) ou P(alta)≤{WAKE_FILTER_SHORT_MAX:.2f} (SHORT) "
         "→ Hub → Brain → posicao_recomendada."
     )
+    _ultima_etapa_funil = "PASSO_1_GUARDA_COSTAS"
+    _ultima_razao_abort_funil = None
+    _ultimo_llava_veto = False
+    # Passo 1 (Guarda-Costas): notícia macro primeiro; pânico => não procurar LONG neste ciclo.
+    try:
+        _ultimo_news_sentiment_score = int(
+            asyncio.run(intelligence_hub.analisar_sentimento_noticias(SYMBOL_TRADE))
+        )
+    except Exception as e_news:  # noqa: BLE001
+        _ultimo_news_sentiment_score = 0
+        print(f"⚠️ [NEWS SENTIMENT] Falha ao analisar RSS: {e_news}")
+    print(f"🛡️ [GUARDA-COSTAS] sentimento_noticias={_ultimo_news_sentiment_score:+d}")
+    if _ultimo_news_sentiment_score <= -1:
+        _ultima_razao_abort_funil = "NEWS_PANIC"
+        msg_news_panic = (
+            "Pânico/venda forte no RSS da última hora. LONG bloqueado e análise técnica pulada neste ciclo."
+        )
+        print(f"🚫 [GUARDA-COSTAS] {msg_news_panic}")
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=0.0,
+            sentimento="BEARISH",
+            acao="VETO_NEWS_PANIC",
+            justificativa=msg_news_panic,
+            contexto_raw=_ultimo_contexto_raw_supabase,
+            justificativa_ia=msg_news_panic,
+            social_sentiment_score=float(_ultimo_social_sentiment_score),
+            whale_flow_score=float(_ultimo_whale_flow_score),
+            funnel_stage=_ultima_etapa_funil,
+            funnel_abort_reason=_ultima_razao_abort_funil,
+            llava_veto=False,
+        )
+        _emit_funnel_observability(
+            "ABORT_PASSO_1",
+            {
+                "reason": _ultima_razao_abort_funil,
+                "news_sentiment_score": _ultimo_news_sentiment_score,
+                "symbol": SYMBOL_TRADE,
+            },
+        )
+        return
+
+    # Passo 2 (Estrategista): só em fechamento de candle, prever próximos candles para peso extra.
+    _ultima_etapa_funil = "PASSO_2_ESTRATEGISTA"
+    minuto_atual_utc = int(datetime.now(timezone.utc).minute)
+    if _ultimo_minuto_previsao_candle != minuto_atual_utc:
+        _ultimo_minuto_previsao_candle = minuto_atual_utc
+        try:
+            df_hist = ml_model.fetch_ohlcv_binance(
+                symbol=SYMBOL_TRADE,
+                timeframe=ml_model.TIMEFRAME,
+                total=220,
+            )
+            prev = asyncio.run(intelligence_hub.prever_proximos_candles(df_hist))
+            _ultima_tendencia_alta_previsao = prev.get("tendencia_alta")
+            _ultimo_preco_alvo_previsao = prev.get("preco_alvo")
+            print(
+                "🧭 [ESTRATEGISTA] "
+                f"tendencia_alta={_ultima_tendencia_alta_previsao} | "
+                f"preco_alvo={_ultimo_preco_alvo_previsao}"
+            )
+        except Exception as e_prev:  # noqa: BLE001
+            _ultima_tendencia_alta_previsao = None
+            _ultimo_preco_alvo_previsao = None
+            print(f"⚠️ [ESTRATEGISTA] previsão indisponível: {e_prev}")
     hora_do_dia_cycle = int(datetime.now(timezone.utc).hour)
     spread_atual: float | None = None
     book_imbalance: float | None = None
@@ -2751,6 +3041,57 @@ def _rodar_ciclo_impl(modo: str) -> None:
                         parede_venda_preco_ref = float(obp.get("preco_atual")) * (1.0 + float(dist))
         except Exception as e_ob:  # noqa: BLE001
             print(f"⚠️ [ORDER BOOK] Falha ao analisar depth Binance: {e_ob}")
+    whale_flow = {
+        "whale_score": 0.0,
+        "signal": "NEUTRAL",
+        "possible_bull_trap": False,
+        "source": "disabled",
+    }
+    try:
+        whale_flow = intelligence_module.obter_smart_money_flow(ex, SYMBOL_TRADE)
+        _ultimo_whale_flow_score = float(
+            whale_flow.get("whale_flow_score", whale_flow.get("whale_score") or 0.0)
+        )
+        _ultimo_whale_flow_signal = str(whale_flow.get("signal") or "NEUTRAL")
+        _ultimo_social_sentiment_score = float(whale_flow.get("social_sentiment_score") or 0.0)
+        print(
+            "🐋 [SMART MONEY] "
+            f"score={_ultimo_whale_flow_score:+.2f} | signal={_ultimo_whale_flow_signal} | "
+            f"social={_ultimo_social_sentiment_score:+.2f} | "
+            f"src={whale_flow.get('source')} | bull_trap={bool(whale_flow.get('possible_bull_trap'))}"
+        )
+    except Exception as e_whale:  # noqa: BLE001
+        _ultimo_whale_flow_score = 0.0
+        _ultimo_whale_flow_signal = "NEUTRAL"
+        _ultimo_social_sentiment_score = 0.0
+        print(f"⚠️ [SMART MONEY] indisponível neste ciclo: {e_whale}")
+    finally:
+        try:
+            # Garantia: dashboard recebe atualização do humor (whale_flow_score) em todo ciclo de inteligência.
+            logger.persistir_whale_flow_score(
+                float(_ultimo_whale_flow_score),
+                social_sentiment_score=float(_ultimo_social_sentiment_score),
+            )
+            logger.atualizar_ultimo_trade_mood_scores(
+                SYMBOL_TRADE,
+                whale_flow_score=float(_ultimo_whale_flow_score),
+                social_sentiment_score=float(_ultimo_social_sentiment_score),
+            )
+        except Exception as e_whale_db:  # noqa: BLE001
+            print(f"⚠️ [SMART MONEY] persistência wallet_status falhou: {e_whale_db}")
+    prob_sem_whale = float(probabilidade)
+    probabilidade = ml_model.ajustar_probabilidade_com_whale_flow(
+        prob_sem_whale,
+        float(_ultimo_whale_flow_score),
+    )
+    _ultima_ml_prob_base = float(prob_ml_base)
+    _ultima_ml_prob_calibrada = float(probabilidade)
+    if abs(probabilidade - prob_sem_whale) > 1e-12:
+        print(
+            "📊 [ML+WHALE FEATURE] "
+            f"P(alta) ajustada por whale_flow {prob_sem_whale:.2%} → {probabilidade:.2%} "
+            f"(score={_ultimo_whale_flow_score:+.2f})."
+        )
     try:
         spread_atual, book_imbalance = _features_dataset_intraday(
             best_bid=float(_best_bid_ws or 0.0),
@@ -2777,6 +3118,8 @@ def _rodar_ciclo_impl(modo: str) -> None:
             atr_14=atr_14_cycle,
             funding_rate=funding_rate,
             long_short_ratio=long_short_ratio,
+            whale_flow_score=float(_ultimo_whale_flow_score),
+            social_sentiment_score=float(_ultimo_social_sentiment_score),
         )
     except Exception:  # noqa: BLE001
         logger.configurar_features_log_ciclo(
@@ -2787,6 +3130,8 @@ def _rodar_ciclo_impl(modo: str) -> None:
             atr_14=None,
             funding_rate=None,
             long_short_ratio=None,
+            whale_flow_score=float(_ultimo_whale_flow_score),
+            social_sentiment_score=float(_ultimo_social_sentiment_score),
         )
 
     try:
@@ -2819,6 +3164,12 @@ def _rodar_ciclo_impl(modo: str) -> None:
             "bb_breakout_long_ok": False,
             "bb_breakout_short_ok": False,
         }
+    snap["whale_flow_score"] = float(_ultimo_whale_flow_score)
+    snap["whale_flow_signal"] = str(_ultimo_whale_flow_signal)
+    snap["social_sentiment_score"] = float(_ultimo_social_sentiment_score)
+    snap["news_sentiment_score"] = int(_ultimo_news_sentiment_score)
+    snap["forecast_preco_alvo"] = _ultimo_preco_alvo_previsao
+    snap["forecast_tendencia_alta"] = _ultima_tendencia_alta_previsao
 
     adx_v = snap.get("adx_14")
     rsi_v = snap.get("rsi_14")
@@ -2978,6 +3329,104 @@ def _rodar_ciclo_impl(modo: str) -> None:
                 "sem consulta ao Claude."
             )
             return
+
+    if (
+        direcao_sugerida == "LONG"
+        and float(_ultimo_whale_flow_score) < -0.5
+    ):
+        bull_trap_msg = (
+            "VETO_WHALE_DUMP: XGBoost sinalizou LONG, mas CoinAPI detectou forte pressão "
+            "vendedora de baleias (whale_flow_score < -0.5). Entrada cancelada."
+        )
+        print(f"🚫 [VETO_WHALE_DUMP] {bull_trap_msg}")
+        try:
+            ctx_bt = indicators.formatar_log_contexto_raw(
+                bull_trap_msg,
+                {
+                    **snap,
+                    "prob_ml": probabilidade,
+                    "prob_ml_bruto": prob_ml_base,
+                    "direcao_sugerida": direcao_sugerida,
+                    "whale_flow_score": _ultimo_whale_flow_score,
+                    "whale_flow_signal": _ultimo_whale_flow_signal,
+                    "whale_flow_source": whale_flow.get("source"),
+                },
+            )
+        except Exception:
+            ctx_bt = None
+        logger.registrar_log_trade(
+            par_moeda=SYMBOL_TRADE,
+            preco=preco,
+            prob_ml=probabilidade,
+            sentimento="CAUTIOUS",
+            acao="VETO_WHALE_DUMP",
+            justificativa=bull_trap_msg,
+            lado_ordem="LONG",
+            contexto_raw=ctx_bt,
+            justificativa_ia=bull_trap_msg,
+            whale_flow_score=float(_ultimo_whale_flow_score),
+            social_sentiment_score=float(_ultimo_social_sentiment_score),
+        )
+        return
+
+    # Anti-contra-tendência: usa P(alta) **bruta** do XGBoost (antes do ajuste opcional do order book).
+    palta_bruto_pct = prob_ml_base * 100.0
+    if direcao_sugerida == "SHORT" and prob_ml_base > ML_PROB_BLOQUEIO_SHORT:
+        msg_v = (
+            f"🚫 [VETO] Bloqueio de SHORT: Força de alta do ML ({palta_bruto_pct:.2f}%) é demasiado "
+            "alta para apostar contra."
+        )
+        print(msg_v)
+        try:
+            ctx_ml = indicators.formatar_log_contexto_raw(
+                msg_v,
+                {**snap, "prob_ml": probabilidade, "prob_ml_bruto": prob_ml_base, "direcao_sugerida": "SHORT"},
+            )
+        except Exception:
+            ctx_ml = None
+        try:
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=prob_ml_base,
+                sentimento="NEUTRAL",
+                acao="VETO_ML_ANTI_SHORT",
+                justificativa=msg_v,
+                contexto_raw=ctx_ml,
+                justificativa_ia=msg_v,
+                lado_ordem="SHORT",
+            )
+        except Exception as e_ml:  # noqa: BLE001
+            print(f"⚠️ [VETO_ML_ANTI_SHORT] Falha ao gravar log: {e_ml}")
+        return
+    if direcao_sugerida == "LONG" and prob_ml_base < ML_PROB_BLOQUEIO_LONG:
+        msg_l = (
+            f"🚫 [VETO] Bloqueio de LONG: P(alta) bruta={palta_bruto_pct:.2f}% — modelo indica viés forte "
+            "de queda (não apostar contra a tendência matemática)."
+        )
+        print(msg_l)
+        try:
+            ctx_ml2 = indicators.formatar_log_contexto_raw(
+                msg_l,
+                {**snap, "prob_ml": probabilidade, "prob_ml_bruto": prob_ml_base, "direcao_sugerida": "LONG"},
+            )
+        except Exception:
+            ctx_ml2 = None
+        try:
+            logger.registrar_log_trade(
+                par_moeda=SYMBOL_TRADE,
+                preco=preco,
+                prob_ml=prob_ml_base,
+                sentimento="NEUTRAL",
+                acao="VETO_ML_ANTI_LONG",
+                justificativa=msg_l,
+                contexto_raw=ctx_ml2,
+                justificativa_ia=msg_l,
+                lado_ordem="LONG",
+            )
+        except Exception as e_ml2:  # noqa: BLE001
+            print(f"⚠️ [VETO_ML_ANTI_LONG] Falha ao gravar log: {e_ml2}")
+        return
 
     if macro_trend == "INDEFINIDA":
         print("🚧 [SINAL] Preço na Chop Zone da EMA200 (Indefinida). Aguardando rompimento claro.")
@@ -3146,9 +3595,14 @@ def _rodar_ciclo_impl(modo: str) -> None:
         if modo == "FUTURES"
         else None
     )
+    snap_log["whale_flow_score"] = float(_ultimo_whale_flow_score)
+    snap_log["whale_flow_signal"] = str(_ultimo_whale_flow_signal)
+    snap_log["whale_flow_source"] = whale_flow.get("source")
+    snap_log["news_sentiment_score"] = int(_ultimo_news_sentiment_score)
+    snap_log["forecast_preco_alvo"] = _ultimo_preco_alvo_previsao
+    snap_log["forecast_tendencia_alta"] = _ultima_tendencia_alta_previsao
 
     contexto_raw_supabase = indicators.formatar_log_contexto_raw(contexto, snap_log)
-    global _ultimo_rsi_14, _ultimo_adx_14, _ultimo_contexto_raw_supabase
     try:
         _ultimo_rsi_14 = float(snap.get("rsi_14")) if snap.get("rsi_14") is not None else 0.0
     except (TypeError, ValueError):
@@ -3201,6 +3655,7 @@ def _rodar_ciclo_impl(modo: str) -> None:
         veredito = brain.analisar_sentimento_mercado(
             contexto,
             prob_ml=probabilidade,
+            prob_ml_bruto=prob_ml_base,
             limiar_ml=WAKE_FILTER_LONG_MIN,
             limiar_ml_short=WAKE_FILTER_SHORT_MAX,
             direcao_sugerida=direcao_sugerida,
@@ -3212,6 +3667,8 @@ def _rodar_ciclo_impl(modo: str) -> None:
             },
             user_market_observation=contexto_humano_brain,
             is_turbo=is_turbo_this_cycle,
+            whale_flow_score=float(_ultimo_whale_flow_score),
+            whale_flow_signal=str(_ultimo_whale_flow_signal),
         )
         if USER_MARKET_OBSERVATION_CLEAR_AFTER_BRAIN_CALL and USER_MARKET_OBSERVATION:
             if str(veredito.get("sentimento", "")).upper() != "ERROR":
@@ -3286,6 +3743,37 @@ def _rodar_ciclo_impl(modo: str) -> None:
             f"👑 [GOD MODE] Veredito MANUAL detetado — filtros RSI/ADX/VWAP ignorados; "
             f"execução forçada para {alvo}."
         )
+
+    if not manual_override_veredito:
+        texto_audit_ml = f"{contexto}\n{alerta}\n{just_ia}"
+        if (
+            prob_ml_base > ML_PROB_SUBMISSAO_LONG
+            and direcao_sugerida == "LONG"
+            and pos_rec != "LONG"
+        ):
+            if not _contexto_tem_catastrofe_sistemica(texto_audit_ml):
+                print(
+                    f"⚜️ [ML SUBMISSÃO] P(alta) bruto {palta_bruto_pct:.2f}% > "
+                    f"{ML_PROB_SUBMISSAO_LONG:.0%} — Claude não pode vetar LONG por notícias leves; "
+                    "a forçar confirmação (sem catástrofe sistémica no contexto)."
+                )
+                pos_rec = "LONG"
+                sent = "BULLISH"
+                conf_num = max(conf_num, CONFIANCA_BRAIN_MIN_ENTRADA)
+        if (
+            prob_ml_base < ML_PROB_SUBMISSAO_SHORT
+            and direcao_sugerida == "SHORT"
+            and pos_rec != "SHORT"
+        ):
+            if not _contexto_tem_catalisador_altista_estrutural(texto_audit_ml):
+                print(
+                    f"⚜️ [ML SUBMISSÃO] P(alta) bruto {palta_bruto_pct:.2f}% < "
+                    f"{ML_PROB_SUBMISSAO_SHORT:.0%} — Claude não pode vetar SHORT por ruído altista moderado; "
+                    "a forçar confirmação (sem catalisador estrutural explícito)."
+                )
+                pos_rec = "SHORT"
+                sent = "BEARISH"
+                conf_num = max(conf_num, CONFIANCA_BRAIN_MIN_ENTRADA)
 
     if (
         parede_venda_proxima_confirma_short
@@ -3445,7 +3933,12 @@ def _rodar_ciclo_impl(modo: str) -> None:
             )
             return
 
-    if not manual_override_veredito and modo == "FUTURES" and pa_bundle.get("double_top"):
+    if (
+        not manual_override_veredito
+        and modo == "FUTURES"
+        and pa_bundle.get("double_top")
+        and prob_ml_base <= ML_PROB_BLOQUEIO_SHORT
+    ):
         if sent == "BULLISH" and pos_rec == "LONG":
             print(
                 "    [Price Action] Double Top (dois topos locais + recuo) — viés baixa; LONG vetado."
@@ -3468,7 +3961,13 @@ def _rodar_ciclo_impl(modo: str) -> None:
             )
             return
 
-    if not manual_override_veredito and modo == "FUTURES" and sent == "BEARISH" and pos_rec == "SHORT":
+    if (
+        not manual_override_veredito
+        and modo == "FUTURES"
+        and sent == "BEARISH"
+        and pos_rec == "SHORT"
+        and prob_ml_base >= ML_PROB_BLOQUEIO_LONG
+    ):
         db_pa = bool(pa_bundle.get("double_bottom"))
         db_troughs = False
         try:
@@ -3694,6 +4193,54 @@ def _rodar_ciclo_impl(modo: str) -> None:
         if manual_override_veredito:
             print("    👑 [GOD MODE] Execução LONG forçada por veredito MANUAL.")
         try:
+            # Passo 3 (Juiz Final): só no instante pré-ordem para poupar API/custo.
+            try:
+                df_vis = ml_model.fetch_ohlcv_binance(
+                    symbol=SYMBOL_TRADE,
+                    timeframe=ml_model.TIMEFRAME,
+                    total=120,
+                )
+            except Exception:
+                df_vis = None
+            _ultima_etapa_funil = "PASSO_3_JUIZ_FINAL"
+            veto_visual = bool(asyncio.run(intelligence_hub.confirmar_entrada_visao(df_vis, "LONG")))
+            if veto_visual:
+                _ultimo_llava_veto = True
+                _ultima_razao_abort_funil = "LLAVA_VISUAL_BARRIER"
+                msg_veto_vis = "Llava vetou a entrada por barreira visual (Juiz Final)."
+                print(f"🛑 [JUIZ FINAL] {msg_veto_vis}")
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento=sent,
+                    acao="VETO_LLAVA_VISUAL",
+                    justificativa=f"{just_ia_entry} | {msg_veto_vis}",
+                    lado_ordem="LONG",
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia_entry,
+                    noticias_agregadas=contexto,
+                    whale_flow_score=float(_ultimo_whale_flow_score),
+                    social_sentiment_score=float(_ultimo_social_sentiment_score),
+                    funnel_stage=_ultima_etapa_funil,
+                    funnel_abort_reason=_ultima_razao_abort_funil,
+                    ml_prob_base=_ultima_ml_prob_base,
+                    ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                    llava_veto=True,
+                )
+                _emit_funnel_observability(
+                    "ABORT_PASSO_3",
+                    {
+                        "reason": _ultima_razao_abort_funil,
+                        "order_side": "LONG",
+                        "ml_prob_base": _ultima_ml_prob_base,
+                        "ml_prob_calibrated": _ultima_ml_prob_calibrada,
+                        "forecast_target": _ultimo_preco_alvo_previsao,
+                        "forecast_trend_up": _ultima_tendencia_alta_previsao,
+                    },
+                )
+                return
+            _ultimo_llava_veto = False
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             if modo == "FUTURES":
                 trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
@@ -3706,6 +4253,29 @@ def _rodar_ciclo_impl(modo: str) -> None:
                     trailing_activation_multiplier=trailing_mult,
                     turbo_chase=is_turbo_this_cycle,
                 )
+                if bool(ordem.get("auric_skipped")):
+                    _ultima_razao_abort_funil = "REDIS_LOCK_ACTIVE"
+                    print("⏭️ [LOCK] LONG ignorado: lock Redis ativo (anti-spam 5s).")
+                    logger.registrar_log_trade(
+                        par_moeda=SYMBOL_TRADE,
+                        preco=preco,
+                        prob_ml=probabilidade,
+                        sentimento=sent,
+                        acao="VETO_REDIS_LOCK",
+                        justificativa=f"{just_ia_entry} | lock Redis ativo; entrada ignorada.",
+                        lado_ordem="LONG",
+                        contexto_raw=contexto_raw_supabase,
+                        justificativa_ia=just_ia_entry,
+                        noticias_agregadas=contexto,
+                        whale_flow_score=float(_ultimo_whale_flow_score),
+                        social_sentiment_score=float(_ultimo_social_sentiment_score),
+                        funnel_stage="PASSO_3_EXECUCAO",
+                        funnel_abort_reason=_ultima_razao_abort_funil,
+                        ml_prob_base=_ultima_ml_prob_base,
+                        ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                        llava_veto=False,
+                    )
+                    return
             else:
                 ordem = ex_mod.executar_compra_spot_market(SYMBOL_TRADE, exchange=ex)
             oid = ordem.get("id", "?")
@@ -3745,6 +4315,21 @@ def _rodar_ciclo_impl(modo: str) -> None:
                 is_maker=is_maker,
                 rsi_14=rsi_num,
                 adx_14=adx_num,
+                funnel_stage="PASSO_3_EXECUCAO",
+                funnel_abort_reason=None,
+                ml_prob_base=_ultima_ml_prob_base,
+                ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                llava_veto=False,
+            )
+            _emit_funnel_observability(
+                "EXEC_PASSO_3",
+                {
+                    "order_side": "LONG",
+                    "ml_prob_base": _ultima_ml_prob_base,
+                    "ml_prob_calibrated": _ultima_ml_prob_calibrada,
+                    "forecast_target": _ultimo_preco_alvo_previsao,
+                    "forecast_trend_up": _ultima_tendencia_alta_previsao,
+                },
             )
             print(
                 f"\n    [Estado] COMPRA Long: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
@@ -3822,6 +4407,54 @@ def _rodar_ciclo_impl(modo: str) -> None:
         except Exception as e_sp:  # noqa: BLE001
             print(f"    ⚠️ Verificação volume spike (antes do SHORT): {e_sp}")
         try:
+            # Passo 3 (Juiz Final): só no instante pré-ordem para poupar API/custo.
+            try:
+                df_vis = ml_model.fetch_ohlcv_binance(
+                    symbol=SYMBOL_TRADE,
+                    timeframe=ml_model.TIMEFRAME,
+                    total=120,
+                )
+            except Exception:
+                df_vis = None
+            _ultima_etapa_funil = "PASSO_3_JUIZ_FINAL"
+            veto_visual = bool(asyncio.run(intelligence_hub.confirmar_entrada_visao(df_vis, "SHORT")))
+            if veto_visual:
+                _ultimo_llava_veto = True
+                _ultima_razao_abort_funil = "LLAVA_VISUAL_BARRIER"
+                msg_veto_vis = "Llava vetou a entrada por barreira visual (Juiz Final)."
+                print(f"🛑 [JUIZ FINAL] {msg_veto_vis}")
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento=sent,
+                    acao="VETO_LLAVA_VISUAL",
+                    justificativa=f"{just_ia_entry} | {msg_veto_vis}",
+                    lado_ordem="SHORT",
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia_entry,
+                    noticias_agregadas=contexto,
+                    whale_flow_score=float(_ultimo_whale_flow_score),
+                    social_sentiment_score=float(_ultimo_social_sentiment_score),
+                    funnel_stage=_ultima_etapa_funil,
+                    funnel_abort_reason=_ultima_razao_abort_funil,
+                    ml_prob_base=_ultima_ml_prob_base,
+                    ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                    llava_veto=True,
+                )
+                _emit_funnel_observability(
+                    "ABORT_PASSO_3",
+                    {
+                        "reason": _ultima_razao_abort_funil,
+                        "order_side": "SHORT",
+                        "ml_prob_base": _ultima_ml_prob_base,
+                        "ml_prob_calibrated": _ultima_ml_prob_calibrada,
+                        "forecast_target": _ultimo_preco_alvo_previsao,
+                        "forecast_trend_up": _ultima_tendencia_alta_previsao,
+                    },
+                )
+                return
+            _ultimo_llava_veto = False
             print(f"⚡ [ORDEM] Enviando comando de {sent} para a Binance...")
             trailing_cb, trailing_mult = _trailing_callback_cfg, _trailing_activation_mult_cfg
             ordem = executor_futures.abrir_short_market(
@@ -3833,6 +4466,29 @@ def _rodar_ciclo_impl(modo: str) -> None:
                 trailing_activation_multiplier=trailing_mult,
                 turbo_chase=is_turbo_this_cycle,
             )
+            if bool(ordem.get("auric_skipped")):
+                _ultima_razao_abort_funil = "REDIS_LOCK_ACTIVE"
+                print("⏭️ [LOCK] SHORT ignorado: lock Redis ativo (anti-spam 5s).")
+                logger.registrar_log_trade(
+                    par_moeda=SYMBOL_TRADE,
+                    preco=preco,
+                    prob_ml=probabilidade,
+                    sentimento=sent,
+                    acao="VETO_REDIS_LOCK",
+                    justificativa=f"{just_ia_entry} | lock Redis ativo; entrada ignorada.",
+                    lado_ordem="SHORT",
+                    contexto_raw=contexto_raw_supabase,
+                    justificativa_ia=just_ia_entry,
+                    noticias_agregadas=contexto,
+                    whale_flow_score=float(_ultimo_whale_flow_score),
+                    social_sentiment_score=float(_ultimo_social_sentiment_score),
+                    funnel_stage="PASSO_3_EXECUCAO",
+                    funnel_abort_reason=_ultima_razao_abort_funil,
+                    ml_prob_base=_ultima_ml_prob_base,
+                    ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                    llava_veto=False,
+                )
+                return
             oid = ordem.get("id", "?")
             st = ordem.get("status", "?")
             commission, is_maker = _commission_and_maker_from_order(ordem)
@@ -3865,6 +4521,21 @@ def _rodar_ciclo_impl(modo: str) -> None:
                 is_maker=is_maker,
                 rsi_14=rsi_num,
                 adx_14=adx_num,
+                funnel_stage="PASSO_3_EXECUCAO",
+                funnel_abort_reason=None,
+                ml_prob_base=_ultima_ml_prob_base,
+                ml_prob_calibrated=_ultima_ml_prob_calibrada,
+                llava_veto=False,
+            )
+            _emit_funnel_observability(
+                "EXEC_PASSO_3",
+                {
+                    "order_side": "SHORT",
+                    "ml_prob_base": _ultima_ml_prob_base,
+                    "ml_prob_calibrated": _ultima_ml_prob_calibrada,
+                    "forecast_target": _ultimo_preco_alvo_previsao,
+                    "forecast_trend_up": _ultima_tendencia_alta_previsao,
+                },
             )
             print(
                 f"\n    [Estado] SHORT aberto: posicao_aberta=True | preco ref.={preco_compra:.4f} USDC"
@@ -3893,6 +4564,10 @@ def _rodar_ciclo_impl(modo: str) -> None:
 
 async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
     """Executa o ciclo completo em thread para não bloquear o event loop (asyncio.to_thread)."""
+    lock_ctx = await _acquire_redis_order_lock(SYMBOL_TRADE)
+    if lock_ctx == ("", ""):
+        print("⚠️ Ordem bloqueada pelo Redis para evitar spam", flush=True)
+        return
     try:
         await asyncio.to_thread(rodar_ciclo, modo)
     except Exception as e:  # noqa: BLE001
@@ -3911,6 +4586,8 @@ async def _executar_ciclo_assincrono(modo: str, origem: str) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        await _release_redis_order_lock(lock_ctx)
 
 
 async def safe_rodar_ciclo() -> None:

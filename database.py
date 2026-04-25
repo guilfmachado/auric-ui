@@ -76,7 +76,7 @@ def log_trade(
         "raw_exchange": raw_exchange or {},
         "mode": mode,
     }
-    res = get_client().table("trades").insert(payload).execute()
+    res = get_client().table("trade_logs").insert(payload).execute()
     if res.data and len(res.data) > 0:
         return res.data[0]
     return {}

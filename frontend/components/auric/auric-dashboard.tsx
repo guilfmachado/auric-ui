@@ -79,6 +79,14 @@ export function AuricDashboard() {
     entryPrice,
     positionOpen,
     walletFetchFailed,
+    whaleFlowScore,
+    socialSentimentScore,
+    newsSentimentScore,
+    forecastPrecoAlvo,
+    forecastTendenciaAlta,
+    llavaVeto,
+    funnelStage,
+    funnelAbortReason,
     manualPending,
     insertManualCommand,
     tradeOutcomes,
@@ -228,6 +236,46 @@ export function AuricDashboard() {
   const logsForTable = logs.slice(0, LIVE_LOGS_N);
   const emptyTelemetry = parseTelemetryFromLog(null);
   const isMotorLoading = ready && supabaseReady && !motorHydrated;
+  const mlBase = latestLog?.ml_prob_base;
+  const mlCalibrated = latestLog?.ml_prob_calibrated;
+  const mlDelta =
+    typeof mlBase === "number" && typeof mlCalibrated === "number"
+      ? mlCalibrated - mlBase
+      : null;
+  const funnelStageLabel = (funnelStage ?? latestLog?.funnel_stage ?? "N/A").toUpperCase();
+  const funnelAbortLabel = funnelAbortReason ?? latestLog?.funnel_abort_reason ?? "—";
+  const stageLooksGood =
+    funnelStageLabel.includes("EXEC") ||
+    funnelStageLabel.includes("ALLOW") ||
+    funnelStageLabel.includes("PASS");
+  const stageLooksBad =
+    funnelStageLabel.includes("VETO") ||
+    funnelStageLabel.includes("ABORT") ||
+    funnelStageLabel.includes("BLOCK");
+  const stageToneClass = stageLooksGood
+    ? "text-emerald-400"
+    : stageLooksBad
+      ? "text-red-400"
+      : "text-amber-300";
+  const abortToneClass = funnelAbortLabel !== "—" ? "text-red-400" : "text-zinc-300";
+  const llavaToneClass =
+    llavaVeto || latestLog?.llava_veto ? "text-red-400" : "text-emerald-400";
+  const whaleToneClass =
+    typeof whaleFlowScore === "number"
+      ? whaleFlowScore < -0.5
+        ? "text-red-400"
+        : whaleFlowScore > 0.5
+          ? "text-emerald-400"
+          : "text-zinc-300"
+      : "text-zinc-300";
+  const newsToneClass =
+    typeof newsSentimentScore === "number"
+      ? newsSentimentScore < 0
+        ? "text-red-400"
+        : newsSentimentScore > 0
+          ? "text-emerald-400"
+          : "text-zinc-300"
+      : "text-zinc-300";
 
   if (connectionError != null) {
     return (
@@ -393,6 +441,24 @@ export function AuricDashboard() {
                     justificativaLog={justificativaLog}
                     noticiasAgregadas={noticiasAgregadas}
                   />
+                  <TerminalCard>
+                    <h2 className="text-[10px] font-semibold tracking-[0.22em] text-zinc-500 uppercase">
+                      Funil de decisao
+                    </h2>
+                    <div className="mt-3 grid gap-2 text-xs text-zinc-300 sm:grid-cols-2">
+                      <p><span className="text-zinc-500">Stage:</span> <span className={stageToneClass}>{funnelStageLabel}</span></p>
+                      <p><span className="text-zinc-500">Abort reason:</span> <span className={abortToneClass}>{funnelAbortLabel}</span></p>
+                      <p><span className="text-zinc-500">ML base:</span> {typeof mlBase === "number" ? mlBase.toFixed(4) : "—"}</p>
+                      <p><span className="text-zinc-500">ML calibrated:</span> {typeof mlCalibrated === "number" ? mlCalibrated.toFixed(4) : "—"}</p>
+                      <p><span className="text-zinc-500">Delta calib:</span> {typeof mlDelta === "number" ? mlDelta.toFixed(4) : "—"}</p>
+                      <p><span className="text-zinc-500">Llava veto:</span> <span className={llavaToneClass}>{llavaVeto || latestLog?.llava_veto ? "SIM" : "NAO"}</span></p>
+                      <p><span className="text-zinc-500">News score:</span> <span className={newsToneClass}>{typeof newsSentimentScore === "number" ? newsSentimentScore.toFixed(2) : "—"}</span></p>
+                      <p><span className="text-zinc-500">Whale flow:</span> <span className={whaleToneClass}>{typeof whaleFlowScore === "number" ? whaleFlowScore.toFixed(3) : "—"}</span></p>
+                      <p><span className="text-zinc-500">Social score:</span> {typeof socialSentimentScore === "number" ? socialSentimentScore.toFixed(2) : "—"}</p>
+                      <p><span className="text-zinc-500">Forecast trend:</span> {forecastTendenciaAlta == null ? "—" : forecastTendenciaAlta ? "ALTA" : "BAIXA"}</p>
+                      <p><span className="text-zinc-500">Forecast alvo:</span> {typeof forecastPrecoAlvo === "number" ? forecastPrecoAlvo.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"}</p>
+                    </div>
+                  </TerminalCard>
                   <TerminalCard>
                     <h2 className="text-[10px] font-semibold tracking-[0.22em] text-zinc-500 uppercase">
                       Curva acumulada (%)

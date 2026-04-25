@@ -156,6 +156,45 @@ def _dict_from_veredito_texto_brain(
     }
 
 
+def _bloco_regra_submissao_ml_claude(prob_bruto: float | None, direcao_sugerida: str) -> str:
+    """
+    Regra de submissão do LLM ao XGBoost quando P(alta) bruta é extrema.
+    Reduz vetos por notícias moderadas (ex.: fluxos de baleias) em favor do modelo.
+    """
+    if prob_bruto is None:
+        return ""
+    try:
+        p = float(prob_bruto)
+    except (TypeError, ValueError):
+        return ""
+    d = (direcao_sugerida or "LONG").strip().upper()
+    partes: list[str] = []
+    if d == "LONG" and p > 0.80:
+        partes.append(
+            "REGRA DE SUBMISSÃO AO ML (OBRIGATÓRIA — P(alta) BRUTA > 80%):\n"
+            "O XGBoost indica probabilidade **extremamente alta** de subida. **NÃO** recomendes VETO "
+            "em LONG por notícias de rotina: movimentos de baleias, rumores leves, «fear» genérico, "
+            "correções intradia ou títulos sensacionalistas **sem** evento sistémico.\n"
+            "Só podes recomendar **VETO** ou divergência de LONG se identificares **catástrofe sistémica** "
+            "explícita no texto agregado (ex.: hack massivo a exchange, falência/insolvência de player "
+            "crítico, processo SEC grave com custódia em risco, paragem de levantamentos). "
+            "Palavras-chave exemplares: hack/hacked, bankruptcy/bankrupt, insolvent, SEC lawsuit/charges, "
+            "withdrawals halted.\n"
+            "Em caso de dúvida com P(alta) > 80%, alinha **posicao_recomendada** com **LONG** e "
+            "confirma leitura **BULLISH** salvo catástrofe clara."
+        )
+    if d == "SHORT" and p < 0.20:
+        partes.append(
+            "REGRA INVERSA (OBRIGATÓRIA — P(alta) BRUTA < 20%, forte viés de QUEDA no ML):\n"
+            "**NÃO** recomendes VETO em SHORT por notícias moderadamente positivas ou «dip buying» de retalho.\n"
+            "Só **VETO** em SHORT se houver catalisador **estrutural e extremo** a favor de preço "
+            "(ex.: aprovação regulatória histórica explícita tipo spot ETF aprovado no mesmo dia, "
+            "liquidação de risco sistémico comprovadamente resolvida a favor do activo). "
+            "Sem isso, alinha **SHORT** com o sinal técnico."
+        )
+    return "\n\n".join(partes) if partes else ""
+
+
 def _prompt_sistema_claude(direcao_sugerida: str) -> str:
     d = (direcao_sugerida or "LONG").strip().upper()
     if d not in ("LONG", "SHORT"):
@@ -205,6 +244,9 @@ def _montar_prompt_completo_claude(
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
     user_market_observation: str | None = None,
     is_turbo: bool = False,
+    prob_ml_bruto: float | None = None,
+    whale_flow_score: float | None = None,
+    whale_flow_signal: str | None = None,
 ) -> str:
     base = _prompt_sistema_claude(direcao_sugerida)
     if bloco_tecnico_prioritario and str(bloco_tecnico_prioritario).strip():
@@ -234,6 +276,18 @@ def _montar_prompt_completo_claude(
             "de um VETO ou procurar divergências para SHORT. Se os dados vierem como None, ignore "
             "esta métrica no ciclo atual."
         )
+    if whale_flow_score is not None or whale_flow_signal:
+        wf_score = "None" if whale_flow_score is None else f"{float(whale_flow_score):+.2f}"
+        wf_sig = str(whale_flow_signal or "NEUTRAL")
+        bloco += (
+            "\n\n🐋 SMART MONEY FLOW\n"
+            f"- whale_flow_score: {wf_score}\n"
+            f"- whale_flow_signal: {wf_sig}\n"
+            "Interpretação mandatória:\n"
+            "- score > 0: influxo/sinal de baleias para exchange (potencial distribuição no curto prazo).\n"
+            "- score < 0: saída de liquidez (risco de bull trap se preço subir sem suporte real).\n"
+            "Se score < 0 e contexto técnico indicar preço a subir, aumente peso para VETO de LONG.\n"
+        )
     bloco += "\n\n=== [USER_SENTIMENT_CONTEXT] — Contexto Humano ===\n"
     obs = (user_market_observation or "").strip()
     if obs:
@@ -248,6 +302,9 @@ def _montar_prompt_completo_claude(
             "na zona neutra (se aplicável). Prioriza o comando **TURBO** na secção acima com peso 2.0 "
             "para **forçar/reforçar** entrada alinhada; em `justificativa_curta` inclui **[TURBO MODE ATIVO]**.\n"
         )
+    subm = _bloco_regra_submissao_ml_claude(prob_ml_bruto, direcao_sugerida)
+    if subm:
+        bloco += "\n\n=== REGRAS DE CALIBRAGEM ML (PRIORIDADE SOBRE RUÍDO DE NOTÍCIAS) ===\n\n" + subm
     bloco += (
         "\n\nResponde agora somente com o objeto JSON pedido acima "
         "(cinco chaves, incluindo posicao_recomendada)."
@@ -301,6 +358,7 @@ def analisar_sentimento_mercado(
     contexto_agregado: str,
     *,
     prob_ml: float | None = None,
+    prob_ml_bruto: float | None = None,
     limiar_ml: float | None = None,
     limiar_ml_short: float | None = None,
     direcao_sugerida: str = "LONG",
@@ -310,6 +368,8 @@ def analisar_sentimento_mercado(
     micro_estrutura_posicionamento: dict[str, Any] | None = None,
     user_market_observation: str | None = None,
     is_turbo: bool = False,
+    whale_flow_score: float | None = None,
+    whale_flow_signal: str | None = None,
 ) -> dict[str, Any]:
     """
     Envia o contexto do IntelligenceHub (+ XGBoost + direção LONG/SHORT) ao Replicate (Claude 4.5 por omissão).
@@ -352,6 +412,7 @@ def analisar_sentimento_mercado(
     ).strip():
         ta_block = str(bloco_indicadores).strip()
 
+    p_bruto = prob_ml_bruto if prob_ml_bruto is not None else prob_ml
     prompt_completo = _montar_prompt_completo_claude(
         contexto_agregado,
         ref_xgboost=ref_xg,
@@ -360,6 +421,9 @@ def analisar_sentimento_mercado(
         micro_estrutura_posicionamento=micro_estrutura_posicionamento,
         user_market_observation=user_market_observation,
         is_turbo=is_turbo,
+        prob_ml_bruto=p_bruto,
+        whale_flow_score=whale_flow_score,
+        whale_flow_signal=whale_flow_signal,
     )
 
     model_slug = REPLICATE_MODEL
@@ -367,12 +431,27 @@ def analisar_sentimento_mercado(
         print("🧠 [BRAIN] Consultando Claude 4.5 Sonnet (Elite Mode)...")
 
     if prob_ml is not None:
+        p_instr = float(prob_ml)
+        p_b = float(p_bruto) if p_bruto is not None else p_instr
+        reforco_sub = ""
+        if d == "LONG" and p_b > 0.80:
+            reforco_sub = (
+                "ATENÇÃO: P(alta) **bruta** do XGBoost neste ciclo é > 80%. **Não** apliques VETO por "
+                "divergências leves com notícias — só por catástrofe sistémica (ver secção REGRAS DE CALIBRAGEM ML).\n"
+            )
+        if d == "SHORT" and p_b < 0.20:
+            reforco_sub += (
+                "ATENÇÃO: P(alta) **bruta** < 20% (forte viés de queda). **Não** apliques VETO por otimismo "
+                "moderado nas manchetes — só por catalisador altista estrutural explícito.\n"
+            )
         instrucao_duplo = (
             "Atua como analista de risco institucional: factual, conservador, sem optimismo nem criatividade literária.\n"
             "O contexto que se segue inclui obrigatoriamente (1) a secção «=== CONTEXTO AGREGADO» com o texto "
             "das notícias e feeds (institucional, Reddit, Twitter) e (2) o bloco final «=== SINAL TÉCNICO (XGBoost)» "
             "com P(alta) em percentagem explícita e em [0,1]. Cruza (1) com (2); se divergirem de forma material, "
-            "VETO.\n"
+            "podes usar VETO — **salvo** secções explícitas «REGRAS DE CALIBRAGEM ML» que restringem vetos "
+            "por ruído quando o modelo está num extremo estatístico.\n"
+            f"{reforco_sub}"
             f"Resumo do sinal numérico deste ciclo (repetido no XGBoost no final): P(alta) = {_pct_br_ml(float(prob_ml))}.\n"
         )
         if is_turbo:

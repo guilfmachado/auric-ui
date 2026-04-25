@@ -7,7 +7,11 @@ texto limpo para o Claude. Fallback: SOCIAL_TWITTER_SNIPPET no .env.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import html as html_stdlib
+import io
+import json
 import os
 import re
 import urllib.error
@@ -19,6 +23,8 @@ MAX_CONTEXTO_AGREGADO_CHARS = 1500
 TRUNCATION_SUFFIX = "... [TRUNCADO PARA POUPAR TOKENS]"
 
 import feedparser
+import mplfinance as mpf
+import replicate
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,6 +56,19 @@ _RE_ESPACOS = re.compile(r"\s+")
 
 # Notícias com mais idade que isto são descartadas (ruído em cripto).
 NOTICIAS_MAX_IDADE_HORAS = 2
+RSS_SENTIMENT_FEEDS: tuple[str, ...] = (
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+)
+REPLICATE_FINBERT_MODEL = (
+    os.getenv("REPLICATE_FINBERT_MODEL", "anthropic/claude-4.5-sonnet").strip()
+)
+REPLICATE_TS_FORECAST_MODEL = (
+    os.getenv("REPLICATE_TS_FORECAST_MODEL", "amazon/chronos-forecasting-large").strip()
+)
+REPLICATE_VISION_MODEL = (
+    os.getenv("REPLICATE_VISION_MODEL", "yorickvp/llava-13b").strip()
+)
 
 
 def _timestamp_da_entrada_feed(ent: Any) -> datetime | None:
@@ -115,6 +134,345 @@ def limpar_texto_feed_bruto(texto: str, max_chars: int = 380) -> str:
         corte = t[: max_chars - 1]
         t = corte.rsplit(" ", 1)[0] + "…"
     return t
+
+
+def _aliases_simbolo_para_noticias(simbolo: str) -> set[str]:
+    """Aliases para filtrar manchetes (ticker e nome canónico)."""
+    s = str(simbolo or "").strip().upper()
+    if not s:
+        s = "BTCUSDT"
+    s = s.replace("/", "").replace(":USDT", "").replace(":USDC", "")
+    base = s
+    for q in ("USDT", "USDC", "BUSD", "USD"):
+        if base.endswith(q) and len(base) > len(q):
+            base = base[: -len(q)]
+            break
+    aliases = {base}
+    mapa = {
+        "BTC": {"BTC", "BITCOIN"},
+        "ETH": {"ETH", "ETHEREUM"},
+        "SOL": {"SOL", "SOLANA"},
+        "BNB": {"BNB", "BINANCE COIN", "BINANCECOIN"},
+        "XRP": {"XRP", "RIPPLE"},
+    }
+    aliases.update(mapa.get(base, {base}))
+    return {a.upper() for a in aliases if a}
+
+
+def _headline_menciona_alias(headline: str, aliases: set[str]) -> bool:
+    t = str(headline or "").upper()
+    if not t:
+        return False
+    for a in aliases:
+        if re.search(rf"\b{re.escape(a)}\b", t):
+            return True
+    return False
+
+
+def _score_finbert_replicate_sync(manchetes: list[str]) -> int:
+    """
+    Classifica sentimento agregado via Replicate (modelo FinBERT-like configurável).
+    """
+    if not manchetes:
+        return 0
+    token = (os.getenv("REPLICATE_API_TOKEN") or "").strip()
+    if not token:
+        return 0
+    prompt = (
+        "You are a financial-news sentiment classifier. "
+        "Return ONLY JSON in schema "
+        '{"score": -1|0|1, "label": "bearish|neutral|bullish"} '
+        "for these crypto headlines.\n\nHEADLINES:\n- "
+        + "\n- ".join(manchetes[:20])
+    )
+    try:
+        out = replicate.run(
+            REPLICATE_FINBERT_MODEL,
+            input={"prompt": prompt, "temperature": 0.1, "max_tokens": 120},
+        )
+        txt = out if isinstance(out, str) else "".join(out)
+        txt = str(txt or "").strip()
+        if not txt:
+            return 0
+        try:
+            obj = json.loads(txt)
+        except json.JSONDecodeError:
+            m = re.search(r"\{[\s\S]*\}", txt)
+            if not m:
+                return 0
+            obj = json.loads(m.group(0))
+        score = int(float(obj.get("score", 0)))
+        if score < 0:
+            return -1
+        if score > 0:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+
+async def analisar_sentimento_noticias(simbolo: str | None = None) -> int:
+    """
+    Lê RSS públicos (Cointelegraph + CoinDesk), filtra manchetes da última hora por símbolo
+    e devolve score final {-1,0,1}. Em falha, retorna 0 por segurança.
+    """
+    try:
+        sym = simbolo or os.getenv("SYMBOL", "BTCUSDT")
+        aliases = _aliases_simbolo_para_noticias(sym)
+        agora = datetime.now(timezone.utc)
+        limite = agora - timedelta(hours=1)
+
+        headlines: list[str] = []
+        for feed_url in RSS_SENTIMENT_FEEDS:
+            try:
+                parsed = await asyncio.to_thread(feedparser.parse, feed_url)
+                for ent in list(getattr(parsed, "entries", []) or []):
+                    ts = _timestamp_da_entrada_feed(ent)
+                    if ts is None or ts < limite:
+                        continue
+                    title = limpar_texto_feed_bruto((ent.get("title") or "").strip(), max_chars=220)
+                    if not title:
+                        continue
+                    if _headline_menciona_alias(title, aliases):
+                        headlines.append(title)
+            except Exception:
+                continue
+
+        if not headlines:
+            return 0
+        score = await asyncio.to_thread(_score_finbert_replicate_sync, headlines)
+        if score < 0:
+            return -1
+        if score > 0:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+
+def _safe_float_from_any(v: Any) -> float | None:
+    try:
+        f = float(v)
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_forecast_values(payload: Any) -> list[float]:
+    """
+    Extrai lista de floats de respostas heterogéneas do Replicate.
+    """
+    vals: list[float] = []
+    if isinstance(payload, (int, float)):
+        f = _safe_float_from_any(payload)
+        return [f] if f is not None else []
+    if isinstance(payload, list):
+        for item in payload:
+            vals.extend(_extract_forecast_values(item))
+        return vals
+    if isinstance(payload, dict):
+        for k in ("forecast", "predictions", "prediction", "output", "data", "values"):
+            if k in payload:
+                vals.extend(_extract_forecast_values(payload.get(k)))
+        return vals
+    if isinstance(payload, str):
+        s = payload.strip()
+        if not s:
+            return []
+        try:
+            obj = json.loads(s)
+            return _extract_forecast_values(obj)
+        except json.JSONDecodeError:
+            nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+            out: list[float] = []
+            for n in nums:
+                f = _safe_float_from_any(n)
+                if f is not None:
+                    out.append(f)
+            return out
+    return []
+
+
+def _replicate_forecast_sync(serie_close: list[float]) -> list[float]:
+    """
+    Chamada síncrona ao Replicate para previsão de série temporal.
+    Executar via `asyncio.to_thread`.
+    """
+    if not serie_close or len(serie_close) < 10:
+        return []
+    token = (os.getenv("REPLICATE_API_TOKEN") or "").strip()
+    if not token:
+        return []
+    try:
+        out = replicate.run(
+            REPLICATE_TS_FORECAST_MODEL,
+            input={
+                "series": serie_close,
+                "horizon": 8,
+            },
+        )
+    except Exception:
+        return []
+    if isinstance(out, str):
+        return _extract_forecast_values(out)
+    if isinstance(out, dict):
+        return _extract_forecast_values(out)
+    if isinstance(out, list):
+        return _extract_forecast_values(out)
+    try:
+        txt = "".join(out)
+        return _extract_forecast_values(txt)
+    except Exception:
+        return []
+
+
+async def prever_proximos_candles(df_historico: Any) -> dict[str, Any]:
+    """
+    Recebe OHLCV (DataFrame-like), envia últimos 100 closes ao Replicate (Chronos),
+    calcula média das próximas 3 velas previstas e compara com o preço atual.
+    """
+    try:
+        if df_historico is None:
+            return {"tendencia_alta": None, "preco_alvo": None}
+        close_series = getattr(df_historico, "get", lambda *_: None)("close")
+        if close_series is None:
+            return {"tendencia_alta": None, "preco_alvo": None}
+        if hasattr(close_series, "tolist"):
+            closes_raw = close_series.tolist()
+        else:
+            closes_raw = list(close_series)
+        closes = [float(x) for x in closes_raw if x is not None]
+        if len(closes) < 5:
+            return {"tendencia_alta": None, "preco_alvo": None}
+        ultimos_100 = closes[-100:]
+        preco_atual = float(ultimos_100[-1])
+        previsoes = await asyncio.to_thread(_replicate_forecast_sync, ultimos_100)
+        if len(previsoes) < 3:
+            return {"tendencia_alta": None, "preco_alvo": None}
+        alvo = float(sum(previsoes[:3]) / 3.0)
+        return {
+            "tendencia_alta": bool(alvo > preco_atual),
+            "preco_alvo": float(alvo),
+        }
+    except Exception:
+        return {"tendencia_alta": None, "preco_alvo": None}
+
+
+def _dataframe_para_candle_png_data_uri(df_historico: Any) -> str | None:
+    """
+    Gera candle chart + volume dos últimos 50 períodos em memória (sem gravar em disco).
+    Retorna data URI base64 para envio multimodal.
+    """
+    fig = None
+    buf: io.BytesIO | None = None
+    try:
+        # Pandas-like obrigatório; sem ele aborta silenciosamente.
+        df50 = df_historico.tail(50).copy()
+        if len(df50) < 10:
+            return None
+        # mplfinance espera colunas OHLCV com estes nomes exatos.
+        cols = {c.lower(): c for c in list(getattr(df50, "columns", []))}
+        required = {"open", "high", "low", "close", "volume"}
+        if not required.issubset(set(cols.keys())):
+            return None
+        df50 = df50.rename(
+            columns={
+                cols["open"]: "Open",
+                cols["high"]: "High",
+                cols["low"]: "Low",
+                cols["close"]: "Close",
+                cols["volume"]: "Volume",
+            }
+        )
+        # Index datetime melhora render do eixo x; fallback mantém índice original.
+        idx = getattr(df50, "index", None)
+        if idx is not None and getattr(idx, "dtype", None) is not None:
+            try:
+                if str(idx.dtype).lower() not in ("datetime64[ns]", "datetime64[ns, utc]"):
+                    ts_col = None
+                    for cand in ("timestamp", "time", "date", "datetime"):
+                        if cand in cols:
+                            ts_col = cols[cand]
+                            break
+                    if ts_col is not None:
+                        dt = df50[ts_col]
+                        if hasattr(dt, "dtype"):
+                            df50.index = __import__("pandas").to_datetime(dt, utc=True)
+            except Exception:
+                pass
+
+        fig, _ax = mpf.plot(
+            df50[["Open", "High", "Low", "Close", "Volume"]],
+            type="candle",
+            style="charles",
+            volume=True,
+            returnfig=True,
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return None
+    finally:
+        try:
+            if fig is not None:
+                fig.clf()
+        except Exception:
+            pass
+        try:
+            if buf is not None:
+                buf.close()
+        except Exception:
+            pass
+
+
+def _confirmar_entrada_visao_sync(df_historico: Any, tipo_ordem: str) -> bool:
+    """
+    Executa confirmação visual multimodal. True = bloquear ordem.
+    """
+    try:
+        token = (os.getenv("REPLICATE_API_TOKEN") or "").strip()
+        if not token:
+            return False
+        ordem = str(tipo_ordem or "").strip().upper()
+        if ordem not in ("LONG", "SHORT"):
+            ordem = "LONG"
+        img_uri = _dataframe_para_candle_png_data_uri(df_historico)
+        if not img_uri:
+            return False
+        prompt = (
+            f"Você é um trader institucional. O sistema quer executar uma ordem de {ordem} "
+            "agora. Olhando este gráfico, há alguma barreira óbvia, divergência ou resistência "
+            "forte contra essa operação? Responda APENAS com a palavra SIM (para bloquear a ordem) "
+            "ou NAO (para permitir)."
+        )
+        out = replicate.run(
+            REPLICATE_VISION_MODEL,
+            input={
+                "prompt": prompt,
+                "image": img_uri,
+                "temperature": 0.0,
+                "max_tokens": 8,
+            },
+        )
+        txt = out if isinstance(out, str) else "".join(out)
+        ans = str(txt or "").strip().upper()
+        return "SIM" in ans
+    except Exception:
+        return False
+
+
+async def confirmar_entrada_visao(df_historico: Any, tipo_ordem: str) -> bool:
+    """
+    Juiz Final visual.
+    Retorna True (bloquear) ou False (permitir). Falhas de API => False.
+    """
+    try:
+        return bool(await asyncio.to_thread(_confirmar_entrada_visao_sync, df_historico, tipo_ordem))
+    except Exception:
+        return False
 
 
 def buscar_tweets_nitter(

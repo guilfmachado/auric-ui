@@ -30,6 +30,21 @@ N_CANDLES = 5000
 CONFIDENCE_THRESHOLD = 0.60
 
 
+def ajustar_probabilidade_com_whale_flow(prob_alta: float, whale_flow_score: float | None) -> float:
+    """
+    Feature extra de Smart Money para o motor de decisão:
+    - score positivo desloca P(alta) para baixo (risco de distribuição em exchange).
+    - score negativo desloca P(alta) para cima levemente (saída de liquidez = squeeze possível).
+    """
+    p = max(0.0, min(1.0, float(prob_alta)))
+    if whale_flow_score is None:
+        return p
+    s = float(whale_flow_score)
+    # Shift pequeno e controlado para não sobrepor o modelo.
+    shift = max(-0.08, min(0.08, -0.05 * s))
+    return max(0.0, min(1.0, p + shift))
+
+
 def fetch_ohlcv_binance(
     symbol: str = SYMBOL,
     timeframe: str = TIMEFRAME,
