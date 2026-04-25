@@ -17,6 +17,7 @@ import { BrainFeed } from "./brain-feed";
 import { GaugeMatrix } from "./gauge-matrix";
 import { IndicatorHub } from "./indicator-hub";
 import { LogsTable } from "./logs-table";
+import { MacroRadar } from "./macro-radar";
 import { PulseHero } from "./pulse-hero";
 import { TacticalOverridePanel } from "./tactical-override-panel";
 import { TerminalCard } from "./terminal-card";
@@ -395,6 +396,7 @@ export function AuricDashboard() {
                     rsi={null}
                   />
                   <IndicatorHub isLoading telemetry={emptyTelemetry} />
+                  <MacroRadar />
                 </aside>
               </div>
 
@@ -482,6 +484,7 @@ export function AuricDashboard() {
                     rsi={rsiForGauge}
                   />
                   <IndicatorHub telemetry={telemetry} />
+                  <MacroRadar />
                 </aside>
               </div>
 

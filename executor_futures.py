@@ -97,6 +97,8 @@ AURIC_MAX_OPEN_ORDERS_GUARD = max(1, int(os.getenv("AURIC_MAX_OPEN_ORDERS_BEFORE
 SL_REPLACE_MIN_REL_DIFF = float(os.getenv("AURIC_SL_REPLACE_MIN_REL_DIFF", "0.001"))  # 0,1 %
 # Após cada `create_order` de proteção: dar tempo à API refletir estado.
 PROTECTION_ORDER_CREATE_THROTTLE_S = float(os.getenv("AURIC_PROTECTION_CREATE_THROTTLE_S", "5"))
+# Cadência curta entre criações de ordens de proteção no mesmo lote (anti rate-limit Binance).
+PROTECTION_INTER_ORDER_SLEEP_S = float(os.getenv("AURIC_PROTECTION_INTER_ORDER_SLEEP_S", "2"))
 # Após cancelar ordem do mesmo tipo (fetch_open_orders) antes de recriar.
 PROTECTION_PRE_CREATE_CANCEL_SLEEP_S = float(os.getenv("AURIC_PROTECTION_PRE_CREATE_CANCEL_SLEEP_S", "5"))
 # Loop `cancelar_livro_aberto_ate_zero_sync`: pausa entre rondas até `fetch_open_orders` = [].
@@ -2241,6 +2243,8 @@ def _criar_bracket_long_impl(
     sl_break_even: bool = False,
     risk_atr_abs: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_LONG start"):
+        return {}, {}, {}
     q = float(exchange.amount_to_precision(simbolo, qty))
     cb_rate = (
         float(trailing_callback_rate)
@@ -2352,6 +2356,10 @@ def _criar_bracket_long_impl(
                                 f"{_TAG} [FREE RUNNER] TP parcial LONG não criado: segurança pré-create bloqueou.",
                                 flush=True,
                             )
+                        elif _ja_existe_ordem_protecao_aberta(
+                            exchange, simbolo, "LONG", "TAKE_PROFIT_MARKET"
+                        ):
+                            print("[SKIP] Ordem de TAKE_PROFIT_MARKET já existe na Binance.", flush=True)
                         else:
                             ord_tp_partial = exchange.create_order(
                                 simbolo,
@@ -2362,7 +2370,7 @@ def _criar_bracket_long_impl(
                                 {**p_ro, "stopPrice": tp_market_p},
                             )
                             _marcar_criacao_ordem_protecao()
-                            _sleep_apos_criar_ordem_protecao()
+                            _sleep_entre_ordens_protecao()
                             print(
                                 f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
                                 flush=True,
@@ -2380,9 +2388,42 @@ def _criar_bracket_long_impl(
                 flush=True,
             )
 
-    ord_trailing: dict[str, Any] = {}
     ord_sl: dict[str, Any] = {}
+    ord_trailing: dict[str, Any] = {}
     try:
+        if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_LONG STOP_MARKET"):
+            return ord_trailing, ord_sl, ord_tp_partial
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG STOP_MARKET"):
+            print(f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "LONG", context="bracket_LONG STOP_MARKET"
+        ):
+            print(
+                f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        elif _ja_existe_ordem_protecao_aberta(exchange, simbolo, "LONG", "STOP_MARKET"):
+            print("[SKIP] Ordem de STOP_MARKET já existe na Binance.", flush=True)
+        else:
+            ord_sl = exchange.create_order(
+                simbolo,
+                "STOP_MARKET",
+                "sell",
+                q_work,
+                None,
+                {**p_ro, "stopPrice": sl_p},
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_entre_ordens_protecao()
+    except Exception as e_sl:  # noqa: BLE001
+        print(
+            f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET LONG: {e_sl} (seguindo para TRAILING).",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_LONG TRAILING"):
+            return ord_trailing, ord_sl, ord_tp_partial
         if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TRAILING"):
             print(f"{_TAG} [PROTECT] Trailing LONG não criado: throttle anti-spam.", flush=True)
         elif not _assert_seguranca_antes_create_ordem_protecao(
@@ -2392,6 +2433,8 @@ def _criar_bracket_long_impl(
                 f"{_TAG} [PROTECT] Trailing LONG não criado: segurança pré-create bloqueou.",
                 flush=True,
             )
+        elif _ja_existe_ordem_protecao_aberta(exchange, simbolo, "LONG", "TRAILING_STOP_MARKET"):
+            print("[SKIP] Ordem de TRAILING_STOP_MARKET já existe na Binance.", flush=True)
         else:
             ord_trailing = exchange.create_order(
                 simbolo,
@@ -2406,36 +2449,9 @@ def _criar_bracket_long_impl(
                 },
             )
             _marcar_criacao_ordem_protecao()
-            _sleep_apos_criar_ordem_protecao()
+            _sleep_entre_ordens_protecao()
     except Exception as e_tr:  # noqa: BLE001
-        print(
-            f"{_TAG} [PROTECT] Falha ao criar TRAILING LONG: {e_tr} (seguindo para STOP_MARKET).",
-            file=sys.stderr,
-            flush=True,
-        )
-    try:
-        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG STOP_MARKET"):
-            print(f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: throttle anti-spam.", flush=True)
-        elif not _assert_seguranca_antes_create_ordem_protecao(
-            exchange, simbolo, "LONG", context="bracket_LONG STOP_MARKET"
-        ):
-            print(
-                f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: segurança pré-create bloqueou.",
-                flush=True,
-            )
-        else:
-            ord_sl = exchange.create_order(
-                simbolo,
-                "STOP_MARKET",
-                "sell",
-                q_work,
-                None,
-                {**p_ro, "stopPrice": sl_p},
-            )
-            _marcar_criacao_ordem_protecao()
-            _sleep_apos_criar_ordem_protecao()
-    except Exception as e_sl:  # noqa: BLE001
-        print(f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET LONG: {e_sl}", file=sys.stderr, flush=True)
+        print(f"{_TAG} [PROTECT] Falha ao criar TRAILING LONG: {e_tr}", file=sys.stderr, flush=True)
     if sl_break_even:
         print(
             f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (BREAK-EVEN entrada) + "
@@ -2526,6 +2542,8 @@ def _criar_bracket_short_impl(
     sl_break_even: bool = False,
     risk_atr_abs: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_SHORT start"):
+        return {}, {}, {}
     q = float(exchange.amount_to_precision(simbolo, qty))
     cb_rate = (
         float(trailing_callback_rate)
@@ -2637,6 +2655,10 @@ def _criar_bracket_short_impl(
                                 f"{_TAG} [FREE RUNNER] TP parcial SHORT não criado: segurança pré-create bloqueou.",
                                 flush=True,
                             )
+                        elif _ja_existe_ordem_protecao_aberta(
+                            exchange, simbolo, "SHORT", "TAKE_PROFIT_MARKET"
+                        ):
+                            print("[SKIP] Ordem de TAKE_PROFIT_MARKET já existe na Binance.", flush=True)
                         else:
                             ord_tp_partial = exchange.create_order(
                                 simbolo,
@@ -2647,7 +2669,7 @@ def _criar_bracket_short_impl(
                                 {**p_ro, "stopPrice": tp_market_p},
                             )
                             _marcar_criacao_ordem_protecao()
-                            _sleep_apos_criar_ordem_protecao()
+                            _sleep_entre_ordens_protecao()
                             print(
                                 f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
                                 flush=True,
@@ -2665,9 +2687,42 @@ def _criar_bracket_short_impl(
                 flush=True,
             )
 
-    ord_trailing: dict[str, Any] = {}
     ord_sl: dict[str, Any] = {}
+    ord_trailing: dict[str, Any] = {}
     try:
+        if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_SHORT STOP_MARKET"):
+            return ord_trailing, ord_sl, ord_tp_partial
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT STOP_MARKET"):
+            print(f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "SHORT", context="bracket_SHORT STOP_MARKET"
+        ):
+            print(
+                f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        elif _ja_existe_ordem_protecao_aberta(exchange, simbolo, "SHORT", "STOP_MARKET"):
+            print("[SKIP] Ordem de STOP_MARKET já existe na Binance.", flush=True)
+        else:
+            ord_sl = exchange.create_order(
+                simbolo,
+                "STOP_MARKET",
+                "buy",
+                q_work,
+                None,
+                {**p_ro, "stopPrice": sl_p},
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_entre_ordens_protecao()
+    except Exception as e_sl:  # noqa: BLE001
+        print(
+            f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET SHORT: {e_sl} (seguindo para TRAILING).",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        if _abortar_protecao_se_posicao_zero(exchange, simbolo, context="bracket_SHORT TRAILING"):
+            return ord_trailing, ord_sl, ord_tp_partial
         if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TRAILING"):
             print(f"{_TAG} [PROTECT] Trailing SHORT não criado: throttle anti-spam.", flush=True)
         elif not _assert_seguranca_antes_create_ordem_protecao(
@@ -2677,6 +2732,8 @@ def _criar_bracket_short_impl(
                 f"{_TAG} [PROTECT] Trailing SHORT não criado: segurança pré-create bloqueou.",
                 flush=True,
             )
+        elif _ja_existe_ordem_protecao_aberta(exchange, simbolo, "SHORT", "TRAILING_STOP_MARKET"):
+            print("[SKIP] Ordem de TRAILING_STOP_MARKET já existe na Binance.", flush=True)
         else:
             ord_trailing = exchange.create_order(
                 simbolo,
@@ -2691,36 +2748,9 @@ def _criar_bracket_short_impl(
                 },
             )
             _marcar_criacao_ordem_protecao()
-            _sleep_apos_criar_ordem_protecao()
+            _sleep_entre_ordens_protecao()
     except Exception as e_tr:  # noqa: BLE001
-        print(
-            f"{_TAG} [PROTECT] Falha ao criar TRAILING SHORT: {e_tr} (seguindo para STOP_MARKET).",
-            file=sys.stderr,
-            flush=True,
-        )
-    try:
-        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT STOP_MARKET"):
-            print(f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: throttle anti-spam.", flush=True)
-        elif not _assert_seguranca_antes_create_ordem_protecao(
-            exchange, simbolo, "SHORT", context="bracket_SHORT STOP_MARKET"
-        ):
-            print(
-                f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: segurança pré-create bloqueou.",
-                flush=True,
-            )
-        else:
-            ord_sl = exchange.create_order(
-                simbolo,
-                "STOP_MARKET",
-                "buy",
-                q_work,
-                None,
-                {**p_ro, "stopPrice": sl_p},
-            )
-            _marcar_criacao_ordem_protecao()
-            _sleep_apos_criar_ordem_protecao()
-    except Exception as e_sl:  # noqa: BLE001
-        print(f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET SHORT: {e_sl}", file=sys.stderr, flush=True)
+        print(f"{_TAG} [PROTECT] Falha ao criar TRAILING SHORT: {e_tr}", file=sys.stderr, flush=True)
     if sl_break_even:
         print(
             f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (BREAK-EVEN entrada) + "
@@ -3590,6 +3620,61 @@ def _ordem_protecao_mesmo_tipo_lado(
     if str(o.get("side") or "").lower() != need:
         return False
     return _order_reduce_only_flag(o) or _futures_one_way_position_side(o)
+
+
+def _ordem_tipo_equiv_para_check(tipo_norm: str) -> set[str]:
+    t = str(tipo_norm).upper().replace("-", "_")
+    if t in ("TAKE_PROFIT", "TAKE_PROFIT_MARKET"):
+        return {"TAKE_PROFIT", "TAKE_PROFIT_MARKET"}
+    return {t}
+
+
+def _ja_existe_ordem_protecao_aberta(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    direcao: str,
+    tipo_norm: str,
+) -> bool:
+    """Filtro de existência: evita recriar proteção já aberta no livro."""
+    need = _lado_fecho_protecao(direcao)
+    tipos = _ordem_tipo_equiv_para_check(tipo_norm)
+    for o in _fetch_open_orders_ccxt_list(exchange, simbolo_ccxt):
+        if _order_type_norm(o) not in tipos:
+            continue
+        if str(o.get("side") or "").lower() != need:
+            continue
+        if _order_reduce_only_flag(o) or _futures_one_way_position_side(o):
+            return True
+    return False
+
+
+def _abortar_protecao_se_posicao_zero(
+    exchange: ccxt.binance,
+    simbolo_any: str,
+    *,
+    context: str,
+) -> bool:
+    """
+    Se posição = 0 na corretora, cancela ordens abertas imediatamente e aborta criação.
+    """
+    snap = consultar_posicao_futures(simbolo_any, exchange)
+    aberta = bool(snap.get("posicao_aberta"))
+    qty = abs(float(snap.get("contratos") or 0.0))
+    if aberta and qty > 0:
+        return False
+    print(
+        f"{_TAG} [PROTECT] {context}: posição ZERO detectada. Cancelando ordens abertas e abortando proteção.",
+        flush=True,
+    )
+    try:
+        cancelar_todas_ordens_abertas(simbolo_any, exchange)
+    except Exception as e_can:  # noqa: BLE001
+        print(f"{_TAG} [PROTECT] falha ao cancelar ordens com posição ZERO: {e_can}", file=sys.stderr)
+    return True
+
+
+def _sleep_entre_ordens_protecao() -> None:
+    time.sleep(float(PROTECTION_INTER_ORDER_SLEEP_S))
 
 
 def _cancelar_ordens_abertas_tipo_protecao(
