@@ -906,7 +906,8 @@ def _sync_entry_price_supabase() -> None:
     if logger.supabase is None:
         return
     opened = bool(posicao_aberta and float(preco_compra) > 0)
-    entry_price = float(preco_compra) if opened else None
+    # Limpa estado antigo no dashboard: sem posição => entry_price explícito em 0.0
+    entry_price = float(preco_compra) if opened else 0.0
     now_iso = datetime.now(timezone.utc).isoformat()
     payload = {
         "id": 1,

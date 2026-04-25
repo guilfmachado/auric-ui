@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import traceback
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -28,6 +27,38 @@ TABELA_WALLET_STATUS = "wallet_status"
 TABELA_CONFIG = "config"
 COLUNA_USDT_BALANCE = "usdt_balance"
 COLUNA_USDC_BALANCE = "usdc_balance"
+
+# Colunas opcionais em `logs` — removidas em retry se PostgREST PGRST204 (schema desatualizado).
+_LOGS_OPTIONAL_KEYS_PGRST204_RETRY: tuple[str, ...] = (
+    "funnel_abort_reason",
+    "llava_veto",
+    "justificativa_ia",
+    "ml_prob_base",
+    "ml_prob_calibrated",
+)
+
+
+def _postgrest_error_code(err: BaseException) -> str | None:
+    code = getattr(err, "code", None)
+    if code:
+        return str(code)
+    args = getattr(err, "args", None)
+    if args and isinstance(args[0], dict):
+        c = args[0].get("code")
+        return str(c) if c is not None else None
+    return None
+
+
+def _is_pgrst204_schema_cache(err: BaseException) -> bool:
+    if _postgrest_error_code(err) == "PGRST204":
+        return True
+    msg = str(err).lower()
+    return "pgrst204" in msg or "schema cache" in msg
+
+
+def _insert_log_row(payload: dict[str, Any]) -> Any:
+    return supabase.table(TABELA_LOGS).insert(payload).execute()
+
 
 # Features auxiliares para treino (setadas por ciclo no main; fallback None).
 _FEATURES_LOG_DEFAULTS: dict[str, Any] = {
@@ -122,23 +153,25 @@ def obter_contexto_ultima_abertura(par_moeda: str = "ETH/USDC") -> dict[str, Any
         "RECON_EMERGENCY_LONG",
         "RECON_EMERGENCY_SHORT",
     )
-    for sym in _variants_symbolo_trade(par_moeda):
-        try:
-            res = (
-                supabase.table(TABELA_LOGS)
-                .select("id, par_moeda, probabilidade_ml, acao_tomada, contexto_raw, created_at")
-                .eq("par_moeda", sym)
-                .in_("acao_tomada", list(acoes_abertura))
-                .order("id", desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            if rows:
-                row = rows[0]
-                return row if isinstance(row, dict) else {}
-        except Exception as e:  # noqa: BLE001
-            print(f"⚠️ obter_contexto_ultima_abertura ({sym}): {e}")
+    variants = _variants_symbolo_trade(par_moeda)
+    if not variants:
+        return {}
+    try:
+        res = (
+            supabase.table(TABELA_LOGS)
+            .select("id, par_moeda, probabilidade_ml, acao_tomada, contexto_raw, created_at")
+            .in_("par_moeda", variants)
+            .in_("acao_tomada", list(acoes_abertura))
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            row = rows[0]
+            return row if isinstance(row, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ obter_contexto_ultima_abertura ({par_moeda!r} variants={variants!r}): {e}")
     return {}
 
 
@@ -194,11 +227,14 @@ def obter_preco_entrada_ultima_posicao(
         "RECON_EMERGENCY_LONG",
         "RECON_EMERGENCY_SHORT",
     )
+    variants = _variants_symbolo_trade(par_moeda)
+    if not variants:
+        return None, "LONG"
     try:
         res = (
             supabase.table(TABELA_LOGS)
             .select("preco_atual, acao_tomada")
-            .eq("par_moeda", par_moeda)
+            .in_("par_moeda", variants)
             .in_("acao_tomada", list(entradas))
             .order("id", desc=True)
             .limit(1)
@@ -226,9 +262,79 @@ def obter_preco_entrada_ultima_posicao(
 
 
 def _variants_symbolo_trade(par_moeda: str) -> list[str]:
+    """
+    Formas de `par_moeda` que o bot e a Binance/CCXT podem usar vs. o que está em Supabase.
+    Inclui: ETH/USDC, ETH/USDC:USDC, ETHUSDC, etc. — para match em `.in_('par_moeda', ...)`.
+    """
     p = (par_moeda or "").strip() or "ETH/USDC"
-    xs = {p, p.replace(":USDC", ""), p.replace("/", "").replace(":USDC", "")}
-    return [x for x in xs if x]
+    xs: set[str] = {p}
+    if ":" in p:
+        head = p.split(":", 1)[0].strip()
+        if head:
+            xs.add(head)
+    compact = (
+        p.replace("/", "")
+        .replace(":USDC", "")
+        .replace(":USDT", "")
+        .replace(":BUSD", "")
+    )
+    if compact:
+        xs.add(compact)
+    # ETHUSDC -> ETH/USDC e ETH/USDC:USDC
+    if "/" not in p and len(p) >= 6:
+        u = p.upper()
+        for suf in ("USDC", "USDT", "BUSD"):
+            if u.endswith(suf) and len(p) > len(suf):
+                base = p[: -len(suf)]
+                if base:
+                    xs.add(f"{base}/{suf}")
+                    xs.add(f"{base}/{suf}:{suf}")
+                break
+    # ETH/USDC (ou ETH/USDC:USDC já em p) — garantir forma perp CCXT
+    if "/" in p:
+        left, right = p.split("/", 1)
+        quote = right.split(":", 1)[0].upper()
+        if quote == "USDC":
+            xs.add(f"{left}/USDC:USDC")
+        elif quote == "USDT":
+            xs.add(f"{left}/USDT:USDT")
+        elif quote == "BUSD":
+            xs.add(f"{left}/BUSD:BUSD")
+    return sorted({x for x in xs if x})
+
+
+def _buscar_id_ultimo_trade_log(par_moeda: str) -> tuple[Any, str] | None:
+    """
+    Última linha em `trade_logs` para qualquer variante de símbolo alinhada a `par_moeda`.
+    Devolve (id, par_moeda_tal_como_na_base) ou None.
+    """
+    if not supabase:
+        return None
+    variants = _variants_symbolo_trade(par_moeda)
+    if not variants:
+        return None
+    try:
+        q = (
+            supabase.table(TABELA_TRADES)
+            .select("id, par_moeda")
+            .in_("par_moeda", variants)
+            .order("created_at", desc=True, nullsfirst=False)
+            .order("id", desc=True)
+            .limit(1)
+        )
+        res = q.execute()
+        rows = res.data or []
+        if not rows:
+            return None
+        row = rows[0]
+        tid = row.get("id")
+        if tid is None:
+            return None
+        stored = str(row.get("par_moeda") or "").strip()
+        return (tid, stored or str(variants[0]))
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ _buscar_id_ultimo_trade_log ({par_moeda!r}): {e}")
+        return None
 
 
 def atualizar_qty_left_ultimo_trade(par_moeda: str, qty_left: float) -> None:
@@ -242,33 +348,21 @@ def atualizar_qty_left_ultimo_trade(par_moeda: str, qty_left: float) -> None:
     if qv < 0:
         return
     payload: dict[str, Any] = {"qty_left": qv}
-    for sym in _variants_symbolo_trade(par_moeda):
-        try:
-            res = (
-                supabase.table(TABELA_TRADES)
-                .select("id")
-                .eq("symbol", sym)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            if not rows:
-                continue
-            tid = rows[0].get("id")
-            if tid is None:
-                continue
-            supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
-            print(
-                f"💾 [{TABELA_TRADES}] qty_left={qv:g} actualizado (id={tid}, symbol={sym})."
-            )
-            return
-        except Exception as e:  # noqa: BLE001
-            print(f"⚠️ atualizar_qty_left_ultimo_trade ({sym}): {e}")
-    print(
-        f"⚠️ atualizar_qty_left_ultimo_trade: sem linha em {TABELA_TRADES} para {par_moeda!r} — "
-        "qty_left não actualizado (insira trade ou migre schema)."
-    )
+    hit = _buscar_id_ultimo_trade_log(par_moeda)
+    if not hit:
+        print(
+            f"⚠️ atualizar_qty_left_ultimo_trade: sem linha em {TABELA_TRADES} para "
+            f"{par_moeda!r} (variantes {_variants_symbolo_trade(par_moeda)!r})."
+        )
+        return
+    tid, par_db = hit
+    try:
+        supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
+        print(
+            f"💾 [{TABELA_TRADES}] qty_left={qv:g} actualizado (id={tid}, par_moeda na base={par_db!r})."
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ atualizar_qty_left_ultimo_trade (id={tid}, par_moeda={par_db!r}): {e}")
 
 
 def atualizar_ultimo_trade_campos(par_moeda: str, campos: dict[str, Any]) -> None:
@@ -281,32 +375,20 @@ def atualizar_ultimo_trade_campos(par_moeda: str, campos: dict[str, Any]) -> Non
     payload = {k: v for k, v in campos.items() if v is not None}
     if not payload:
         return
-    for sym in _variants_symbolo_trade(par_moeda):
-        try:
-            res = (
-                supabase.table(TABELA_TRADES)
-                .select("id")
-                .eq("symbol", sym)
-                .order("created_at", desc=True)
-                .limit(1)
-                .execute()
-            )
-            rows = res.data or []
-            if not rows:
-                continue
-            tid = rows[0].get("id")
-            if tid is None:
-                continue
-            supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
-            keys = ", ".join(f"{k}={payload[k]!r}" for k in sorted(payload))
-            print(f"💾 [{TABELA_TRADES}] {keys} (id={tid}, symbol={sym}).")
-            return
-        except Exception as e:  # noqa: BLE001
-            print(f"⚠️ atualizar_ultimo_trade_campos ({sym}): {e}")
-    print(
-        f"⚠️ atualizar_ultimo_trade_campos: sem linha em {TABELA_TRADES} para {par_moeda!r} — "
-        "campos não actualizados."
-    )
+    hit = _buscar_id_ultimo_trade_log(par_moeda)
+    if not hit:
+        print(
+            f"⚠️ atualizar_ultimo_trade_campos: sem linha em {TABELA_TRADES} para {par_moeda!r} "
+            f"(variantes {_variants_symbolo_trade(par_moeda)!r}) — campos não actualizados."
+        )
+        return
+    tid, par_db = hit
+    try:
+        supabase.table(TABELA_TRADES).update(payload).eq("id", tid).execute()
+        keys = ", ".join(f"{k}={payload[k]!r}" for k in sorted(payload))
+        print(f"💾 [{TABELA_TRADES}] {keys} (id={tid}, par_moeda na base={par_db!r}).")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ atualizar_ultimo_trade_campos (id={tid}, par_moeda={par_db!r}): {e}")
 
 
 def atualizar_ultimo_trade_mood_scores(
@@ -499,13 +581,79 @@ def registrar_log_trade(
         print(f"\n[SIMULAÇÃO] {acao} | Preço: {preco} | Justificativa: {justificativa}")
         return
 
+    def _log_insert_success(resposta: Any) -> None:
+        try:
+            row0 = (resposta.data or [{}])[0]
+            rid = row0.get("id", "?")
+            print(f"💾 Log salvo com sucesso! ID: {rid}")
+        except Exception:
+            print("💾 Log salvo com sucesso!")
+
+    payload = dict(dados_log)
     try:
-        resposta = supabase.table(TABELA_LOGS).insert(dados_log).execute()
-        print(f"💾 Log salvo com sucesso! ID: {resposta.data[0]['id']}")
-    except Exception as e:
-        print(f"❌ ERRO CRÍTICO AO SALVAR LOG: {e}", flush=True)
-        print(f"❌ ERRO CRÍTICO AO SALVAR LOG — chaves do payload: {list(dados_log.keys())}", flush=True)
-        traceback.print_exc()
+        resposta = _insert_log_row(payload)
+        _log_insert_success(resposta)
+        return
+    except Exception as e_first:  # noqa: BLE001
+        if not _is_pgrst204_schema_cache(e_first):
+            print(
+                f"⚠️ [LOGS] Falha ao gravar log (não é PGRST204): {e_first}. Ciclo continua.",
+                flush=True,
+            )
+            return
+        for k in _LOGS_OPTIONAL_KEYS_PGRST204_RETRY:
+            payload.pop(k, None)
+        try:
+            resposta = _insert_log_row(payload)
+            _log_insert_success(resposta)
+            print(
+                "⚠️ [LOGS] Schema desatualizado: insert repetido sem colunas opcionais "
+                f"({', '.join(_LOGS_OPTIONAL_KEYS_PGRST204_RETRY)}).",
+                flush=True,
+            )
+            return
+        except Exception as e_second:  # noqa: BLE001
+            if not _is_pgrst204_schema_cache(e_second):
+                print(
+                    f"⚠️ [LOGS] Falha no retry após PGRST204: {e_second}. Ciclo continua.",
+                    flush=True,
+                )
+                return
+    # Segundo PGRST204: tentar só colunas básicas (compat schema antigo).
+    basico: dict[str, Any] = {
+        "par_moeda": par,
+        "preco_atual": preco,
+        "probabilidade_ml": prob_ml,
+        "sentimento_ia": sentimento,
+        "veredito_ia": sentimento,
+        "acao_tomada": acao,
+        "justificativa": justificativa,
+        "contexto_raw": contexto_raw,
+    }
+    if noticias_agregadas is not None:
+        basico["noticias_agregadas"] = noticias_agregadas
+    if commission is not None:
+        basico["commission"] = float(commission)
+    if is_maker is not None:
+        basico["is_maker"] = bool(is_maker)
+    if rsi_14 is not None:
+        basico["rsi_14"] = float(rsi_14)
+    if adx_14 is not None:
+        basico["adx_14"] = float(adx_14)
+    try:
+        resposta = _insert_log_row(basico)
+        _log_insert_success(resposta)
+        print(
+            "⚠️ [LOGS] Schema muito antigo: gravado apenas bloco básico "
+            "(sem features de funil / whale / etc.). Migre o Supabase.",
+            flush=True,
+        )
+    except Exception as e_final:  # noqa: BLE001
+        print(
+            f"⚠️ [LOGS] Não foi possível gravar em `{TABELA_LOGS}` após fallbacks: {e_final}. "
+            "Ciclo de trading continua.",
+            flush=True,
+        )
 
 # Teste rápido se rodar o arquivo diretamente
 if __name__ == "__main__":

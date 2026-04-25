@@ -4,6 +4,8 @@ import React, { useState } from "react";
 import toast from "react-hot-toast";
 
 const apiSecret = process.env.NEXT_PUBLIC_BOT_COMMAND_API_SECRET;
+const botCommandEndpoint =
+  process.env.NEXT_PUBLIC_BOT_COMMAND_ENDPOINT || "/api/bot/command";
 
 export default function AuricControl() {
   const [loading, setLoading] = useState(false);
@@ -16,7 +18,7 @@ export default function AuricControl() {
     }
     setLoading(true);
     try {
-      const res = await fetch("/api/bot/command", {
+      const res = await fetch(botCommandEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

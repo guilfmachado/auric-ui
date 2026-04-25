@@ -20,10 +20,6 @@ export const metadata: Metadata = {
     "Terminal de trading quantitativo — desk midnight, gauges e intelligence log.",
 };
 
-/** Evita cache estático de rota na Vercel — dados Supabase/logs devem ser frescos a cada visita. */
-export const dynamic = "force-dynamic";
-export const revalidate = 0;
-
 export default function RootLayout({
   children,
 }: Readonly<{

@@ -62,3 +62,44 @@ create policy "logs_anon_select_insert"
 create policy "logs_anon_insert"
   on public.logs for insert
   with check (true);
+
+-- wallet_status (estado de posição + mood/funil para dashboard)
+create table if not exists public.wallet_status (
+  id smallint primary key default 1 check (id = 1),
+  usdt_balance double precision,
+  usdc_balance double precision,
+  entry_price double precision,
+  posicao_aberta boolean default false,
+  whale_flow_score double precision,
+  social_sentiment_score double precision,
+  news_sentiment_score integer,
+  forecast_preco_alvo double precision,
+  forecast_tendencia_alta boolean,
+  llava_veto boolean,
+  funnel_stage text,
+  funnel_abort_reason text,
+  ml_prob_base double precision,
+  ml_prob_calibrated double precision,
+  updated_at timestamptz default now()
+);
+
+-- Colunas extras consumidas pelo frontend e geradas pelo backend.
+alter table if exists public.logs
+  add column if not exists dist_ema200_pct double precision,
+  add column if not exists spread_atual double precision,
+  add column if not exists book_imbalance double precision,
+  add column if not exists hora_do_dia integer,
+  add column if not exists atr_14 double precision,
+  add column if not exists funding_rate double precision,
+  add column if not exists long_short_ratio double precision,
+  add column if not exists whale_flow_score double precision,
+  add column if not exists social_sentiment_score double precision,
+  add column if not exists funnel_stage text,
+  add column if not exists funnel_abort_reason text,
+  add column if not exists ml_prob_base double precision,
+  add column if not exists ml_prob_calibrated double precision,
+  add column if not exists llava_veto boolean,
+  add column if not exists commission double precision,
+  add column if not exists is_maker boolean,
+  add column if not exists rsi_14 double precision,
+  add column if not exists adx_14 double precision;

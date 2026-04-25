@@ -35,6 +35,17 @@ function pickLatestLogRow(data: unknown): LogRow | null {
   return null;
 }
 
+function coerceBooleanLike(value: unknown): boolean {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (["true", "t", "1", "yes", "y", "on"].includes(v)) return true;
+    if (["false", "f", "0", "no", "n", "off", ""].includes(v)) return false;
+  }
+  return false;
+}
+
 function defaultConfig(): ConfigRow {
   return {
     id: CONFIG_ID,
@@ -136,9 +147,15 @@ export function useAuricDashboard() {
         setWalletUsdt(
           row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
         );
-        const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
-        setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
-        setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
+        const openNow = coerceBooleanLike(
+          (row as { posicao_aberta?: unknown } | null)?.posicao_aberta
+        );
+        const ep =
+          row && "entry_price" in row
+            ? Number((row as { entry_price?: unknown }).entry_price)
+            : NaN;
+        setPositionOpen(openNow);
+        setEntryPrice(openNow && Number.isFinite(ep) && ep > 0 ? ep : null);
         const wfs = Number((row as { whale_flow_score?: unknown } | null)?.whale_flow_score);
         setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
         const sss = Number((row as { social_sentiment_score?: unknown } | null)?.social_sentiment_score);
@@ -256,9 +273,15 @@ export function useAuricDashboard() {
       setWalletUsdt(
         row ? coerceQuoteBalance(row.usdc_balance ?? row.usdt_balance) : null
       );
-      const ep = row && "entry_price" in row ? Number((row as { entry_price?: unknown }).entry_price) : NaN;
-      setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
-      setPositionOpen(Boolean((row as { posicao_aberta?: unknown } | null)?.posicao_aberta));
+      const openNow = coerceBooleanLike(
+        (row as { posicao_aberta?: unknown } | null)?.posicao_aberta
+      );
+      const ep =
+        row && "entry_price" in row
+          ? Number((row as { entry_price?: unknown }).entry_price)
+          : NaN;
+      setPositionOpen(openNow);
+      setEntryPrice(openNow && Number.isFinite(ep) && ep > 0 ? ep : null);
       const wfs = Number((row as { whale_flow_score?: unknown } | null)?.whale_flow_score);
       setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
       const sss = Number((row as { social_sentiment_score?: unknown } | null)?.social_sentiment_score);
@@ -537,9 +560,10 @@ export function useAuricDashboard() {
         setWalletUsdt(
           wrow != null ? coerceQuoteBalance(wrow.usdc_balance ?? wrow.usdt_balance) : null
         );
+        const openNow = coerceBooleanLike(wrow?.posicao_aberta);
         const ep = Number(wrow?.entry_price);
-        setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
-        setPositionOpen(Boolean(wrow?.posicao_aberta));
+        setPositionOpen(openNow);
+        setEntryPrice(openNow && Number.isFinite(ep) && ep > 0 ? ep : null);
         const wfs = Number(wrow?.whale_flow_score);
         setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
         const sss = Number(wrow?.social_sentiment_score);
@@ -726,9 +750,10 @@ export function useAuricDashboard() {
             if (n !== null) {
               setWalletFetchFailed(false);
               setWalletUsdt(n);
+              const openNow = coerceBooleanLike(row.posicao_aberta);
               const ep = Number(row.entry_price);
-              setEntryPrice(Number.isFinite(ep) && ep > 0 ? ep : null);
-              setPositionOpen(Boolean(row.posicao_aberta));
+              setPositionOpen(openNow);
+              setEntryPrice(openNow && Number.isFinite(ep) && ep > 0 ? ep : null);
               const wfs = Number(row.whale_flow_score);
               setWhaleFlowScore(Number.isFinite(wfs) ? wfs : null);
               const sss = Number(row.social_sentiment_score);

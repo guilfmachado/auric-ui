@@ -136,7 +136,7 @@ export function PulseHero({
                       minimumFractionDigits: 2,
                       maximumFractionDigits: 2,
                     })}`
-                  : "—"}
+                  : "N/A"}
               </Mono>
             )}
             <p className="mt-1 text-[10px] text-zinc-600">Preço de entrada da posição ativa</p>

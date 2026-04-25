@@ -716,6 +716,30 @@ def _buscar_take_profit_market_parcial_aberto(
     return None
 
 
+def _buscar_take_profit_parcial_aberto_any(
+    exchange: ccxt.binance,
+    simbolo_ccxt: str,
+    direcao: str,
+) -> dict[str, Any] | None:
+    """
+    TP parcial Free Runner já armado:
+    aceita TAKE_PROFIT_MARKET e TAKE_PROFIT (reduce-only, lado de fecho).
+    """
+    d = str(direcao).strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return None
+    need_side = "sell" if d == "LONG" else "buy"
+    for o in _fetch_open_orders_ccxt_list(exchange, simbolo_ccxt):
+        if not _order_reduce_only_flag(o):
+            continue
+        if _order_type_norm(o) not in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+            continue
+        if str(o.get("side") or "").lower() != need_side:
+            continue
+        return o
+    return None
+
+
 def _obter_mark_price_futures(exchange: ccxt.binance, simbolo_ccxt: str) -> float:
     """Mark ou last do ticker (Futures); 0.0 se indisponível."""
     try:
@@ -2277,7 +2301,7 @@ def _criar_bracket_long_impl(
         and FREE_RUNNER_ATR_ENABLED
         and tp_ref_audit is not None
     ):
-        ex_tp = _buscar_take_profit_market_parcial_aberto(exchange, simbolo, "LONG")
+        ex_tp = _buscar_take_profit_parcial_aberto_any(exchange, simbolo, "LONG")
         reuse_tp = False
         if ex_tp is not None:
             q_tp_re = float(_quantidade_ordem_aberta_ccxt(exchange, simbolo, ex_tp))
@@ -2310,68 +2334,108 @@ def _criar_bracket_long_impl(
                     flush=True,
                 )
             else:
-                if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TP_PARTIAL"):
-                    return {}, {}, ord_tp_partial
-                if not _assert_seguranca_antes_create_ordem_protecao(
-                    exchange, simbolo, "LONG", context="bracket_LONG TP_PARTIAL"
-                ):
-                    return {}, {}, ord_tp_partial
-                ord_tp_partial = exchange.create_order(
-                    simbolo,
-                    "TAKE_PROFIT_MARKET",
-                    "sell",
-                    float(exchange.amount_to_precision(simbolo, q_tp)),
-                    None,
-                    {**p_ro, "stopPrice": tp_market_p},
-                )
-                _marcar_criacao_ordem_protecao()
-                _sleep_apos_criar_ordem_protecao()
-                print(
-                    f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
-                    flush=True,
-                )
+                tp_existing_now = _buscar_take_profit_parcial_aberto_any(exchange, simbolo, "LONG")
+                if tp_existing_now is not None:
+                    ord_tp_partial = tp_existing_now
+                    print("🛡️ [FREE RUNNER] TP parcial já existe. Ignorando criação.", flush=True)
+                else:
+                    try:
+                        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TP_PARTIAL"):
+                            print(
+                                f"{_TAG} [FREE RUNNER] TP parcial LONG não criado: throttle anti-spam.",
+                                flush=True,
+                            )
+                        elif not _assert_seguranca_antes_create_ordem_protecao(
+                            exchange, simbolo, "LONG", context="bracket_LONG TP_PARTIAL"
+                        ):
+                            print(
+                                f"{_TAG} [FREE RUNNER] TP parcial LONG não criado: segurança pré-create bloqueou.",
+                                flush=True,
+                            )
+                        else:
+                            ord_tp_partial = exchange.create_order(
+                                simbolo,
+                                "TAKE_PROFIT_MARKET",
+                                "sell",
+                                float(exchange.amount_to_precision(simbolo, q_tp)),
+                                None,
+                                {**p_ro, "stopPrice": tp_market_p},
+                            )
+                            _marcar_criacao_ordem_protecao()
+                            _sleep_apos_criar_ordem_protecao()
+                            print(
+                                f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
+                                flush=True,
+                            )
+                    except Exception as e_tp:  # noqa: BLE001
+                        print(
+                            f"{_TAG} [FREE RUNNER] Falha ao criar TP parcial LONG: {e_tp} "
+                            "(seguindo para TRAILING+SL).",
+                            file=sys.stderr,
+                            flush=True,
+                        )
             print(
                 f"{_TAG} [FREE RUNNER] LONG qty total={q:g} → TP={q_tp:g} + runner={q_work:g} | "
                 f"TAKE_PROFIT_MARKET id={ord_tp_partial.get('id')}",
                 flush=True,
             )
 
-    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TRAILING"):
-        return {}, {}, ord_tp_partial
-    if not _assert_seguranca_antes_create_ordem_protecao(
-        exchange, simbolo, "LONG", context="bracket_LONG TRAILING"
-    ):
-        return {}, {}, ord_tp_partial
-    ord_trailing = exchange.create_order(
-        simbolo,
-        "TRAILING_STOP_MARKET",
-        "sell",
-        q_work,
-        None,
-        {
-            **p_ro,
-            "activationPrice": tp_p,
-            "callbackRate": cb_rate,
-        },
-    )
-    _marcar_criacao_ordem_protecao()
-    _sleep_apos_criar_ordem_protecao()
-    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG STOP_MARKET"):
-        return ord_trailing, {}, ord_tp_partial
-    if not _assert_seguranca_antes_create_ordem_protecao(
-        exchange, simbolo, "LONG", context="bracket_LONG STOP_MARKET"
-    ):
-        return ord_trailing, {}, ord_tp_partial
-    ord_sl = exchange.create_order(
-        simbolo,
-        "STOP_MARKET",
-        "sell",
-        q_work,
-        None,
-        {**p_ro, "stopPrice": sl_p},
-    )
-    _marcar_criacao_ordem_protecao()
-    _sleep_apos_criar_ordem_protecao()
+    ord_trailing: dict[str, Any] = {}
+    ord_sl: dict[str, Any] = {}
+    try:
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG TRAILING"):
+            print(f"{_TAG} [PROTECT] Trailing LONG não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "LONG", context="bracket_LONG TRAILING"
+        ):
+            print(
+                f"{_TAG} [PROTECT] Trailing LONG não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        else:
+            ord_trailing = exchange.create_order(
+                simbolo,
+                "TRAILING_STOP_MARKET",
+                "sell",
+                q_work,
+                None,
+                {
+                    **p_ro,
+                    "activationPrice": tp_p,
+                    "callbackRate": cb_rate,
+                },
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_apos_criar_ordem_protecao()
+    except Exception as e_tr:  # noqa: BLE001
+        print(
+            f"{_TAG} [PROTECT] Falha ao criar TRAILING LONG: {e_tr} (seguindo para STOP_MARKET).",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_LONG STOP_MARKET"):
+            print(f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "LONG", context="bracket_LONG STOP_MARKET"
+        ):
+            print(
+                f"{_TAG} [PROTECT] STOP_MARKET LONG não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        else:
+            ord_sl = exchange.create_order(
+                simbolo,
+                "STOP_MARKET",
+                "sell",
+                q_work,
+                None,
+                {**p_ro, "stopPrice": sl_p},
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_apos_criar_ordem_protecao()
+    except Exception as e_sl:  # noqa: BLE001
+        print(f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET LONG: {e_sl}", file=sys.stderr, flush=True)
     if sl_break_even:
         print(
             f"{_TAG} Bracket LONG: SL STOP_MARKET sell @ {sl_p} (BREAK-EVEN entrada) + "
@@ -2522,7 +2586,7 @@ def _criar_bracket_short_impl(
         and FREE_RUNNER_ATR_ENABLED
         and tp_ref_audit is not None
     ):
-        ex_tp = _buscar_take_profit_market_parcial_aberto(exchange, simbolo, "SHORT")
+        ex_tp = _buscar_take_profit_parcial_aberto_any(exchange, simbolo, "SHORT")
         reuse_tp = False
         if ex_tp is not None:
             q_tp_re = float(_quantidade_ordem_aberta_ccxt(exchange, simbolo, ex_tp))
@@ -2555,68 +2619,108 @@ def _criar_bracket_short_impl(
                     flush=True,
                 )
             else:
-                if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TP_PARTIAL"):
-                    return {}, {}, ord_tp_partial
-                if not _assert_seguranca_antes_create_ordem_protecao(
-                    exchange, simbolo, "SHORT", context="bracket_SHORT TP_PARTIAL"
-                ):
-                    return {}, {}, ord_tp_partial
-                ord_tp_partial = exchange.create_order(
-                    simbolo,
-                    "TAKE_PROFIT_MARKET",
-                    "buy",
-                    float(exchange.amount_to_precision(simbolo, q_tp)),
-                    None,
-                    {**p_ro, "stopPrice": tp_market_p},
-                )
-                _marcar_criacao_ordem_protecao()
-                _sleep_apos_criar_ordem_protecao()
-                print(
-                    f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
-                    flush=True,
-                )
+                tp_existing_now = _buscar_take_profit_parcial_aberto_any(exchange, simbolo, "SHORT")
+                if tp_existing_now is not None:
+                    ord_tp_partial = tp_existing_now
+                    print("🛡️ [FREE RUNNER] TP parcial já existe. Ignorando criação.", flush=True)
+                else:
+                    try:
+                        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TP_PARTIAL"):
+                            print(
+                                f"{_TAG} [FREE RUNNER] TP parcial SHORT não criado: throttle anti-spam.",
+                                flush=True,
+                            )
+                        elif not _assert_seguranca_antes_create_ordem_protecao(
+                            exchange, simbolo, "SHORT", context="bracket_SHORT TP_PARTIAL"
+                        ):
+                            print(
+                                f"{_TAG} [FREE RUNNER] TP parcial SHORT não criado: segurança pré-create bloqueou.",
+                                flush=True,
+                            )
+                        else:
+                            ord_tp_partial = exchange.create_order(
+                                simbolo,
+                                "TAKE_PROFIT_MARKET",
+                                "buy",
+                                float(exchange.amount_to_precision(simbolo, q_tp)),
+                                None,
+                                {**p_ro, "stopPrice": tp_market_p},
+                            )
+                            _marcar_criacao_ordem_protecao()
+                            _sleep_apos_criar_ordem_protecao()
+                            print(
+                                f"🎯 [FREE RUNNER] TP Parcial ({AURIC_PARTIAL_TP_PCT:.0%}) armado em {tp_market_p}.",
+                                flush=True,
+                            )
+                    except Exception as e_tp:  # noqa: BLE001
+                        print(
+                            f"{_TAG} [FREE RUNNER] Falha ao criar TP parcial SHORT: {e_tp} "
+                            "(seguindo para TRAILING+SL).",
+                            file=sys.stderr,
+                            flush=True,
+                        )
             print(
                 f"{_TAG} [FREE RUNNER] SHORT qty total={q:g} → TP={q_tp:g} + runner={q_work:g} | "
                 f"TAKE_PROFIT_MARKET id={ord_tp_partial.get('id')}",
                 flush=True,
             )
 
-    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TRAILING"):
-        return {}, {}, ord_tp_partial
-    if not _assert_seguranca_antes_create_ordem_protecao(
-        exchange, simbolo, "SHORT", context="bracket_SHORT TRAILING"
-    ):
-        return {}, {}, ord_tp_partial
-    ord_trailing = exchange.create_order(
-        simbolo,
-        "TRAILING_STOP_MARKET",
-        "buy",
-        q_work,
-        None,
-        {
-            **p_ro,
-            "activationPrice": tp_p,
-            "callbackRate": cb_rate,
-        },
-    )
-    _marcar_criacao_ordem_protecao()
-    _sleep_apos_criar_ordem_protecao()
-    if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT STOP_MARKET"):
-        return ord_trailing, {}, ord_tp_partial
-    if not _assert_seguranca_antes_create_ordem_protecao(
-        exchange, simbolo, "SHORT", context="bracket_SHORT STOP_MARKET"
-    ):
-        return ord_trailing, {}, ord_tp_partial
-    ord_sl = exchange.create_order(
-        simbolo,
-        "STOP_MARKET",
-        "buy",
-        q_work,
-        None,
-        {**p_ro, "stopPrice": sl_p},
-    )
-    _marcar_criacao_ordem_protecao()
-    _sleep_apos_criar_ordem_protecao()
+    ord_trailing: dict[str, Any] = {}
+    ord_sl: dict[str, Any] = {}
+    try:
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT TRAILING"):
+            print(f"{_TAG} [PROTECT] Trailing SHORT não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "SHORT", context="bracket_SHORT TRAILING"
+        ):
+            print(
+                f"{_TAG} [PROTECT] Trailing SHORT não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        else:
+            ord_trailing = exchange.create_order(
+                simbolo,
+                "TRAILING_STOP_MARKET",
+                "buy",
+                q_work,
+                None,
+                {
+                    **p_ro,
+                    "activationPrice": tp_p,
+                    "callbackRate": cb_rate,
+                },
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_apos_criar_ordem_protecao()
+    except Exception as e_tr:  # noqa: BLE001
+        print(
+            f"{_TAG} [PROTECT] Falha ao criar TRAILING SHORT: {e_tr} (seguindo para STOP_MARKET).",
+            file=sys.stderr,
+            flush=True,
+        )
+    try:
+        if not _exigir_intervalo_min_entre_ordens_protecao(context="bracket_SHORT STOP_MARKET"):
+            print(f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: throttle anti-spam.", flush=True)
+        elif not _assert_seguranca_antes_create_ordem_protecao(
+            exchange, simbolo, "SHORT", context="bracket_SHORT STOP_MARKET"
+        ):
+            print(
+                f"{_TAG} [PROTECT] STOP_MARKET SHORT não criado: segurança pré-create bloqueou.",
+                flush=True,
+            )
+        else:
+            ord_sl = exchange.create_order(
+                simbolo,
+                "STOP_MARKET",
+                "buy",
+                q_work,
+                None,
+                {**p_ro, "stopPrice": sl_p},
+            )
+            _marcar_criacao_ordem_protecao()
+            _sleep_apos_criar_ordem_protecao()
+    except Exception as e_sl:  # noqa: BLE001
+        print(f"{_TAG} [PROTECT] Falha ao criar STOP_MARKET SHORT: {e_sl}", file=sys.stderr, flush=True)
     if sl_break_even:
         print(
             f"{_TAG} Bracket SHORT: SL STOP_MARKET buy @ {sl_p} (BREAK-EVEN entrada) + "
