@@ -1868,23 +1868,21 @@ def check_decision_funnel(symbol: str, side: str) -> tuple[str, str]:
                 if audit.get("approved"):
                     consensus = float(audit.get("consensus_score") or score)
                     final_score = (float(score) + consensus) / 2.0
-                    log_to_supabase(
-                        "AI",
-                        f"✅ Claude aprovou. Score final de consenso: {final_score:.1f}",
-                        "success",
+                    audit_comment = str(audit.get("audit_comment") or "").strip()
+                    consensus_score = audit.get("consensus_score", consensus)
+                    final_message = (
+                        f"CONSENSO: {audit_comment} | Score: {consensus_score}"
                     )
+                    log_to_supabase("AI", final_message, "success")
                     return (
                         "EXECUTE",
                         f"DeepSeek+Claude consenso risco={final_score:.1f} "
                         f"(DeepSeek={score:.1f}, regime={market_regime}).",
                     )
 
-                log_to_supabase(
-                    "AI",
-                    "❌ Veto do Claude. Operação cancelada por risco excessivo.",
-                    "error",
-                )
-                comment = str(audit.get("audit_comment") or "").strip()
+                audit_comment = str(audit.get("audit_comment") or "").strip()
+                log_to_supabase("AI", f"VETO: {audit_comment}", "error")
+                comment = audit_comment
                 return (
                     "IGNORE",
                     f"[CLAUDE VETO] {comment}" if comment else "[CLAUDE VETO] Risco excessivo.",

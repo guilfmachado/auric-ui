@@ -1,5 +1,5 @@
 """
-Auditor de risco macro via Claude (Anthropic API).
+Segunda opinião ao DeepSeek via Claude (Anthropic API): estrategista de alta convicção.
 Requer ANTHROPIC_API_KEY no .env.
 """
 
@@ -62,7 +62,7 @@ def _build_client() -> Anthropic:
 
 def get_claude_audit(news_summary: str, deepseek_score: int | float) -> dict[str, Any]:
     """
-    Claude atua como o Auditor de Risco (segunda opinião ao score DeepSeek).
+    Claude como Estrategista de Alta Convicção (segunda opinião ao score DeepSeek).
 
     Retorno tipado (após parse):
         consensus_score: int 0–100
@@ -71,15 +71,20 @@ def get_claude_audit(news_summary: str, deepseek_score: int | float) -> dict[str
     """
     client = _build_client()
     prompt = f"""
-Como Auditor de Risco do Projeto AURIC, analisa este resumo de mercado:
+Atua como um Estrategista de Alta Convicção para o Projeto AURIC.
+O analista primário (DeepSeek) detectou uma oportunidade com score {deepseek_score}.
+
+Contexto:
 {news_summary}
 
-O analista primário (DeepSeek) deu um score de {deepseek_score}.
-Concordas com este nível de agressividade/risco?
-Responde APENAS com um JSON válido (sem markdown) neste formato exato:
+Tua missão: Não sejas apenas cauteloso. Identifica se os fundamentos confirmam uma
+explosão de preço ou uma queda severa. Só aprova se a tendência for clara e forte.
+Se aprovares, sê agressivo no score.
+
+Responde APENAS com um JSON válido (sem markdown, sem texto fora do objeto) neste formato:
 {{
   "consensus_score": <inteiro de 0 a 100>,
-  "audit_comment": "<breve explicação da divergência ou concordância>",
+  "audit_comment": "<análise curta e direta>",
   "approved": <true ou false>
 }}
 """.strip()
